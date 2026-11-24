@@ -25,3 +25,21 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/test-windows-package.ps1
+      - name: Reject package rehearsal outside authorized CI context
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $saved = $env:GITHUB_ACTIONS
+          try {
+            Remove-Item Env:GITHUB_ACTIONS
+            $PSNativeCommandUseErrorActionPreference = $false
+            $output = & pwsh -NoProfile -NonInteractive -File ./scripts/test-windows-package.ps1 2>&1
+            $code = $LASTEXITCODE
+            if ($code -eq 0 -or (($output -join "`n") -notmatch 'Run only in the authorized GitHub Actions test environment')) {
+              throw 'Package rehearsal authorization regression failed.'
+            }
+          } finally {
+            $env:GITHUB_ACTIONS = $saved
+          }
+          Write-Output 'Unauthorized rehearsal correctly rejected.'
+          exit 0
