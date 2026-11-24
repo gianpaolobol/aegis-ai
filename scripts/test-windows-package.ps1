@@ -97,6 +97,56 @@ try {
     if ($LASTEXITCODE -ne 0 -or (($status -join "`n") -notmatch 'Active protection: unavailable')) {
         throw 'Extracted executable status check failed.'
     }
+    # Rehearse MSIX packaging, never signing, installing or publishing.
+    # The SDK is a build-only proprietary Microsoft tool; no SDK binaries shipped.
+    $sdk = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe'
+    if (-not (Test-Path -LiteralPath $sdk -PathType Leaf)) { throw 'Pinned MakeAppx SDK path unavailable.' }
+    $msixStage = Join-Path $root 'msix-stage'
+    $msixOut = Join-Path $root 'msix-unpacked'
+    $msix = Join-Path $root 'aegis-unsigned-ci.msix'
+    New-Item -ItemType Directory -Path $msixStage | Out-Null
+    foreach ($name in ($expected + 'SHA256SUMS.txt')) {
+        Copy-Item -LiteralPath (Join-Path $stage $name) -Destination $msixStage
+    }
+    Copy-Item -LiteralPath 'packaging/windows/AppxManifest.xml' -Destination $msixStage
+    $assets = Join-Path $msixStage 'Assets'
+    New-Item -ItemType Directory -Path $assets | Out-Null
+    Add-Type -AssemblyName System.Drawing
+    foreach ($entry in @(@{name='StoreLogo.png';size=50}, @{name='Square150.png';size=150}, @{name='Square44.png';size=44})) {
+        $bitmap = [System.Drawing.Bitmap]::new([int]$entry.size, [int]$entry.size)
+        try {
+            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+            try { $graphics.Clear([System.Drawing.Color]::DarkSlateBlue) }
+            finally { $graphics.Dispose() }
+            $bitmap.Save((Join-Path $assets $entry.name), [System.Drawing.Imaging.ImageFormat]::Png)
+        } finally { $bitmap.Dispose() }
+    }
+    # Explicit native exit-code checks also cover the expected-negative invocation.
+    $PSNativeCommandUseErrorActionPreference = $false
+    & $sdk pack /d $msixStage /p $msix /o
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $msix -PathType Leaf)) {
+        throw 'MSIX pack failed.'
+    }
+    & $sdk unpack /p $msix /d $msixOut /o
+    if ($LASTEXITCODE -ne 0) { throw 'MSIX unpack failed.' }
+    $payload = $expected + @('SHA256SUMS.txt','AppxManifest.xml','Assets\StoreLogo.png','Assets\Square150.png','Assets\Square44.png')
+    foreach ($name in $payload) {
+        $a = (Get-FileHash -LiteralPath (Join-Path $msixStage $name) -Algorithm SHA256).Hash
+        $b = (Get-FileHash -LiteralPath (Join-Path $msixOut $name) -Algorithm SHA256).Hash
+        if ($a -ne $b) { throw 'MSIX payload hash mismatch.' }
+    }
+    # No install or trust-store modification. Run only the extracted known binary.
+    $msixExe = Join-Path $msixOut 'aegis-policy.exe'
+    $status = & $msixExe status
+    if ($LASTEXITCODE -ne 0 -or (($status -join "`n") -notmatch 'Active protection: unavailable')) {
+        throw 'MSIX extracted executable status check failed.'
+    }
+    Write-Output ("Unsigned MSIX rehearsal SHA256: " + (Get-FileHash -LiteralPath $msix -Algorithm SHA256).Hash)
+    Remove-Item -LiteralPath (Join-Path $assets 'Square44.png') -Force
+    $badMsix = Join-Path $root 'missing-logo-negative.msix'
+    & $sdk pack /d $msixStage /p $badMsix /o
+    if ($LASTEXITCODE -eq 0) { throw 'MSIX missing referenced logo was accepted.' }
+    Write-Output 'MSIX missing required asset negative test passed.'
     # Negative test: modify only a disposable documentation file; verify rejection.
     Add-Content -LiteralPath (Join-Path $unpacked 'LIMITATIONS.txt') -Value 'Synthetic integrity test.'
     $rejected = $false
