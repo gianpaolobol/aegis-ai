@@ -19,3 +19,5 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
       - run: cargo +stable test --all-targets
+      - run: cargo +stable build --release --bin aegis-policy
+      - run: cargo +stable test --release --test cli_smoke
