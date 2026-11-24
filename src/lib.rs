@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 // Copyright 2026 Gian Paolo Franceschini. See LICENSE.
 //! Pure policy classifier; not an authorization boundary.
+
+pub mod wifi;
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Action { Read, Write, Export, Execute, ChangePolicy, Unknown }
 #[derive(Debug, PartialEq, Eq)]
