@@ -1,5 +1,5 @@
 # AEGIS Wi-Fi Security Auditor
-Status: planned; no live scanning or device tests claimed.
+Status: WIFI-02 advisory classifier and partial WIFI-05 mode comparison implemented on development branch; CI pending for this revision. No live scanning or device tests claimed.
 ## Scope and acceptance
 - WIFI-01: read OS-exposed Wi-Fi metadata with user permission; no active probing or association; unavailable fields remain unknown.
 - WIFI-02: classify open, WEP, WPA, WPA2, WPA3, transition and unknown configurations; distinguish observed security mode from password strength; surface WPS and PMF only when reliably reported.
@@ -13,3 +13,6 @@ No cracking, handshake capture, credential extraction, deauthentication, active 
 Windows/macOS/Linux: native metadata adapters; Android/AOSP/GrapheneOS and forks: permission-aware Android adapter; iOS/iPadOS: only sanctioned APIs and entitlements, no promise of nearby-network enumeration. Unsupported fields remain unknown.
 ## Test gates
 Synthetic security-mode fixtures, unknown metadata, denied permissions, transition mode, false-positive cases, no secret in logs, RNG failure, and platform-specific integration tests. Review privacy, licensing and CI before merge. No production readiness claim before physical-device validation.
+
+## ADE-003 implementation review (2026-11-24)
+Acceptance: classify ten explicit security modes, preserve unknown WPS/PMF, distinguish transition and Enhanced Open from authenticated WPA3, flag inconsistent WPA3 PMF metadata, represent permission denial/unavailable without a pass, and compare known security modes without declaring an attack. Implemented in `src/wifi.rs`, nine synthetic test functions. Review: no radio/network APIs, secrets, SSID/BSSID, persistence, dependencies or unsafe code; no inference of password strength; no severity score or proof of network safety. Caller must verify OS-reported metadata and scope; empty advisory list is not a safety verdict. Platform adapters, real password evaluation/generation, other profile checks and hardware validation remain open. This is a same-session code review, not an independent audit.
