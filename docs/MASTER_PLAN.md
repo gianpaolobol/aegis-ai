@@ -21,3 +21,5 @@ Threat coverage: hostile agents, adaptive malware, ransomware, phishing, deepfak
 
 - AAIS: [Adaptive Immune System](ADAPTIVE_IMMUNE_SYSTEM.md), offline learning and immutable authorization, [response governance](RESPONSE_GOVERNANCE.md). Design only.
 - First release priority: [Windows alpha readiness](RELEASE_READINESS.md), followed by other platforms only after actual validation. No production protection claims.
+
+- ALIS: [Learning Integrity Shield](LEARNING_INTEGRITY.md). Quarantine, provenance, drift, artifact and RAG integrity, independent release gates and rollback; design only.
