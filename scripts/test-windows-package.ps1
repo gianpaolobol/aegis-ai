@@ -171,8 +171,9 @@ try {
         # Trust only the newly generated public leaf certificate, never a root CA.
         $cer = Join-Path $root 'ci-public-leaf.cer'
         Export-Certificate -Cert $cert -FilePath $cer | Out-Null
-        Import-Certificate -FilePath $cer -CertStoreLocation 'Cert:\LocalMachine\TrustedPeople' | Out-Null
+        # The exact thumbprint was absent before import. Arm cleanup before the call.
         $addedTrust = $true
+        Import-Certificate -FilePath $cer -CertStoreLocation 'Cert:\LocalMachine\TrustedPeople' | Out-Null
         if (-not (Test-Path -LiteralPath $trustedPath)) { throw 'Temporary leaf trust missing.' }
         & $signTool verify /pa /all $signedMsix
         if ($LASTEXITCODE -ne 0) { throw 'Development MSIX signature verification failed.' }
