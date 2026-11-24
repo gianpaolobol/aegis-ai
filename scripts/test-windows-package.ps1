@@ -178,3 +178,8 @@ try {
     if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
 }
 if (Test-Path -LiteralPath $root) { throw 'Temporary package cleanup failed.' }
+# GitHub Actions pwsh propagates the last native exit code. The last MakeAppx
+# invocation intentionally fails. Only report success after every assertion and
+# cleanup completed; any unexpected native failure or exception above still fails.
+Write-Output 'All package rehearsal assertions and cleanup passed.'
+exit 0
