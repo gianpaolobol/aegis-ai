@@ -142,6 +142,22 @@ try {
         throw 'MSIX extracted executable status check failed.'
     }
     Write-Output ("Unsigned MSIX rehearsal SHA256: " + (Get-FileHash -LiteralPath $msix -Algorithm SHA256).Hash)
+    # Regression for MakeAppx 0x80080204: a console alias requires multi-instance activation.
+    # Modify only the disposable staging manifest, then restore exact original bytes.
+    $stagedManifest = Join-Path $msixStage 'AppxManifest.xml'
+    $originalManifest = [System.IO.File]::ReadAllBytes($stagedManifest)
+    try {
+        $manifestText = [System.IO.File]::ReadAllText($stagedManifest)
+        $badManifest = $manifestText.Replace(' uap10:SupportsMultipleInstances="true"', '')
+        if ($badManifest -ceq $manifestText) { throw 'Console regression fixture not generated.' }
+        [System.IO.File]::WriteAllText($stagedManifest, $badManifest, [System.Text.UTF8Encoding]::new($false))
+        $badConsole = Join-Path $root 'single-instance-console-negative.msix'
+        & $sdk pack /d $msixStage /p $badConsole /o
+        if ($LASTEXITCODE -eq 0) { throw 'Console alias without multi-instance declaration was accepted.' }
+        Write-Output 'MSIX console multi-instance negative test passed.'
+    } finally {
+        [System.IO.File]::WriteAllBytes($stagedManifest, $originalManifest)
+    }
     Remove-Item -LiteralPath (Join-Path $assets 'Square44.png') -Force
     $badMsix = Join-Path $root 'missing-logo-negative.msix'
     & $sdk pack /d $msixStage /p $badMsix /o
