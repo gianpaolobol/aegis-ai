@@ -142,6 +142,85 @@ try {
         throw 'MSIX extracted executable status check failed.'
     }
     Write-Output ("Unsigned MSIX rehearsal SHA256: " + (Get-FileHash -LiteralPath $msix -Algorithm SHA256).Hash)
+    # Development signature rehearsal: only on a disposable GitHub-hosted runner.
+    # No production keys, PFX export, timestamp service, installation, or upload.
+    if ($env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or $env:GITHUB_ACTIONS -cne 'true') {
+        throw 'Signing rehearsal requires an ephemeral GitHub-hosted runner.'
+    }
+    $signTool = Join-Path (Split-Path -Parent $sdk) 'signtool.exe'
+    if (-not (Test-Path -LiteralPath $signTool -PathType Leaf)) { throw 'Pinned SignTool unavailable.' }
+    $signedMsix = Join-Path $root 'aegis-signed-test-only.msix'
+    Copy-Item -LiteralPath $msix -Destination $signedMsix
+    & $signTool verify /pa $msix
+    if ($LASTEXITCODE -eq 0) { throw 'Unsigned MSIX unexpectedly passed signature verification.' }
+    $cert = $null
+    $trustedPath = $null
+    $personalPath = $null
+    $addedTrust = $false
+    try {
+        $cert = New-SelfSignedCertificate -Type Custom -Subject 'CN=AEGIS AI CI Rehearsal' `
+            -CertStoreLocation 'Cert:\CurrentUser\My' -KeyUsage DigitalSignature `
+            -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -KeyExportPolicy NonExportable `
+            -NotAfter (Get-Date).AddHours(6) -FriendlyName 'AEGIS disposable CI signing test' `
+            -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3', '2.5.29.19={text}')
+        $personalPath = 'Cert:\CurrentUser\My\' + $cert.Thumbprint
+        $trustedPath = 'Cert:\LocalMachine\TrustedPeople\' + $cert.Thumbprint
+        if (Test-Path -LiteralPath $trustedPath) { throw 'Unexpected pre-existing trust entry.' }
+        & $signTool sign /fd SHA256 /s My /sha1 $cert.Thumbprint $signedMsix
+        if ($LASTEXITCODE -ne 0) { throw 'Development MSIX signing failed.' }
+        # Trust only the newly generated public leaf certificate, never a root CA.
+        $cer = Join-Path $root 'ci-public-leaf.cer'
+        Export-Certificate -Cert $cert -FilePath $cer | Out-Null
+        Import-Certificate -FilePath $cer -CertStoreLocation 'Cert:\LocalMachine\TrustedPeople' | Out-Null
+        $addedTrust = $true
+        if (-not (Test-Path -LiteralPath $trustedPath)) { throw 'Temporary leaf trust missing.' }
+        & $signTool verify /pa /all $signedMsix
+        if ($LASTEXITCODE -ne 0) { throw 'Development MSIX signature verification failed.' }
+        # Verify expected signer and retain exact payload after signing.
+        $signature = Get-AuthenticodeSignature -LiteralPath $signedMsix
+        if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate -or
+            $signature.SignerCertificate.Thumbprint -cne $cert.Thumbprint) {
+            throw 'Development package signer verification failed.'
+        }
+        $signedOut = Join-Path $root 'signed-unpacked'
+        & $sdk unpack /p $signedMsix /d $signedOut /o
+        if ($LASTEXITCODE -ne 0) { throw 'Signed MSIX unpack failed.' }
+        foreach ($name in $payload) {
+            $a = (Get-FileHash -LiteralPath (Join-Path $msixStage $name) -Algorithm SHA256).Hash
+            $b = (Get-FileHash -LiteralPath (Join-Path $signedOut $name) -Algorithm SHA256).Hash
+            if ($a -ne $b) { throw 'Signed MSIX payload hash mismatch.' }
+        }
+        # Modify only a disposable copy of the synthetic package, never the original.
+        $tampered = Join-Path $root 'tampered-signed-test.msix'
+        Copy-Item -LiteralPath $signedMsix -Destination $tampered
+        $archive = [System.IO.Compression.ZipFile]::Open($tampered, [System.IO.Compression.ZipArchiveMode]::Update)
+        try {
+            $entry = $archive.GetEntry('LIMITATIONS.txt')
+            if ($null -eq $entry) { throw 'Missing synthetic tamper fixture entry.' }
+            $entry.Delete()
+            $newEntry = $archive.CreateEntry('LIMITATIONS.txt')
+            $writer = [System.IO.StreamWriter]::new($newEntry.Open())
+            try { $writer.Write('Synthetic integrity regression only.') } finally { $writer.Dispose() }
+        } finally { $archive.Dispose() }
+        & $signTool verify /pa /all $tampered
+        if ($LASTEXITCODE -eq 0) { throw 'Modified signed package unexpectedly verified.' }
+        Write-Output 'Development MSIX signed and verified; tampered copy rejected.'
+    } finally {
+        # Remove only our ephemeral leaf and private key, even on test failure.
+        try {
+            if ($addedTrust -and (Test-Path -LiteralPath $trustedPath)) {
+                Remove-Item -LiteralPath $trustedPath -Force
+            }
+            if ($addedTrust -and (Test-Path -LiteralPath $trustedPath)) { throw 'Temporary trust cleanup failed.' }
+        } finally {
+            if ($personalPath -and (Test-Path -LiteralPath $personalPath)) {
+                Remove-Item -LiteralPath $personalPath -DeleteKey -Force
+            }
+            if ($personalPath -and (Test-Path -LiteralPath $personalPath)) { throw 'Temporary signing certificate cleanup failed.' }
+        }
+        if ($null -ne $cert) { $cert.Dispose() }
+    }
+    Write-Output 'Temporary signing certificate and trust cleanup passed.'
     # Regression for MakeAppx 0x80080204: a console alias requires multi-instance activation.
     # Modify only the disposable staging manifest, then restore exact original bytes.
     $stagedManifest = Join-Path $msixStage 'AppxManifest.xml'
