@@ -21,7 +21,7 @@ jobs:
       - run: cargo +1.100.0 test --locked --offline --all-targets
       - run: cargo +1.100.0 build --locked --offline --release --bin aegis-policy
       - run: cargo +1.100.0 test --locked --offline --release --test cli_smoke
-      - name: Rehearse unsigned Windows portable package (no upload)
+      - name: Rehearse Windows packaging and disposable test signing (no upload)
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/test-windows-package.ps1
