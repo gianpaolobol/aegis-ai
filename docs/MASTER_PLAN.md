@@ -18,3 +18,6 @@ Threat coverage: hostile agents, adaptive malware, ransomware, phishing, deepfak
 ## Cross-cutting modules
 - WIFI-01–06: [Wi-Fi Security Auditor](WIFI_SECURITY_AUDITOR.md). Advisory-only metadata classification, local authorized password assessment, secure generation and guidance, user-approved profile changes and synthetic demos. No invasive wireless operations.
 - ARFT: [Future technologies](FUTURE_TECHNOLOGIES.md). Crypto-agility and NHI architecture gates; confidential computing and PQC research and measured adoption.
+
+- AAIS: [Adaptive Immune System](ADAPTIVE_IMMUNE_SYSTEM.md), offline learning and immutable authorization, [response governance](RESPONSE_GOVERNANCE.md). Design only.
+- First release priority: [Windows alpha readiness](RELEASE_READINESS.md), followed by other platforms only after actual validation. No production protection claims.
