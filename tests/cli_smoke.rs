@@ -1,0 +1,67 @@
+#![forbid(unsafe_code)]
+// Copyright 2026 Gian Paolo Franceschini. See LICENSE.
+//! Process-level smoke tests for the read-only alpha; synthetic arguments only.
+use std::process::{Command, Output};
+
+fn run(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_aegis-policy"))
+        .args(args)
+        .output()
+        .expect("launch alpha executable")
+}
+fn stdout(output: &Output) -> &str {
+    std::str::from_utf8(&output.stdout).expect("UTF-8 stdout")
+}
+fn stderr(output: &Output) -> &str {
+    std::str::from_utf8(&output.stderr).expect("UTF-8 stderr")
+}
+#[test]
+fn help_and_default_exit_successfully() {
+    for args in [&[][..], &["--help"][..]] {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(0));
+        assert!(stdout(&output).contains("not validated"));
+        assert!(stdout(&output).contains("No device access"));
+        assert!(output.stderr.is_empty());
+    }
+}
+#[test]
+fn status_and_version_disclose_limitations() {
+    let status = run(&["status"]);
+    assert_eq!(status.status.code(), Some(0));
+    assert!(stdout(&status).contains("Active protection: unavailable"));
+    assert!(stdout(&status).contains("not enforcement"));
+    assert!(status.stderr.is_empty());
+    let version = run(&["--version"]);
+    assert_eq!(version.status.code(), Some(0));
+    assert!(stdout(&version).contains(env!("CARGO_PKG_VERSION")));
+    assert!(stdout(&version).contains("development alpha"));
+    assert!(version.stderr.is_empty());
+}
+#[test]
+fn synthetic_demos_have_expected_results() {
+    let policy = run(&["demo-policy"]);
+    assert_eq!(policy.status.code(), Some(0));
+    for expected in ["unscoped read: Deny", "scoped read: Allow",
+                     "scoped export: RequireApproval", "policy change: Deny"] {
+        assert!(stdout(&policy).contains(expected));
+    }
+    assert!(policy.stderr.is_empty());
+    let wifi = run(&["demo-wifi"]);
+    assert_eq!(wifi.status.code(), Some(0));
+    assert!(stdout(&wifi).contains("PermissionDenied"));
+    assert!(stdout(&wifi).contains("safety not established"));
+    assert!(stdout(&wifi).contains("no scan"));
+    assert!(wifi.stderr.is_empty());
+}
+#[test]
+fn invalid_invocations_fail_without_echoing_input() {
+    for args in [&["fixture-secret"][..], &["status", "fixture-secret"][..],
+                 &["--help", "fixture-secret"][..], &[""][..]] {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(stderr(&output).contains("Use --help."));
+        assert!(!stderr(&output).contains("fixture-secret"));
+    }
+}
