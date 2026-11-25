@@ -21,6 +21,108 @@ jobs:
       - run: cargo +1.100.0 test --locked --offline --all-targets
       - run: cargo +1.100.0 build --locked --offline --release --bin aegis-policy
       - run: cargo +1.100.0 test --locked --offline --release --test cli_smoke
+      - name: Verify Windows executable rebuild repeatability (same runner)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          function Assert-EqualDigest([string]$First, [string]$Second) {
+            if ($First -cnotmatch '^[0-9A-F]{64}
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/test-windows-package.ps1
+      - name: Reject package rehearsal outside authorized CI context
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          foreach ($case in @(
+            @{ Name = 'GITHUB_ACTIONS'; Value = '' },
+            @{ Name = 'GITHUB_ACTIONS'; Value = 'false' },
+            @{ Name = 'RUNNER_ENVIRONMENT'; Value = 'self-hosted' },
+            @{ Name = 'RUNNER_OS'; Value = 'Linux' },
+            @{ Name = 'RUNNER_TEMP'; Value = '' }
+          )) {
+            $saved = [Environment]::GetEnvironmentVariable($case.Name, 'Process')
+            try {
+              [Environment]::SetEnvironmentVariable($case.Name, $case.Value, 'Process')
+              $output = & pwsh -NoProfile -NonInteractive -File ./scripts/test-windows-package.ps1 2>&1
+              $code = $LASTEXITCODE
+              if ($code -eq 0 -or (($output -join "`n") -notmatch 'Run only in the authorized GitHub Actions test environment')) {
+                throw ('Package rehearsal authorization regression failed: ' + $case.Name)
+              }
+              Write-Output ('Unauthorized rehearsal correctly rejected: ' + $case.Name)
+            } finally {
+              [Environment]::SetEnvironmentVariable($case.Name, $saved, 'Process')
+            }
+          }
+          exit 0
+ -or $Second -cnotmatch '^[0-9A-F]{64}
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/test-windows-package.ps1
+      - name: Reject package rehearsal outside authorized CI context
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          foreach ($case in @(
+            @{ Name = 'GITHUB_ACTIONS'; Value = '' },
+            @{ Name = 'GITHUB_ACTIONS'; Value = 'false' },
+            @{ Name = 'RUNNER_ENVIRONMENT'; Value = 'self-hosted' },
+            @{ Name = 'RUNNER_OS'; Value = 'Linux' },
+            @{ Name = 'RUNNER_TEMP'; Value = '' }
+          )) {
+            $saved = [Environment]::GetEnvironmentVariable($case.Name, 'Process')
+            try {
+              [Environment]::SetEnvironmentVariable($case.Name, $case.Value, 'Process')
+              $output = & pwsh -NoProfile -NonInteractive -File ./scripts/test-windows-package.ps1 2>&1
+              $code = $LASTEXITCODE
+              if ($code -eq 0 -or (($output -join "`n") -notmatch 'Run only in the authorized GitHub Actions test environment')) {
+                throw ('Package rehearsal authorization regression failed: ' + $case.Name)
+              }
+              Write-Output ('Unauthorized rehearsal correctly rejected: ' + $case.Name)
+            } finally {
+              [Environment]::SetEnvironmentVariable($case.Name, $saved, 'Process')
+            }
+          }
+          exit 0
+) {
+              throw 'Invalid SHA-256 digest.'
+            }
+            if ($First -cne $Second) { throw 'Executable rebuild digest mismatch.' }
+          }
+          # Negative fixture: distinguish well-formed unequal digests from success.
+          $rejected = $false
+          try { Assert-EqualDigest ('A' * 64) ('B' * 64) } catch {
+            if ($_.Exception.Message -ne 'Executable rebuild digest mismatch.') { throw }
+            $rejected = $true
+          }
+          if (-not $rejected) { throw 'Unequal digest regression failed.' }
+          $rejected = $false
+          try { Assert-EqualDigest 'invalid' 'invalid' } catch {
+            if ($_.Exception.Message -ne 'Invalid SHA-256 digest.') { throw }
+            $rejected = $true
+          }
+          if (-not $rejected) { throw 'Invalid digest regression failed.' }
+          $exe = 'target/release/aegis-policy.exe'
+          $first = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+          & rustc +1.100.0 -Vv
+          if ($LASTEXITCODE -ne 0) { throw 'Compiler version query failed.' }
+          & cargo +1.100.0 clean --release --target-dir target
+          if ($LASTEXITCODE -ne 0 -or (Test-Path -LiteralPath $exe)) { throw 'Release clean failed.' }
+          & cargo +1.100.0 build --locked --offline --release --bin aegis-policy --target-dir target
+          if ($LASTEXITCODE -ne 0) { throw 'Clean release rebuild failed.' }
+          $second = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+          Write-Output "First executable SHA256: $first"
+          Write-Output "Clean rebuilt executable SHA256: $second"
+          Assert-EqualDigest $first $second
+          & cargo +1.100.0 test --locked --offline --release --test cli_smoke --target-dir target
+          if ($LASTEXITCODE -ne 0) { throw 'Rebuilt release smoke tests failed.' }
+          Assert-EqualDigest $second (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+          Write-Output 'Same-runner rebuild and negative digest regressions passed.'
+          exit 0
       - name: Rehearse Windows packaging and disposable test signing (no upload)
         if: runner.os == 'Windows'
         shell: pwsh
