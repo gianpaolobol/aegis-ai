@@ -5,7 +5,7 @@ use aegis_policy::{classify, Action, Decision};
 use aegis_policy::wifi::{audit, Audit, Metadata, Observation, Pmf, Reported, SecurityMode};
 use std::ffi::{OsStr, OsString};
 
-const HELP: &str = "AEGIS AI — alpha demonstrator (not validated)\nUsage: aegis-policy [status|demo-policy|demo-wifi|--help|--version]\nNo device access, network operations, antivirus or active protection.\n";
+const HELP: &str = "AEGIS AI — alpha demonstrator (not validated)\nUsage: aegis-policy [status|demo-policy|demo-wifi|demo-incidents|--help|--version]\nNo device access, network operations, antivirus or active protection.\n";
 const STATUS: &str = "AEGIS AI — development alpha\nActive protection: unavailable\nPolicy: pure classifier, not enforcement\nWi-Fi: synthetic metadata only, no radio access\nNo system settings changed. Keep native protections enabled.\n";
 fn run(args: &[OsString]) -> (i32, String) {
     if args.is_empty() { return (0, HELP.into()); }
@@ -47,6 +47,20 @@ fn run(args: &[OsString]) -> (i32, String) {
             }
         }
         return (0, report);
+    }
+    if arg == OsStr::new("demo-incidents") {
+        use aegis_policy::incident::{correlate, Event, Signal};
+        let events = [
+            Event { id: 1, asset: 1, seconds: 0, signal: Signal::IntegrityMismatch },
+            Event { id: 2, asset: 1, seconds: 60, signal: Signal::PolicyDenied },
+            Event { id: 3, asset: 2, seconds: 60, signal: Signal::NativeProtectionDisabled },
+            Event { id: 4, asset: 3, seconds: 60, signal: Signal::Normal },
+        ];
+        match correlate(&events) {
+            Ok(s) => return (0, format!("Synthetic incident correlation; not live telemetry or enforcement.\nEvents: {}\nAssets observed: {}\nAssets with advisories: {}\nAssets for review: {}\nNo attack probability or safety established.\n",
+                s.event_count, s.assets_observed, s.assets_with_advisories, s.assets_for_review)),
+            Err(_) => return (1, "Synthetic correlation unavailable.\n".into()),
+        }
     }
     (2, "Unknown command. Use --help.\n".into())
 }
