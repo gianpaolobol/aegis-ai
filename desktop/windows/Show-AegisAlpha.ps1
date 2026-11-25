@@ -324,6 +324,81 @@ function Test-AegisVpnReport {
     Write-Output 'PASS: minimized VPN profile synthetic fixtures'
 }
 
+
+# Structural link advisory only. Never resolve, open, transmit or echo a link.
+function Get-AegisLinkReport([string]$Link) {
+    $intro = 'Offline URL structure advisory; no reputation, DNS, TLS or content verification.'
+    $guidance = 'Do not follow unexpected links. Verify the sender or site via a separately known channel.'
+    $notes = @()
+    if ([string]::IsNullOrEmpty($Link) -or $Link.Length -gt 2048) {
+        $notes += 'Input missing or exceeds 2048 characters.'
+    } elseif ($Link -cmatch '[^\x21-\x7e]' -or $Link.Contains('\')) {
+        $notes += 'Whitespace, non-ASCII or ambiguous characters: unsupported; review independently.'
+    } elseif ($Link -notmatch '\Ahttps?://([^/?#]+)') {
+        $notes += 'Only explicit absolute HTTP or HTTPS links are supported.'
+    } else {
+        $authority = $Matches[1]
+        $uri = $null
+        if ($authority.Contains('%')) {
+            $notes += 'Encoded authority: unsupported; review independently.'
+        } elseif (-not [Uri]::TryCreate($Link,[UriKind]::Absolute,[ref]$uri) -or
+            -not $uri.IsWellFormedOriginalString() -or
+            @('http','https') -cnotcontains $uri.Scheme -or
+            [string]::IsNullOrEmpty($uri.Host)) {
+            $notes += 'Malformed or unsupported URL; review independently.'
+        } else {
+            if ($uri.Scheme -ceq 'http') { $notes += 'HTTP scheme: transport encryption is not indicated.' }
+            if ($authority.Contains('@') -or -not [string]::IsNullOrEmpty($uri.UserInfo)) {
+                $notes += 'User information in authority: destination may be misleading.'
+            }
+            if ($uri.HostNameType -eq [UriHostNameType]::IPv4 -or
+                $uri.HostNameType -eq [UriHostNameType]::IPv6) {
+                $notes += 'IP-literal destination: verify independently.'
+            } elseif ($uri.HostNameType -ne [UriHostNameType]::Dns) {
+                $notes += 'Unrecognized host form: verify independently.'
+            } elseif ($uri.IdnHost -match '(?:\A|\.)xn--') {
+                $notes += 'Internationalized domain encoding: verify the actual domain independently.'
+            }
+            if (-not $uri.IsDefaultPort) { $notes += 'Non-default port: verify independently.' }
+            if ($notes.Count -eq 0) { $notes += 'No selected structural indicator found; safety NOT established.' }
+        }
+    }
+    return (@($intro) + $notes + @($guidance) -join [Environment]::NewLine)
+}
+function Test-AegisLinkReport {
+    $cases = @(
+        @('https://example.invalid/path?token=SYNTHETIC-PRIVATE','safety NOT established'),
+        @('http://example.invalid','HTTP scheme'),
+        @('https://user:pass@example.invalid','User information'),
+        @('https://192.0.2.10','IP-literal'),
+        @('https://[2001:db8::1]','IP-literal'),
+        @('https://xn--bcher-kva.invalid','Internationalized domain'),
+        @('https://example.invalid:8443','Non-default port'),
+        @('file:///C:/fixture.txt','Only explicit'),
+        @('https://exa%6dple.invalid','Encoded authority'),
+        @('https://example.invalid\fixture','ambiguous characters'),
+        @('https://example.invalid/a b','ambiguous characters'),
+        @('https://example.invalid:99999','Malformed or unsupported'),
+        @('','Input missing'),
+        @(('a' * 2049),'exceeds 2048')
+    )
+    foreach ($case in $cases) {
+        $result = Get-AegisLinkReport $case[0]
+        if (-not $result.Contains($case[1]) -or -not $result.Contains('no reputation') -or
+            $result.Contains('SYNTHETIC-PRIVATE') -or $result.Contains('user:pass') -or
+            $result.Contains('example.invalid') -or $result.Contains('192.0.2.10')) {
+            throw 'URL structural advisory fixture failed'
+        }
+    }
+    $result = Get-AegisLinkReport ('https://b' + [char]0x00fc + 'cher.invalid')
+    if (-not $result.Contains('non-ASCII')) { throw 'Unicode input not explicitly unsupported' }
+    $result = Get-AegisLinkReport 'http://user@example.invalid:8080'
+    foreach ($expected in @('HTTP scheme','User information','Non-default port')) {
+        if (-not $result.Contains($expected)) { throw 'Combined advisory missing' }
+    }
+    Write-Output 'PASS: offline URL structure synthetic fixtures'
+}
+
 if ($SelfTest) {
     foreach ($command in (Get-AegisCommands)) {
         if (-not (Test-AegisCommand $command)) { throw 'Allowlist failure' }
@@ -335,6 +410,7 @@ if ($SelfTest) {
     Test-AegisIntegrity
     Test-AegisDnsReport
     Test-AegisVpnReport
+    Test-AegisLinkReport
     Write-Output 'PASS: fixed development UI command allowlist'
     return
 }
@@ -472,5 +548,46 @@ $vpn.Add_Click({
     }
 })
 $form.Controls.Add($vpn)
+
+
+$linkCheck = New-Object Windows.Forms.Button
+$linkCheck.Location = New-Object Drawing.Point(365,284)
+$linkCheck.Size = New-Object Drawing.Size(340,36)
+$linkCheck.Text = 'Suspicious link (offline advisory)'
+$linkCheck.Add_Click({
+    $dialog = New-Object Windows.Forms.Form
+    try {
+        $dialog.Text = 'Offline link advisory - no navigation'
+        $dialog.ClientSize = New-Object Drawing.Size(610,140)
+        $dialog.StartPosition = 'CenterParent'
+        $dialog.FormBorderStyle = 'FixedDialog'
+        $dialog.MaximizeBox = $false
+        $dialog.MinimizeBox = $false
+        $hint = New-Object Windows.Forms.Label
+        $hint.Location = New-Object Drawing.Point(12,10)
+        $hint.Size = New-Object Drawing.Size(580,42)
+        $hint.Text = 'Paste a link without passwords, tokens or personal data. No request will be sent. This is not a reputation or safety check.'
+        $dialog.Controls.Add($hint)
+        $entry = New-Object Windows.Forms.TextBox
+        $entry.Location = New-Object Drawing.Point(12,56)
+        $entry.Size = New-Object Drawing.Size(580,24)
+        # One extra character allows the evaluator to reject oversized input.
+        $entry.MaxLength = 2049
+        $dialog.Controls.Add($entry)
+        $check = New-Object Windows.Forms.Button
+        $check.Location = New-Object Drawing.Point(12,94)
+        $check.Size = New-Object Drawing.Size(180,32)
+        $check.Text = 'Check structure'
+        $check.DialogResult = [Windows.Forms.DialogResult]::OK
+        $dialog.AcceptButton = $check
+        $dialog.Controls.Add($check)
+        if ($dialog.ShowDialog($form) -eq [Windows.Forms.DialogResult]::OK) {
+            $output.Text = Get-AegisLinkReport $entry.Text
+        }
+        $entry.Clear()
+    } catch { $output.Text = 'Offline link advisory unavailable.' }
+    finally { $dialog.Dispose() }
+})
+$form.Controls.Add($linkCheck)
 
 try { [void]$form.ShowDialog() } finally { $form.Dispose() }
