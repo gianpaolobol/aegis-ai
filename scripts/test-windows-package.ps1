@@ -37,6 +37,7 @@ try {
     $componentRef = 'pkg:cargo/aegis-policy@' + $pkg.version
     $exeHash = (Get-FileHash -LiteralPath (Join-Path $stage 'aegis-policy.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
     $sbom = [ordered]@{
+        '$schema' = 'http://cyclonedx.org/schema/bom-1.7.schema.json'
         bomFormat = 'CycloneDX'
         specVersion = '1.7'
         version = 1
@@ -52,6 +53,12 @@ try {
             }
         }
         dependencies = @(@{ ref = $componentRef; dependsOn = @() })
+        # The application assembly and runtime dependency inventory are incomplete.
+        compositions = @(@{
+            aggregate = 'incomplete'
+            assemblies = @($componentRef)
+            dependencies = @($componentRef)
+        })
         properties = @(@{
             name = 'aegis:inventory:scope'
             value = 'Cargo graph only; compiler, standard library and OS/runtime components not inventoried'
@@ -85,14 +92,55 @@ try {
         }
     }
     Assert-PackageManifest
-    $readBom = Get-Content -Raw -LiteralPath (Join-Path $unpacked 'SBOM.cdx.json') | ConvertFrom-Json
-    if ($readBom.bomFormat -cne 'CycloneDX' -or $readBom.specVersion -cne '1.7' -or
-        $readBom.metadata.component.version -cne $pkg.version -or
-        $readBom.metadata.component.hashes[0].content -cne $exeHash -or
-        $readBom.dependencies[0].ref -cne $componentRef -or
-        @($readBom.dependencies[0].dependsOn).Count -ne 0) {
-        throw 'Extracted SBOM semantic check failed.'
+    # This is a strict check of the current partial Cargo inventory, not a
+    # general CycloneDX schema validator or a complete release SBOM.
+    function Assert-PartialCargoBom($bom) {
+        if ($bom.'$schema' -cne 'http://cyclonedx.org/schema/bom-1.7.schema.json' -or
+            $bom.bomFormat -cne 'CycloneDX' -or $bom.specVersion -cne '1.7' -or
+            $bom.version -ne 1 -or
+            $bom.metadata.component.'bom-ref' -cne $componentRef -or
+            $bom.metadata.component.purl -cne $componentRef -or
+            $bom.metadata.component.type -cne 'application' -or
+            $bom.metadata.component.name -cne $pkg.name -or
+            $bom.metadata.component.version -cne $pkg.version -or
+            @($bom.metadata.component.hashes).Count -ne 1 -or
+            $bom.metadata.component.hashes[0].alg -cne 'SHA-256' -or
+            $bom.metadata.component.hashes[0].content -cne $exeHash -or
+            @($bom.dependencies).Count -ne 1 -or
+            $bom.dependencies[0].ref -cne $componentRef -or
+            @($bom.dependencies[0].dependsOn).Count -ne 0 -or
+            @($bom.compositions).Count -ne 1 -or
+            $bom.compositions[0].aggregate -cne 'incomplete' -or
+            @($bom.compositions[0].assemblies).Count -ne 1 -or
+            $bom.compositions[0].assemblies[0] -cne $componentRef -or
+            @($bom.compositions[0].dependencies).Count -ne 1 -or
+            $bom.compositions[0].dependencies[0] -cne $componentRef -or
+            @($bom.properties).Count -ne 1 -or
+            $bom.properties[0].name -cne 'aegis:inventory:scope' -or
+            $bom.properties[0].value -cne 'Cargo graph only; compiler, standard library and OS/runtime components not inventoried') {
+            throw 'Extracted SBOM semantic check failed.'
+        }
     }
+    $bomJson = Get-Content -Raw -LiteralPath (Join-Path $unpacked 'SBOM.cdx.json')
+    Assert-PartialCargoBom ($bomJson | ConvertFrom-Json)
+    # Independent copies of synthetic metadata; no alteration of actual files.
+    foreach ($case in @('false-completeness','wrong-reference','wrong-hash','wrong-scope','extra-dependency')) {
+        $bad = $bomJson | ConvertFrom-Json
+        switch ($case) {
+            'false-completeness' { $bad.compositions[0].aggregate = 'complete' }
+            'wrong-reference' { $bad.compositions[0].assemblies = @('synthetic-wrong-ref') }
+            'wrong-hash' { $bad.metadata.component.hashes[0].content = ('z' * 64) }
+            'wrong-scope' { $bad.properties[0].value = 'Full inventory' }
+            'extra-dependency' { $bad.dependencies[0].dependsOn = @('synthetic-extra-ref') }
+        }
+        try {
+            Assert-PartialCargoBom $bad
+            throw "Unexpected partial SBOM acceptance: $case"
+        } catch {
+            if ($_.Exception.Message -cne 'Extracted SBOM semantic check failed.') { throw }
+        }
+    }
+    Write-Output 'Partial SBOM composition and semantic regressions passed (5 cases).'
     $exe = Join-Path $unpacked 'aegis-policy.exe'
     $status = & $exe status
     if ($LASTEXITCODE -ne 0 -or (($status -join "`n") -notmatch 'Active protection: unavailable')) {
