@@ -3,6 +3,9 @@
 Not an attestation verifier, package installer or approval to execute code.
 """
 import hashlib
+import base64
+import csv
+import re
 import io
 from pathlib import Path
 import stat
@@ -16,7 +19,54 @@ FILENAME = "yara_x-1.24.0-cp39-abi3-win_amd64.whl"
 SHA256 = "ce52bbf23683f47515bf493ee3d7c8346f3742c0dc5c654c389b8495b3dbfaca"
 MAX_WHEEL = 16 * 1024 * 1024
 MAX_METADATA = 256 * 1024
+MAX_EXPANDED = 64 * 1024 * 1024
+MAX_RECORD = 256 * 1024
 PREFIX = "yara_x-1.24.0.dist-info/"
+
+
+def verify_record(z, items):
+    """Strict candidate profile: SHA-256 only, no legacy detached signatures."""
+    files = {i.filename: i for i in items if not i.is_dir()}
+    record = PREFIX + "RECORD"
+    if record not in files or files[record].file_size > MAX_RECORD:
+        return False
+    if any(n in files for n in (record + ".jws", record + ".p7s")):
+        return False
+    if sum(i.file_size for i in files.values()) > MAX_EXPANDED:
+        return False
+    with z.open(files[record]) as stream:
+        raw = stream.read(MAX_RECORD + 1)
+    if len(raw) > MAX_RECORD:
+        return False
+    rows = {}
+    for row in csv.reader(io.StringIO(raw.decode("utf-8"), newline=""), strict=True):
+        if len(row) != 3 or row[0] in rows or row[0] not in files:
+            return False
+        rows[row[0]] = (row[1], row[2])
+    if rows.keys() != files.keys() or rows[record] != ("", ""):
+        return False
+    for name, item in files.items():
+        if name == record:
+            continue
+        digest, size = rows[name]
+        if (not re.fullmatch(r"sha256=[A-Za-z0-9_-]{43}", digest)
+                or size != str(item.file_size)):
+            return False
+        h = hashlib.sha256()
+        count = 0
+        with z.open(item) as stream:
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    break
+                count += len(chunk)
+                if count > item.file_size:
+                    return False
+                h.update(chunk)
+        actual = "sha256=" + base64.urlsafe_b64encode(h.digest()).decode("ascii").rstrip("=")
+        if count != item.file_size or actual != digest:
+            return False
+    return True
 
 
 def inspect_bytes(data, expected):
@@ -53,6 +103,8 @@ def inspect_bytes(data, expected):
                 m.get_all("Version") != ["1.24.0"] or
                 w.get_all("Tag") != ["cp39-abi3-win_amd64"]):
                 return "MetadataMismatch"
+            if not verify_record(z, items):
+                return "RecordMismatch"
             if m.get_all("Requires-Dist"):
                 return "DependencyReviewRequired"
             return "DigestAndMetadataMatch"
@@ -76,18 +128,54 @@ def inspect_path(path):
 
 class Fixtures(unittest.TestCase):
     def wheel(self, name="yara-x", version="1.24.0", tag="cp39-abi3-win_amd64",
-              extra="", member=None):
+              extra="", member=None, record_mode="valid"):
         b = io.BytesIO()
+        contents = {
+            PREFIX + "METADATA": f"Name: {name}\nVersion: {version}\n{extra}\n".encode(),
+            PREFIX + "WHEEL": f"Tag: {tag}\n\n".encode(),
+        }
+        if member:
+            contents[member] = b"synthetic"
+        record = PREFIX + "RECORD"
+        out = io.StringIO(newline="")
+        writer = csv.writer(out)
+        for index, (key, value) in enumerate(contents.items()):
+            digest = base64.urlsafe_b64encode(hashlib.sha256(value).digest()).decode().rstrip("=")
+            row = [key, "sha256=" + digest, str(len(value))]
+            if index == 0:
+                if record_mode == "bad_hash":
+                    row[1] = "sha256=" + "A" * 43
+                elif record_mode == "bad_size":
+                    row[2] = "0"
+                elif record_mode == "weak_hash":
+                    row[1] = "sha1=" + "A" * 27
+                elif record_mode == "omitted":
+                    continue
+                elif record_mode == "duplicate":
+                    writer.writerow(row)
+            writer.writerow(row)
+        writer.writerow([record, "", ""])
+        if record_mode == "extra":
+            writer.writerow(["absent.txt", "", ""])
         with zipfile.ZipFile(b, "w") as z:
-            z.writestr(PREFIX + "METADATA", f"Name: {name}\nVersion: {version}\n{extra}\n")
-            z.writestr(PREFIX + "WHEEL", f"Tag: {tag}\n\n")
-            if member:
-                z.writestr(member, "synthetic")
+            for key, value in contents.items():
+                z.writestr(key, value)
+            if record_mode != "missing":
+                z.writestr(record, out.getvalue())
         return b.getvalue()
     def check(self, data):
         return inspect_bytes(data, hashlib.sha256(data).hexdigest())
     def test_match_is_not_approval(self):
         self.assertEqual(self.check(self.wheel()), "DigestAndMetadataMatch")
+    def test_record_failures(self):
+        for mode in ("missing", "bad_hash", "bad_size", "weak_hash", "omitted",
+                     "duplicate", "extra"):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.check(self.wheel(record_mode=mode)), "RecordMismatch")
+    def test_expanded_limit(self):
+        from unittest.mock import patch
+        with patch(__name__ + ".MAX_EXPANDED", 1):
+            self.assertEqual(self.check(self.wheel()), "RecordMismatch")
     def test_changed_bytes(self):
         d = self.wheel()
         self.assertEqual(inspect_bytes(d+b"x", hashlib.sha256(d).hexdigest()), "DigestMismatch")
