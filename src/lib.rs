@@ -482,3 +482,132 @@ pub mod alis_promotion {
         }
     }
 }
+
+
+/// ALIS-04: bounded offline split-integrity rehearsal over synthetic metadata.
+/// Does not authenticate identifiers, detect semantic similarity, or approve learning.
+pub mod alis_split {
+    use std::collections::BTreeSet;
+    pub type Id = [u8; 32];
+    pub const MAX_PER_SPLIT: usize = 4096;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Record {
+        pub record_id: Id,
+        pub content_digest: Id,
+        /// Independently assigned leakage group, e.g. one synthetic session.
+        pub group_id: Id,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Verdict {
+        EmptySplit,
+        TooLarge,
+        InvalidIdentifier,
+        DuplicateRecordOrContent,
+        SharedGroup,
+        ExactMetadataDisjointOnly,
+    }
+
+    /// A successful check is necessary, never sufficient, for independent evaluation.
+    /// Groups may repeat within one split but not across the two splits.
+    /// Record IDs and exact content digests must be unique across both splits.
+    pub fn check(training: &[Record], holdout: &[Record]) -> Verdict {
+        if training.is_empty() || holdout.is_empty() {
+            return Verdict::EmptySplit;
+        }
+        if training.len() > MAX_PER_SPLIT || holdout.len() > MAX_PER_SPLIT {
+            return Verdict::TooLarge;
+        }
+        let all = training.iter().chain(holdout);
+        if all.clone().any(|r| [r.record_id, r.content_digest, r.group_id].contains(&[0; 32])) {
+            return Verdict::InvalidIdentifier;
+        }
+        let mut ids = BTreeSet::new();
+        let mut content = BTreeSet::new();
+        for r in all {
+            if !ids.insert(r.record_id) || !content.insert(r.content_digest) {
+                return Verdict::DuplicateRecordOrContent;
+            }
+        }
+        let train_groups: BTreeSet<Id> = training.iter().map(|r| r.group_id).collect();
+        if holdout.iter().any(|r| train_groups.contains(&r.group_id)) {
+            return Verdict::SharedGroup;
+        }
+        Verdict::ExactMetadataDisjointOnly
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        fn record(id: u8, content: u8, group: u8) -> Record {
+            Record { record_id: [id; 32], content_digest: [content; 32],
+                group_id: [group; 32] }
+        }
+        #[test]
+        fn distinct_splits_are_metadata_only() {
+            let train = [record(1, 11, 21), record(2, 12, 21)];
+            let held = [record(3, 13, 22), record(4, 14, 22)];
+            assert_eq!(check(&train, &held), Verdict::ExactMetadataDisjointOnly);
+            assert_eq!(check(&held, &train), Verdict::ExactMetadataDisjointOnly);
+        }
+        #[test]
+        fn empty_splits_fail() {
+            let valid = [record(1, 11, 21)];
+            assert_eq!(check(&[], &valid), Verdict::EmptySplit);
+            assert_eq!(check(&valid, &[]), Verdict::EmptySplit);
+            assert_eq!(check(&[], &[]), Verdict::EmptySplit);
+        }
+        #[test]
+        fn oversized_splits_fail_before_iteration() {
+            let r = record(1, 11, 21);
+            let many = vec![r; MAX_PER_SPLIT + 1];
+            assert_eq!(check(&many, &[r]), Verdict::TooLarge);
+            assert_eq!(check(&[r], &many), Verdict::TooLarge);
+        }
+        #[test]
+        fn zero_in_any_identifier_fails_in_either_split() {
+            let good = record(1, 11, 21);
+            for bad in [record(0, 12, 22), record(2, 0, 22), record(2, 12, 0)] {
+                assert_eq!(check(&[good], &[bad]), Verdict::InvalidIdentifier);
+                assert_eq!(check(&[bad], &[good]), Verdict::InvalidIdentifier);
+            }
+        }
+        #[test]
+        fn duplicate_record_even_with_different_digest_fails() {
+            let a = record(1, 11, 21);
+            let b = record(1, 12, 22);
+            assert_eq!(check(&[a], &[b]), Verdict::DuplicateRecordOrContent);
+            assert_eq!(check(&[a, b], &[record(3, 13, 23)]), Verdict::DuplicateRecordOrContent);
+        }
+        #[test]
+        fn duplicate_content_under_different_ids_fails() {
+            let a = record(1, 11, 21);
+            let b = record(2, 11, 22);
+            assert_eq!(check(&[a], &[b]), Verdict::DuplicateRecordOrContent);
+            assert_eq!(check(&[record(3, 13, 23)], &[a, b]), Verdict::DuplicateRecordOrContent);
+        }
+        #[test]
+        fn shared_group_fails_even_if_records_are_distinct() {
+            let a = record(1, 11, 21);
+            let b = record(2, 12, 21);
+            assert_eq!(check(&[a], &[b]), Verdict::SharedGroup);
+        }
+        #[test]
+        fn full_bound_and_order_independence() {
+            fn make(i: u32, group: u8) -> Record {
+                let mut id = [0; 32];
+                id[..4].copy_from_slice(&i.to_be_bytes());
+                let mut digest = id;
+                digest[31] = 1;
+                Record { record_id: id, content_digest: digest, group_id: [group; 32] }
+            }
+            let n = MAX_PER_SPLIT as u32;
+            let mut train: Vec<_> = (1..=n).map(|i| make(i, 1)).collect();
+            let held: Vec<_> = (n+1..=2*n).map(|i| make(i, 2)).collect();
+            assert_eq!(check(&train, &held), Verdict::ExactMetadataDisjointOnly);
+            train.reverse();
+            assert_eq!(check(&train, &held), Verdict::ExactMetadataDisjointOnly);
+        }
+    }
+}
