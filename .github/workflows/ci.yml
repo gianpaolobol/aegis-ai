@@ -79,6 +79,10 @@ jobs:
           Assert-EqualDigest $second (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
           Write-Output 'Same-runner rebuild and negative digest regressions passed.'
           exit 0
+      - name: Collect Windows release license and direct dependency evidence (no redistribution)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/inspect-windows-release-evidence.ps1
       - name: Rehearse Windows packaging and disposable test signing (no upload)
         if: runner.os == 'Windows'
         shell: pwsh
