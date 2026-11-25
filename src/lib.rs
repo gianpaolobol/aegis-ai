@@ -611,3 +611,145 @@ pub mod alis_split {
         }
     }
 }
+
+
+/// ALIS-05: bounded quarantine propagation over synthetic artifact lineage.
+/// No IO, authentication, training, deletion or deployment authority.
+pub mod alis_quarantine {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    pub type Id = [u8; 32];
+    pub const MAX_ARTIFACTS: usize = 1024;
+    pub const MAX_PARENTS: usize = 8;
+
+    #[derive(Clone, Debug)]
+    pub struct Artifact {
+        pub id: Id,
+        /// Every parent must occur earlier in the supplied topological order.
+        pub parents: Vec<Id>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Error {
+        EmptyGraph,
+        TooLarge,
+        InvalidIdentifier,
+        DuplicateArtifact,
+        TooManyParents,
+        DuplicateParent,
+        MissingOrUnorderedParent,
+        UnknownSeed,
+        DuplicateSeed,
+    }
+
+    /// Output is metadata for review only. A missing quarantine flag is NOT
+    /// clearance. A malformed graph produces no partial result. Parentless
+    /// nodes are declared roots, not proof of authentic or complete lineage.
+    pub fn affected(graph: &[Artifact], seeds: &[Id]) -> Result<BTreeSet<Id>, Error> {
+        if graph.is_empty() { return Err(Error::EmptyGraph); }
+        if graph.len() > MAX_ARTIFACTS || seeds.len() > MAX_ARTIFACTS {
+            return Err(Error::TooLarge);
+        }
+        let mut known = BTreeMap::new();
+        for (index, node) in graph.iter().enumerate() {
+            if node.id == [0; 32] { return Err(Error::InvalidIdentifier); }
+            if known.contains_key(&node.id) { return Err(Error::DuplicateArtifact); }
+            if node.parents.len() > MAX_PARENTS { return Err(Error::TooManyParents); }
+            let mut unique = BTreeSet::new();
+            for parent in &node.parents {
+                if *parent == [0; 32] { return Err(Error::InvalidIdentifier); }
+                if !unique.insert(*parent) { return Err(Error::DuplicateParent); }
+                if !known.contains_key(parent) { return Err(Error::MissingOrUnorderedParent); }
+            }
+            known.insert(node.id, index);
+        }
+        let mut marked = BTreeSet::new();
+        for seed in seeds {
+            if *seed == [0; 32] { return Err(Error::InvalidIdentifier); }
+            if !known.contains_key(seed) { return Err(Error::UnknownSeed); }
+            if !marked.insert(*seed) { return Err(Error::DuplicateSeed); }
+        }
+        for node in graph {
+            if node.parents.iter().any(|p| marked.contains(p)) {
+                marked.insert(node.id);
+            }
+        }
+        Ok(marked)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        fn id(n: u16) -> Id {
+            let mut out = [0; 32];
+            out[..2].copy_from_slice(&n.to_be_bytes());
+            out
+        }
+        fn node(n: u16, parents: &[u16]) -> Artifact {
+            Artifact { id: id(n), parents: parents.iter().map(|&p| id(p)).collect() }
+        }
+        fn graph() -> Vec<Artifact> {
+            vec![node(1, &[]), node(2, &[]), node(3, &[1]),
+                 node(4, &[2, 3]), node(5, &[2]), node(6, &[4])]
+        }
+        #[test]
+        fn transitive_propagation_preserves_unrelated_metadata() {
+            assert_eq!(affected(&graph(), &[id(1)]).unwrap(),
+                BTreeSet::from([id(1), id(3), id(4), id(6)]));
+        }
+        #[test]
+        fn multiple_seeds_and_no_seed() {
+            assert_eq!(affected(&graph(), &[id(1), id(5)]).unwrap(),
+                BTreeSet::from([id(1), id(3), id(4), id(5), id(6)]));
+            assert!(affected(&graph(), &[]).unwrap().is_empty());
+        }
+        #[test]
+        fn missing_forward_self_and_cyclic_parents_rejected() {
+            for bad in [vec![node(1, &[9])], vec![node(1, &[1])],
+                vec![node(1, &[2]), node(2, &[])],
+                vec![node(1, &[2]), node(2, &[1])]] {
+                assert_eq!(affected(&bad, &[]), Err(Error::MissingOrUnorderedParent));
+            }
+        }
+        #[test]
+        fn duplicates_rejected() {
+            assert_eq!(affected(&[node(1, &[]), node(1, &[])], &[]),
+                Err(Error::DuplicateArtifact));
+            assert_eq!(affected(&[node(1, &[]), node(2, &[1, 1])], &[]),
+                Err(Error::DuplicateParent));
+            assert_eq!(affected(&graph(), &[id(1), id(1)]), Err(Error::DuplicateSeed));
+        }
+        #[test]
+        fn unknown_and_zero_identifiers_rejected() {
+            assert_eq!(affected(&graph(), &[id(99)]), Err(Error::UnknownSeed));
+            assert_eq!(affected(&graph(), &[id(0)]), Err(Error::InvalidIdentifier));
+            assert_eq!(affected(&[node(0, &[])], &[]), Err(Error::InvalidIdentifier));
+            assert_eq!(affected(&[node(1, &[0])], &[]), Err(Error::InvalidIdentifier));
+        }
+        #[test]
+        fn bounds_fail_closed() {
+            assert_eq!(affected(&[], &[]), Err(Error::EmptyGraph));
+            let many = vec![node(1, &[]); MAX_ARTIFACTS + 1];
+            assert_eq!(affected(&many, &[]), Err(Error::TooLarge));
+            assert_eq!(affected(&graph(), &vec![id(1); MAX_ARTIFACTS + 1]),
+                Err(Error::TooLarge));
+            let too_many = node(2, &vec![1; MAX_PARENTS + 1]);
+            assert_eq!(affected(&[node(1, &[]), too_many], &[]), Err(Error::TooManyParents));
+        }
+        #[test]
+        fn maximum_chain_propagates_without_recursion() {
+            let g: Vec<_> = (1..=MAX_ARTIFACTS as u16).map(|i|
+                if i == 1 { node(i, &[]) } else { node(i, &[i-1]) }).collect();
+            assert_eq!(affected(&g, &[id(1)]).unwrap().len(), MAX_ARTIFACTS);
+        }
+        #[test]
+        fn valid_topological_orders_give_same_set() {
+            let a = graph();
+            let mut b = a.clone();
+            b.swap(0, 1);
+            b.swap(4, 5);
+            assert_eq!(affected(&a, &[id(2), id(1)]),
+                affected(&b, &[id(1), id(2)]));
+        }
+    }
+}
