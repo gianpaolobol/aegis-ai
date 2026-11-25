@@ -518,8 +518,12 @@ function Get-AegisEncryptionReport([scriptblock]$ReadVolumes) {
         if ($rows.Count -eq 0 -or $rows.Count -gt 128) { return $unavailable }
         $on = 0; $off = 0; $unknown = 0; $transition = 0; $decrypted = 0; $inconsistent = 0
         foreach ($row in $rows) {
-            $p = Get-AegisProperty $row 'ProtectionStatus'
-            $c = Get-AegisProperty $row 'ConversionStatus'
+            if ($null -eq $row) { $unknown++; continue }
+            $pp = $row.PSObject.Properties['ProtectionStatus']
+            $cp = $row.PSObject.Properties['ConversionStatus']
+            if ($null -eq $pp -or $null -eq $cp) { $unknown++; continue }
+            $p = $pp.Value
+            $c = $cp.Value
             # Only native UInt32 values are expected; do not coerce null, strings or booleans.
             if ($p -isnot [uint32] -or $c -isnot [uint32] -or $p -gt 2 -or $c -gt 5) {
                 $unknown++
@@ -551,9 +555,11 @@ function Test-AegisEncryptionReport {
         [pscustomobject]@{ProtectionStatus='1';ConversionStatus=[uint32]1}
         [pscustomobject]@{ProtectionStatus=$null;ConversionStatus=[uint32]1}
         [pscustomobject]@{ProtectionStatus=[uint32]0;ConversionStatus=[uint32]99}
+        [pscustomobject]@{ProtectionStatus=@([uint32]1);ConversionStatus=[uint32]1}
+        [pscustomobject]@{ConversionStatus=[uint32]1}
     }
-    foreach ($expected in @('Reported volumes: 9','Protection on and encrypted reported: 1',
-        'Protection off reported: 3','Protection unknown or inconsistent: 5',
+    foreach ($expected in @('Reported volumes: 11','Protection on and encrypted reported: 1',
+        'Protection off reported: 3','Protection unknown or inconsistent: 7',
         'Fully decrypted reported: 1','Encryption/decryption in progress or paused: 2','Inconsistent snapshots: 1')) {
         if (-not $report.Contains($expected)) { throw 'Encryption fixture mismatch' }
     }
