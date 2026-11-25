@@ -4,7 +4,7 @@ param([switch]$SelfTest, [switch]$UiSmokeTest)
 if ($SelfTest -and $UiSmokeTest) { throw 'Select only one test mode.' }
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-function Get-AegisCommands { @('status','demo-policy','demo-wifi','demo-incidents','--version') }
+function Get-AegisCommands { @('status','demo-policy','demo-wifi','demo-incidents','demo-patches','--version') }
 function Test-AegisCommand([string]$Command) { return (Get-AegisCommands) -ccontains $Command }
 # Native diagnostic readings are advisory, not AEGIS enforcement.
 function Convert-AegisState($Value) {
@@ -845,6 +845,15 @@ $encryption.Add_Click({
 })
 $form.Controls.Add($encryption)
 
+$patchPriority = New-Object Windows.Forms.Button
+$patchPriority.Location = New-Object Drawing.Point(365,372)
+$patchPriority.Size = New-Object Drawing.Size(340,36)
+$patchPriority.Text = 'Patch priority (synthetic)'
+$patchPriority.Add_Click({
+    $output.Text = Get-AegisCliReport 'demo-patches'
+})
+$form.Controls.Add($patchPriority)
+
 
 try {
     if ($UiSmokeTest) {
@@ -855,7 +864,7 @@ try {
             'Verify local file integrity (16 MiB max)','Incident correlation (synthetic)',
             'Windows VPN profiles (read-only)','Suspicious link (offline advisory)',
             'Windows patch inventory (partial)','Invoice IBAN comparison (offline, IT)',
-            'Windows disk encryption (read-only)')
+            'Windows disk encryption (read-only)','Patch priority (synthetic)')
         if ($buttons.Count -ne $labels.Count) { throw 'Unexpected GUI button count.' }
         foreach ($label in $labels) {
             if (@($buttons | Where-Object { $_.Text -ceq $label }).Count -ne 1) {
@@ -877,7 +886,7 @@ try {
         if ((Get-AegisCliReport 'scan') -cne 'Command rejected.') {
             throw 'Invalid command bridge regression.'
         }
-        Write-Output 'PASS: GUI constructed; thirteen controls, safety labels, five CLI calls and denied command.'
+        Write-Output 'PASS: GUI constructed; fourteen controls, safety labels, six CLI calls and denied command.'
     } else {
         [void]$form.ShowDialog()
     }

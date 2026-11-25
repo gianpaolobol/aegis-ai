@@ -5,7 +5,7 @@ use aegis_policy::{classify, Action, Decision};
 use aegis_policy::wifi::{audit, Audit, Metadata, Observation, Pmf, Reported, SecurityMode};
 use std::ffi::{OsStr, OsString};
 
-const HELP: &str = "AEGIS AI — alpha demonstrator (not validated)\nUsage: aegis-policy [status|demo-policy|demo-wifi|demo-incidents|--help|--version]\nNo device access, network operations, antivirus or active protection.\n";
+const HELP: &str = "AEGIS AI — alpha demonstrator (not validated)\nUsage: aegis-policy [status|demo-policy|demo-wifi|demo-incidents|demo-patches|--help|--version]\nNo device access, network operations, antivirus or active protection.\n";
 const STATUS: &str = "AEGIS AI — development alpha\nActive protection: unavailable\nPolicy: pure classifier, not enforcement\nWi-Fi: synthetic metadata only, no radio access\nNo system settings changed. Keep native protections enabled.\n";
 fn run(args: &[OsString]) -> (i32, String) {
     if args.is_empty() { return (0, HELP.into()); }
@@ -60,6 +60,26 @@ fn run(args: &[OsString]) -> (i32, String) {
             Ok(s) => return (0, format!("Synthetic incident correlation; not live telemetry or enforcement.\nEvents: {}\nAssets observed: {}\nAssets with advisories: {}\nAssets for review: {}\nNo attack probability or safety established.\n",
                 s.event_count, s.assets_observed, s.assets_with_advisories, s.assets_for_review)),
             Err(_) => return (1, "Synthetic correlation unavailable.\n".into()),
+        }
+    }
+    if arg == OsStr::new("demo-patches") {
+        use aegis_policy::patch::{triage, Advisory, Applicability, Evidence, Finding, ProductBuild};
+        let p = ProductBuild { product: 1, build: 1 };
+        let other = ProductBuild { product: 1, build: 2 };
+        let findings = [
+            Finding { product: p, vulnerability: 1, applicability: Applicability::Affected },
+            Finding { product: p, vulnerability: 2, applicability: Applicability::Affected },
+            Finding { product: other, vulnerability: 1, applicability: Applicability::Affected },
+        ];
+        let reviewed = Evidence::ReviewedFixture;
+        match triage(p, reviewed, reviewed, reviewed, &[1], &findings) {
+            Ok(v) => {
+                let priority = v.iter().filter(|a| **a == Advisory::PriorityReview).count();
+                let unknown = v.iter().filter(|a| **a == Advisory::ApplicabilityUnknown).count();
+                let review = v.iter().filter(|a| **a == Advisory::ReviewNotListedInFixture).count();
+                return (0, format!("Synthetic patch priority; no real KEV catalog or CVE mapping.\nPriority review: {priority}\nOther review: {review}\nApplicability unknown: {unknown}\nNo patch installation or safety established.\n"));
+            }
+            Err(_) => return (1, "Synthetic patch priority unavailable.\n".into()),
         }
     }
     (2, "Unknown command. Use --help.\n".into())

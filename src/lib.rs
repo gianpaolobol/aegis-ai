@@ -3,6 +3,7 @@
 //! Pure policy classifier; not an authorization boundary.
 
 pub mod wifi;
+pub mod patch;
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Action { Read, Write, Export, Execute, ChangePolicy, Unknown }
 #[derive(Debug, PartialEq, Eq)]
