@@ -254,6 +254,76 @@ function Test-AegisIntegrity {
     Write-Output 'PASS: local SHA-256 synthetic fixtures'
 }
 
+# VPN profile configuration only; not a tunnel, traffic or WireGuard detector.
+# Do not display profile names, endpoints, identifiers or authentication details.
+function Get-AegisVpnScope([scriptblock]$ReadProfiles) {
+    try {
+        $records = @(& $ReadProfiles | Select-Object -First 129)
+        if ($records.Count -gt 128) { return 'Inventory unavailable (limit exceeded).' }
+        $connected=0; $disconnected=0; $statusUnknown=0
+        $split=0; $noSplit=0; $splitUnknown=0; $pptp=0; $automatic=0; $other=0; $typeUnknown=0
+        foreach ($record in $records) {
+            $status = $null; $mode = $null; $tunnel = $null
+            if ($null -ne $record) {
+                $prop = $record.PSObject.Properties['ConnectionStatus']
+                if ($null -ne $prop) { $status = $prop.Value }
+                $prop = $record.PSObject.Properties['SplitTunneling']
+                if ($null -ne $prop) { $mode = $prop.Value }
+                $prop = $record.PSObject.Properties['TunnelType']
+                if ($null -ne $prop) { $tunnel = $prop.Value }
+            }
+            if ($status -is [string] -or $status -is [System.Enum]) {
+                if ([string]$status -ceq 'Connected') { $connected++ }
+                elseif ([string]$status -ceq 'Disconnected') { $disconnected++ }
+                else { $statusUnknown++ }
+            } else { $statusUnknown++ }
+            if ($mode -is [bool]) {
+                if ($mode) { $split++ } else { $noSplit++ }
+            } else { $splitUnknown++ }
+            if ($tunnel -is [string] -or $tunnel -is [System.Enum]) {
+                if ([string]$tunnel -ieq 'Pptp') { $pptp++ }
+                elseif ([string]$tunnel -ieq 'Automatic') { $automatic++ }
+                elseif (@('Ikev2','Sstp','L2tp') -icontains [string]$tunnel) { $other++ }
+                else { $typeUnknown++ }
+            } else { $typeUnknown++ }
+        }
+        return (@("Provider profile rows: $($records.Count)",
+            "Connection reported connected: $connected; disconnected: $disconnected; unknown: $statusUnknown",
+            "Split tunneling configured: $split; disabled: $noSplit; unknown: $splitUnknown",
+            "Configured protocol PPTP: $pptp; Automatic: $automatic; other recognized: $other; unknown: $typeUnknown") -join [Environment]::NewLine)
+    } catch { return 'Inventory unavailable (provider failure).' }
+}
+function Get-AegisVpnReport([scriptblock]$ReadUser,[scriptblock]$ReadGlobal) {
+    return (@('Windows VPN profiles (read-only).',
+        'Current user phone book:', (Get-AegisVpnScope $ReadUser),
+        'Global phone book:', (Get-AegisVpnScope $ReadGlobal),
+        'Counts are provider rows, not unique or verified tunnels.',
+        'PPTP configuration merits review. Automatic does not identify the negotiated protocol.',
+        'No route, encryption, leak, kill switch or WireGuard assessment. Third-party VPNs may not appear.') -join [Environment]::NewLine)
+}
+function Test-AegisVpnReport {
+    $report = Get-AegisVpnReport {
+        [pscustomobject]@{ConnectionStatus='Connected';SplitTunneling=$true;TunnelType='Ikev2';Name='SYNTHETIC-PRIVATE';ServerAddress='192.0.2.12'}
+        [pscustomobject]@{ConnectionStatus='Disconnected';SplitTunneling=$false;TunnelType='Pptp'}
+        [pscustomobject]@{ConnectionStatus=@('Connected');SplitTunneling='True';TunnelType=@('Automatic')}
+        [pscustomobject]@{ConnectionStatus='Connecting';TunnelType='Automatic'}
+    } { throw 'SYNTHETIC-PRIVATE' }
+    foreach ($expected in @('Provider profile rows: 4','connected: 1; disconnected: 1; unknown: 2',
+        'configured: 1; disabled: 1; unknown: 2',
+        'PPTP: 1; Automatic: 1; other recognized: 1; unknown: 1',
+        'Inventory unavailable (provider failure).')) {
+        if (-not $report.Contains($expected)) { throw 'VPN fixture count mismatch' }
+    }
+    if ($report.Contains('SYNTHETIC-PRIVATE') -or $report.Contains('192.0.2.12')) { throw 'VPN report disclosed private field' }
+    if (-not (Get-AegisVpnScope {}).Contains('Provider profile rows: 0')) { throw 'Empty successful scope misreported' }
+    if ((Get-AegisVpnScope { for ($i=0;$i -lt 129;$i++) { [pscustomobject]@{} } }) -cne 'Inventory unavailable (limit exceeded).') { throw 'VPN scope bound failed' }
+    $report = Get-AegisVpnReport { throw 'Unavailable' } { [pscustomobject]@{ConnectionStatus='Connected';SplitTunneling=$false;TunnelType='Sstp'} }
+    if (-not $report.Contains('Inventory unavailable (provider failure).') -or -not $report.Contains('connected: 1; disconnected: 0; unknown: 0')) { throw 'VPN scopes not independent' }
+    $report = Get-AegisVpnScope { [pscustomobject]@{}; [pscustomobject]@{ConnectionStatus=1;SplitTunneling=0;TunnelType='Unrecognized'} }
+    if (-not $report.Contains('connected: 0; disconnected: 0; unknown: 2') -or -not $report.Contains('configured: 0; disabled: 0; unknown: 2') -or -not $report.Contains('other recognized: 0; unknown: 2')) { throw 'Malformed VPN records accepted' }
+    Write-Output 'PASS: minimized VPN profile synthetic fixtures'
+}
+
 if ($SelfTest) {
     foreach ($command in (Get-AegisCommands)) {
         if (-not (Test-AegisCommand $command)) { throw 'Allowlist failure' }
@@ -264,6 +334,7 @@ if ($SelfTest) {
     Test-AegisNativeReport
     Test-AegisIntegrity
     Test-AegisDnsReport
+    Test-AegisVpnReport
     Write-Output 'PASS: fixed development UI command allowlist'
     return
 }
@@ -286,8 +357,8 @@ $banner.Size = New-Object Drawing.Size(700,62)
 $banner.Text = @('DEVELOPMENT ONLY - Active protection unavailable.', 'Keep native antivirus and firewall enabled. No scan, VPN or enforcement.', 'Run only from a trusted, reviewed development checkout.') -join [Environment]::NewLine
 $form.Controls.Add($banner)
 $output = New-Object Windows.Forms.TextBox
-$output.Location = New-Object Drawing.Point(18,286)
-$output.Size = New-Object Drawing.Size(705,274)
+$output.Location = New-Object Drawing.Point(18,330)
+$output.Size = New-Object Drawing.Size(705,230)
 $output.Multiline = $true
 $output.ReadOnly = $true
 $output.ScrollBars = 'Vertical'
@@ -387,5 +458,19 @@ $incidents.Add_Click({
     } catch { $output.Text = 'Incident demonstration unavailable.' }
 })
 $form.Controls.Add($incidents)
+
+
+$vpn = New-Object Windows.Forms.Button
+$vpn.Location = New-Object Drawing.Point(18,284)
+$vpn.Size = New-Object Drawing.Size(340,36)
+$vpn.Text = 'Windows VPN profiles (read-only)'
+$vpn.Add_Click({
+    $output.Text = Get-AegisVpnReport {
+        VpnClient\Get-VpnConnection -ErrorAction Stop -WarningAction SilentlyContinue
+    } {
+        VpnClient\Get-VpnConnection -AllUserConnection -ErrorAction Stop -WarningAction SilentlyContinue
+    }
+})
+$form.Controls.Add($vpn)
 
 try { [void]$form.ShowDialog() } finally { $form.Dispose() }
