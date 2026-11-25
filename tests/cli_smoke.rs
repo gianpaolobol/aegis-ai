@@ -65,3 +65,19 @@ fn invalid_invocations_fail_without_echoing_input() {
         assert!(!stderr(&output).contains("fixture-secret"));
     }
 }
+
+#[test]
+fn incident_demo_reports_counts_and_limitations() {
+    let output = run(&["demo-incidents"]);
+    assert_eq!(output.status.code(), Some(0));
+    for expected in ["Events: 4", "Assets observed: 3", "Assets with advisories: 2",
+                     "Assets for review: 1", "not live telemetry or enforcement",
+                     "No attack probability or safety established"] {
+        assert!(stdout(&output).contains(expected));
+    }
+    assert!(output.stderr.is_empty());
+    let invalid = run(&["demo-incidents", "synthetic-secret"]);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(invalid.stdout.is_empty());
+    assert!(!stderr(&invalid).contains("synthetic-secret"));
+}
