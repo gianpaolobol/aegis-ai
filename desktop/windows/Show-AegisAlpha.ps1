@@ -508,6 +508,63 @@ function Test-AegisIbanReport {
 }
 
 
+
+# Read-only BitLocker provider snapshot; no recovery key/protector lookup.
+function Get-AegisEncryptionReport([scriptblock]$ReadVolumes) {
+    $unavailable = 'BitLocker inventory unavailable; encryption state unknown. No elevation or settings changes.'
+    $suffix = 'Provider snapshot only; coverage, recovery readiness and data security are not established.'
+    try {
+        $rows = @(& $ReadVolumes | Select-Object -First 129)
+        if ($rows.Count -eq 0 -or $rows.Count -gt 128) { return $unavailable }
+        $on = 0; $off = 0; $unknown = 0; $transition = 0; $decrypted = 0; $inconsistent = 0
+        foreach ($row in $rows) {
+            $p = Get-AegisProperty $row 'ProtectionStatus'
+            $c = Get-AegisProperty $row 'ConversionStatus'
+            # Only native UInt32 values are expected; do not coerce null, strings or booleans.
+            if ($p -isnot [uint32] -or $c -isnot [uint32] -or $p -gt 2 -or $c -gt 5) {
+                $unknown++
+                continue
+            }
+            if ($c -eq 0) { $decrypted++ }
+            if ($c -ge 2) { $transition++ }
+            if ($p -eq 1 -and $c -ne 1) { $unknown++; $inconsistent++; continue }
+            switch ($p) {
+                0 { $off++ }
+                1 { $on++ }
+                2 { $unknown++ }
+            }
+        }
+        return (@("Reported volumes: $($rows.Count)", "Protection on and encrypted reported: $on",
+            "Protection off reported: $off", "Protection unknown or inconsistent: $unknown",
+            "Fully decrypted reported: $decrypted", "Encryption/decryption in progress or paused: $transition",
+            "Inconsistent snapshots: $inconsistent", $suffix) -join [Environment]::NewLine)
+    } catch { return $unavailable }
+}
+function Test-AegisEncryptionReport {
+    $report = Get-AegisEncryptionReport {
+        [pscustomobject]@{ProtectionStatus=[uint32]1;ConversionStatus=[uint32]1;DeviceID='SYNTHETIC-PRIVATE'}
+        [pscustomobject]@{ProtectionStatus=[uint32]0;ConversionStatus=[uint32]1}
+        [pscustomobject]@{ProtectionStatus=[uint32]0;ConversionStatus=[uint32]0}
+        [pscustomobject]@{ProtectionStatus=[uint32]0;ConversionStatus=[uint32]4}
+        [pscustomobject]@{ProtectionStatus=[uint32]2;ConversionStatus=[uint32]1}
+        [pscustomobject]@{ProtectionStatus=[uint32]1;ConversionStatus=[uint32]3}
+        [pscustomobject]@{ProtectionStatus='1';ConversionStatus=[uint32]1}
+        [pscustomobject]@{ProtectionStatus=$null;ConversionStatus=[uint32]1}
+        [pscustomobject]@{ProtectionStatus=[uint32]0;ConversionStatus=[uint32]99}
+    }
+    foreach ($expected in @('Reported volumes: 9','Protection on and encrypted reported: 1',
+        'Protection off reported: 3','Protection unknown or inconsistent: 5',
+        'Fully decrypted reported: 1','Encryption/decryption in progress or paused: 2','Inconsistent snapshots: 1')) {
+        if (-not $report.Contains($expected)) { throw 'Encryption fixture mismatch' }
+    }
+    if ($report.Contains('SYNTHETIC-PRIVATE') -or -not $report.Contains('not established')) { throw 'Encryption privacy or limitation regression' }
+    foreach ($read in @({}, { throw 'SYNTHETIC-PRIVATE' }, { for ($i=0; $i -lt 129; $i++) { [pscustomobject]@{ProtectionStatus=[uint32]1;ConversionStatus=[uint32]1} } })) {
+        $report = Get-AegisEncryptionReport $read
+        if (-not $report.Contains('state unknown') -or $report.Contains('SYNTHETIC-PRIVATE')) { throw 'Encryption unavailable handling failed' }
+    }
+    Write-Output 'PASS: BitLocker snapshot synthetic fixtures'
+}
+
 if ($SelfTest) {
     foreach ($command in (Get-AegisCommands)) {
         if (-not (Test-AegisCommand $command)) { throw 'Allowlist failure' }
@@ -522,6 +579,7 @@ if ($SelfTest) {
     Test-AegisLinkReport
     Test-AegisPatchReport
     Test-AegisIbanReport
+    Test-AegisEncryptionReport
     Write-Output 'PASS: fixed development UI command allowlist'
     return
 }
@@ -546,8 +604,8 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 $form = New-Object Windows.Forms.Form
 $form.Text = 'AEGIS AI - Development Alpha'
-$form.Size = New-Object Drawing.Size(760,684)
-$form.MinimumSize = New-Object Drawing.Size(760,684)
+$form.Size = New-Object Drawing.Size(760,728)
+$form.MinimumSize = New-Object Drawing.Size(760,728)
 $form.StartPosition = 'CenterScreen'
 $banner = New-Object Windows.Forms.Label
 $banner.Location = New-Object Drawing.Point(18,14)
@@ -555,7 +613,7 @@ $banner.Size = New-Object Drawing.Size(700,62)
 $banner.Text = @('DEVELOPMENT ONLY - Active protection unavailable.', 'Keep native antivirus and firewall enabled. No scan, VPN or enforcement.', 'Run only from a trusted, reviewed development checkout.') -join [Environment]::NewLine
 $form.Controls.Add($banner)
 $output = New-Object Windows.Forms.TextBox
-$output.Location = New-Object Drawing.Point(18,374)
+$output.Location = New-Object Drawing.Point(18,418)
 $output.Size = New-Object Drawing.Size(705,230)
 $output.Multiline = $true
 $output.ReadOnly = $true
@@ -770,6 +828,18 @@ $ibanCheck.Add_Click({
 })
 $form.Controls.Add($ibanCheck)
 
+$encryption = New-Object Windows.Forms.Button
+$encryption.Location = New-Object Drawing.Point(18,372)
+$encryption.Size = New-Object Drawing.Size(340,36)
+$encryption.Text = 'Windows disk encryption (read-only)'
+$encryption.Add_Click({
+    $output.Text = Get-AegisEncryptionReport {
+        CimCmdlets\Get-CimInstance -Namespace 'root\CIMV2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -Property ProtectionStatus,ConversionStatus -ErrorAction Stop -WarningAction SilentlyContinue
+    }
+})
+$form.Controls.Add($encryption)
+
+
 try {
     if ($UiSmokeTest) {
         # Construct real controls but do not display a window or call native providers.
@@ -778,7 +848,8 @@ try {
             'Windows native protection (read-only)','DNS configuration (read-only)',
             'Verify local file integrity (16 MiB max)','Incident correlation (synthetic)',
             'Windows VPN profiles (read-only)','Suspicious link (offline advisory)',
-            'Windows patch inventory (partial)','Invoice IBAN comparison (offline, IT)')
+            'Windows patch inventory (partial)','Invoice IBAN comparison (offline, IT)',
+            'Windows disk encryption (read-only)')
         if ($buttons.Count -ne $labels.Count) { throw 'Unexpected GUI button count.' }
         foreach ($label in $labels) {
             if (@($buttons | Where-Object { $_.Text -ceq $label }).Count -ne 1) {
@@ -800,7 +871,7 @@ try {
         if ((Get-AegisCliReport 'scan') -cne 'Command rejected.') {
             throw 'Invalid command bridge regression.'
         }
-        Write-Output 'PASS: GUI constructed; twelve controls, safety labels, five CLI calls and denied command.'
+        Write-Output 'PASS: GUI constructed; thirteen controls, safety labels, five CLI calls and denied command.'
     } else {
         [void]$form.ShowDialog()
     }
