@@ -3,7 +3,7 @@
 param([switch]$SelfTest)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-function Get-AegisCommands { @('status','demo-policy','demo-wifi','--version') }
+function Get-AegisCommands { @('status','demo-policy','demo-wifi','demo-incidents','--version') }
 function Test-AegisCommand([string]$Command) { return (Get-AegisCommands) -ccontains $Command }
 # Native diagnostic readings are advisory, not AEGIS enforcement.
 function Convert-AegisState($Value) {
@@ -373,5 +373,19 @@ $verify.Add_Click({
     $output.Text = Get-AegisFileIntegrity $filePath.Text $expectedHash.Text
 })
 $form.Controls.Add($verify)
+
+$incidents = New-Object Windows.Forms.Button
+$incidents.Location = New-Object Drawing.Point(365,240)
+$incidents.Size = New-Object Drawing.Size(340,36)
+$incidents.Text = 'Incident correlation (synthetic)'
+$incidents.Add_Click({
+    try {
+        if (-not (Test-AegisCommand 'demo-incidents')) { throw 'Command rejected' }
+        $result = & $exe 'demo-incidents' 2>&1
+        $code = $LASTEXITCODE
+        $output.Text = "Exit code: $code" + [Environment]::NewLine + ($result -join [Environment]::NewLine)
+    } catch { $output.Text = 'Incident demonstration unavailable.' }
+})
+$form.Controls.Add($incidents)
 
 try { [void]$form.ShowDialog() } finally { $form.Dispose() }
