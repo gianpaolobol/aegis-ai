@@ -38,3 +38,9 @@ jobs:
         run: |
           python -I lab/av/yara_lab.py --mock-tests
           if ($LASTEXITCODE -ne 0) { throw 'AV adapter mock regressions failed' }
+
+      - name: Run offline wheel preflight synthetic regressions
+        shell: powershell
+        run: |
+          python -I lab/av/verify_wheel.py --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'Wheel preflight regression failed' }
