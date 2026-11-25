@@ -78,7 +78,7 @@ function Get-AegisDigestResult([System.IO.Stream]$Stream, [string]$Expected) {
         if (-not $Stream.CanRead -or -not $Stream.CanSeek -or $Stream.Position -ne 0) { return 'Unavailable.' }
         if ($Stream.Length -gt 16777216) { return 'File exceeds 16 MiB alpha limit.' }
         $length = [int]$Stream.Length
-        $bytes = New-Object byte[] $length
+        $bytes = [byte[]]::new($length)
         $offset = 0
         while ($offset -lt $length) {
             $n = $Stream.Read($bytes, $offset, $length - $offset)
@@ -112,13 +112,17 @@ function Get-AegisFileIntegrity([string]$Path, [string]$Expected) {
         $drive = New-Object IO.DriveInfo($root)
         if ($drive.DriveType -ne [IO.DriveType]::Fixed) { return 'Only fixed local drives are supported.' }
         # Best-effort path checks, not race-free sandboxing. Trusted local checkout/user path only.
-        $current = $Path
-        while ($current -ne $root) {
+        $current = $root
+        # Inspect each ancestor before requesting attributes of its child.
+        $blocked = [IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Offline -bor [IO.FileAttributes]::Device
+        if (([IO.File]::GetAttributes($root) -band $blocked) -ne 0) { return 'Linked, offline or special files are unsupported.' }
+        foreach ($part in $Path.Substring(3).Split([char]92)) {
+            $current = [IO.Path]::Combine($current,$part)
             $flags = [IO.File]::GetAttributes($current)
-            $blocked = [IO.FileAttributes]::ReparsePoint -bor [IO.FileAttributes]::Offline -bor [IO.FileAttributes]::Device
-            if (($flags -band $blocked) -ne 0) { return 'Linked, offline or special files are unsupported.' }
-            $current = [IO.Path]::GetDirectoryName($current)
-            if ([string]::IsNullOrEmpty($current)) { return 'Unavailable.' }
+            # Include Windows recall-on-open and recall-on-data-access bits.
+            if (([int]$flags -band ([int]$blocked -bor 0x00040000 -bor 0x00400000)) -ne 0) {
+                return 'Linked, offline or special files are unsupported.'
+            }
         }
         if (([IO.File]::GetAttributes($Path) -band [IO.FileAttributes]::Directory) -ne 0) { return 'A regular file is required.' }
         $stream = [IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
@@ -260,7 +264,7 @@ $form.Controls.Add($hashLabel)
 $expectedHash = New-Object Windows.Forms.TextBox
 $expectedHash.Location = New-Object Drawing.Point(150,207)
 $expectedHash.Size = New-Object Drawing.Size(555,24)
-$expectedHash.MaxLength = 64
+$expectedHash.MaxLength = 128
 $form.Controls.Add($expectedHash)
 $verify = New-Object Windows.Forms.Button
 $verify.Location = New-Object Drawing.Point(18,240)
