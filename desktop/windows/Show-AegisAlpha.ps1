@@ -458,6 +458,56 @@ function Test-AegisPatchReport {
     Write-Output 'PASS: partial patch inventory synthetic fixtures'
 }
 
+# Italian IBAN comparison only. No account lookup, payment or identity verification.
+function ConvertTo-AegisItalianIban([string]$Value) {
+    if ([string]::IsNullOrEmpty($Value) -or $Value.Length -gt 64 -or
+        $Value -cnotmatch '\A[A-Za-z0-9 ]+\z') { return $null }
+    $normalized = $Value.Replace(' ','').ToUpperInvariant()
+    if ($normalized -cnotmatch '\AIT[0-9]{2}[A-Z][0-9]{10}[A-Z0-9]{12}\z') { return $null }
+    $check = [int]$normalized.Substring(2,2)
+    if ($check -lt 2 -or $check -gt 98) { return $null }
+    $remainder = 0
+    foreach ($ch in ($normalized.Substring(4) + $normalized.Substring(0,4)).ToCharArray()) {
+        $n = [int]$ch
+        if ($n -ge 48 -and $n -le 57) {
+            $remainder = ($remainder * 10 + $n - 48) % 97
+        } else {
+            $remainder = ($remainder * 100 + $n - 55) % 97
+        }
+    }
+    if ($remainder -ne 1) { return $null }
+    return $normalized
+}
+function Get-AegisIbanReport([string]$Reference, [string]$Invoice) {
+    $a = ConvertTo-AegisItalianIban $Reference
+    $b = ConvertTo-AegisItalianIban $Invoice
+    if ($null -eq $a -or $null -eq $b) {
+        $state = 'Invalid or unsupported Italian IBAN format/checksum. Do not rely on this comparison.'
+    } elseif ($a -cne $b) {
+        $state = 'IBAN DIFFERENCE: pause payment and contact the supplier via a previously verified channel.'
+    } else {
+        $state = 'Same normalized IBAN; this does not establish payment safety.'
+    }
+    return $state + ' Account existence, domestic CIN, ownership and reference authenticity are not verified. Use your bank beneficiary verification.'
+}
+function Test-AegisIbanReport {
+    # Fictional zero bank/branch identifiers; checksum-only fixture, never a payment destination.
+    $a = 'IT51X0000000000000000000001'
+    $b = 'IT24X0000000000000000000002'
+    if (-not (Get-AegisIbanReport $a $a).StartsWith('Same normalized IBAN')) { throw 'IBAN equality failed' }
+    $formatted = $a.Substring(0,4).ToLowerInvariant() + ' ' + $a.Substring(4)
+    if (-not (Get-AegisIbanReport $formatted $a).StartsWith('Same normalized IBAN')) { throw 'IBAN formatting failed' }
+    if (-not (Get-AegisIbanReport $a $b).StartsWith('IBAN DIFFERENCE')) { throw 'IBAN change missed' }
+    foreach ($invalid in @('', 'IT00' + $a.Substring(4), $a.Substring(0,26),
+        ('DE' + $a.Substring(2)), ($a + [char]0x200B), ($a + '-'), (' ' * 65 + $a))) {
+        if (-not (Get-AegisIbanReport $a $invalid).StartsWith('Invalid or unsupported')) { throw 'Invalid IBAN accepted' }
+    }
+    $report = Get-AegisIbanReport $a $b
+    if ($report.Contains($a) -or $report.Contains($b) -or -not $report.Contains('ownership')) { throw 'IBAN privacy or limitation regression' }
+    Write-Output 'PASS: Italian IBAN comparison synthetic fixtures'
+}
+
+
 if ($SelfTest) {
     foreach ($command in (Get-AegisCommands)) {
         if (-not (Test-AegisCommand $command)) { throw 'Allowlist failure' }
@@ -471,6 +521,7 @@ if ($SelfTest) {
     Test-AegisVpnReport
     Test-AegisLinkReport
     Test-AegisPatchReport
+    Test-AegisIbanReport
     Write-Output 'PASS: fixed development UI command allowlist'
     return
 }
@@ -660,6 +711,65 @@ $patches.Add_Click({
 })
 $form.Controls.Add($patches)
 
+$ibanCheck = New-Object Windows.Forms.Button
+$ibanCheck.Location = New-Object Drawing.Point(365,328)
+$ibanCheck.Size = New-Object Drawing.Size(340,36)
+$ibanCheck.Text = 'Invoice IBAN comparison (offline, IT)'
+$ibanCheck.Add_Click({
+    $dialog = New-Object Windows.Forms.Form
+    $referenceEntry = $null
+    $invoiceEntry = $null
+    try {
+        $dialog.Text = 'Invoice payment advisory - Italy only'
+        $dialog.ClientSize = New-Object Drawing.Size(610,226)
+        $dialog.StartPosition = 'CenterParent'
+        $dialog.FormBorderStyle = 'FixedDialog'
+        $dialog.MaximizeBox = $false
+        $dialog.MinimizeBox = $false
+        $hint = New-Object Windows.Forms.Label
+        $hint.Location = New-Object Drawing.Point(12,10)
+        $hint.Size = New-Object Drawing.Size(580,44)
+        $hint.Text = 'Use a reference obtained independently of the invoice. No lookup or payment. A match does not prove the beneficiary is genuine.'
+        $dialog.Controls.Add($hint)
+        $refLabel = New-Object Windows.Forms.Label
+        $refLabel.Location = New-Object Drawing.Point(12,58)
+        $refLabel.Size = New-Object Drawing.Size(580,22)
+        $refLabel.Text = 'Previously verified Italian IBAN'
+        $dialog.Controls.Add($refLabel)
+        $referenceEntry = New-Object Windows.Forms.TextBox
+        $referenceEntry.Location = New-Object Drawing.Point(12,82)
+        $referenceEntry.Size = New-Object Drawing.Size(580,24)
+        $referenceEntry.MaxLength = 65
+        $dialog.Controls.Add($referenceEntry)
+        $invoiceLabel = New-Object Windows.Forms.Label
+        $invoiceLabel.Location = New-Object Drawing.Point(12,112)
+        $invoiceLabel.Size = New-Object Drawing.Size(580,22)
+        $invoiceLabel.Text = 'Italian IBAN on invoice'
+        $dialog.Controls.Add($invoiceLabel)
+        $invoiceEntry = New-Object Windows.Forms.TextBox
+        $invoiceEntry.Location = New-Object Drawing.Point(12,136)
+        $invoiceEntry.Size = New-Object Drawing.Size(580,24)
+        $invoiceEntry.MaxLength = 65
+        $dialog.Controls.Add($invoiceEntry)
+        $compare = New-Object Windows.Forms.Button
+        $compare.Location = New-Object Drawing.Point(12,174)
+        $compare.Size = New-Object Drawing.Size(180,32)
+        $compare.Text = 'Compare offline'
+        $compare.DialogResult = [Windows.Forms.DialogResult]::OK
+        $dialog.AcceptButton = $compare
+        $dialog.Controls.Add($compare)
+        if ($dialog.ShowDialog($form) -eq [Windows.Forms.DialogResult]::OK) {
+            $output.Text = Get-AegisIbanReport $referenceEntry.Text $invoiceEntry.Text
+        }
+    } catch { $output.Text = 'Offline invoice advisory unavailable.' }
+    finally {
+        if ($null -ne $referenceEntry) { $referenceEntry.Clear() }
+        if ($null -ne $invoiceEntry) { $invoiceEntry.Clear() }
+        $dialog.Dispose()
+    }
+})
+$form.Controls.Add($ibanCheck)
+
 try {
     if ($UiSmokeTest) {
         # Construct real controls but do not display a window or call native providers.
@@ -668,7 +778,7 @@ try {
             'Windows native protection (read-only)','DNS configuration (read-only)',
             'Verify local file integrity (16 MiB max)','Incident correlation (synthetic)',
             'Windows VPN profiles (read-only)','Suspicious link (offline advisory)',
-            'Windows patch inventory (partial)')
+            'Windows patch inventory (partial)','Invoice IBAN comparison (offline, IT)')
         if ($buttons.Count -ne $labels.Count) { throw 'Unexpected GUI button count.' }
         foreach ($label in $labels) {
             if (@($buttons | Where-Object { $_.Text -ceq $label }).Count -ne 1) {
@@ -690,7 +800,7 @@ try {
         if ((Get-AegisCliReport 'scan') -cne 'Command rejected.') {
             throw 'Invalid command bridge regression.'
         }
-        Write-Output 'PASS: GUI constructed; eleven controls, safety labels, five CLI calls and denied command.'
+        Write-Output 'PASS: GUI constructed; twelve controls, safety labels, five CLI calls and denied command.'
     } else {
         [void]$form.ShowDialog()
     }
