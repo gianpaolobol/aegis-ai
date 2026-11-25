@@ -28,67 +28,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $false
           function Assert-EqualDigest([string]$First, [string]$Second) {
-            if ($First -cnotmatch '^[0-9A-F]{64}
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./scripts/test-windows-package.ps1
-      - name: Reject package rehearsal outside authorized CI context
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $false
-          foreach ($case in @(
-            @{ Name = 'GITHUB_ACTIONS'; Value = '' },
-            @{ Name = 'GITHUB_ACTIONS'; Value = 'false' },
-            @{ Name = 'RUNNER_ENVIRONMENT'; Value = 'self-hosted' },
-            @{ Name = 'RUNNER_OS'; Value = 'Linux' },
-            @{ Name = 'RUNNER_TEMP'; Value = '' }
-          )) {
-            $saved = [Environment]::GetEnvironmentVariable($case.Name, 'Process')
-            try {
-              [Environment]::SetEnvironmentVariable($case.Name, $case.Value, 'Process')
-              $output = & pwsh -NoProfile -NonInteractive -File ./scripts/test-windows-package.ps1 2>&1
-              $code = $LASTEXITCODE
-              if ($code -eq 0 -or (($output -join "`n") -notmatch 'Run only in the authorized GitHub Actions test environment')) {
-                throw ('Package rehearsal authorization regression failed: ' + $case.Name)
-              }
-              Write-Output ('Unauthorized rehearsal correctly rejected: ' + $case.Name)
-            } finally {
-              [Environment]::SetEnvironmentVariable($case.Name, $saved, 'Process')
-            }
-          }
-          exit 0
- -or $Second -cnotmatch '^[0-9A-F]{64}
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./scripts/test-windows-package.ps1
-      - name: Reject package rehearsal outside authorized CI context
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $false
-          foreach ($case in @(
-            @{ Name = 'GITHUB_ACTIONS'; Value = '' },
-            @{ Name = 'GITHUB_ACTIONS'; Value = 'false' },
-            @{ Name = 'RUNNER_ENVIRONMENT'; Value = 'self-hosted' },
-            @{ Name = 'RUNNER_OS'; Value = 'Linux' },
-            @{ Name = 'RUNNER_TEMP'; Value = '' }
-          )) {
-            $saved = [Environment]::GetEnvironmentVariable($case.Name, 'Process')
-            try {
-              [Environment]::SetEnvironmentVariable($case.Name, $case.Value, 'Process')
-              $output = & pwsh -NoProfile -NonInteractive -File ./scripts/test-windows-package.ps1 2>&1
-              $code = $LASTEXITCODE
-              if ($code -eq 0 -or (($output -join "`n") -notmatch 'Run only in the authorized GitHub Actions test environment')) {
-                throw ('Package rehearsal authorization regression failed: ' + $case.Name)
-              }
-              Write-Output ('Unauthorized rehearsal correctly rejected: ' + $case.Name)
-            } finally {
-              [Environment]::SetEnvironmentVariable($case.Name, $saved, 'Process')
-            }
-          }
-          exit 0
-) {
+            if ($First -cnotmatch '^[0-9A-F]{64}$' -or $Second -cnotmatch '^[0-9A-F]{64}$') {
               throw 'Invalid SHA-256 digest.'
             }
             if ($First -cne $Second) { throw 'Executable rebuild digest mismatch.' }
