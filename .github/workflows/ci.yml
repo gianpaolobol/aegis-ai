@@ -29,17 +29,25 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $saved = $env:GITHUB_ACTIONS
-          try {
-            Remove-Item Env:GITHUB_ACTIONS
-            $PSNativeCommandUseErrorActionPreference = $false
-            $output = & pwsh -NoProfile -NonInteractive -File ./scripts/test-windows-package.ps1 2>&1
-            $code = $LASTEXITCODE
-            if ($code -eq 0 -or (($output -join "`n") -notmatch 'Run only in the authorized GitHub Actions test environment')) {
-              throw 'Package rehearsal authorization regression failed.'
+          $PSNativeCommandUseErrorActionPreference = $false
+          foreach ($case in @(
+            @{ Name = 'GITHUB_ACTIONS'; Value = '' },
+            @{ Name = 'GITHUB_ACTIONS'; Value = 'false' },
+            @{ Name = 'RUNNER_ENVIRONMENT'; Value = 'self-hosted' },
+            @{ Name = 'RUNNER_OS'; Value = 'Linux' },
+            @{ Name = 'RUNNER_TEMP'; Value = '' }
+          )) {
+            $saved = [Environment]::GetEnvironmentVariable($case.Name, 'Process')
+            try {
+              [Environment]::SetEnvironmentVariable($case.Name, $case.Value, 'Process')
+              $output = & pwsh -NoProfile -NonInteractive -File ./scripts/test-windows-package.ps1 2>&1
+              $code = $LASTEXITCODE
+              if ($code -eq 0 -or (($output -join "`n") -notmatch 'Run only in the authorized GitHub Actions test environment')) {
+                throw ('Package rehearsal authorization regression failed: ' + $case.Name)
+              }
+              Write-Output ('Unauthorized rehearsal correctly rejected: ' + $case.Name)
+            } finally {
+              [Environment]::SetEnvironmentVariable($case.Name, $saved, 'Process')
             }
-          } finally {
-            $env:GITHUB_ACTIONS = $saved
           }
-          Write-Output 'Unauthorized rehearsal correctly rejected.'
           exit 0
