@@ -1,6 +1,7 @@
 # Copyright 2026 Gian Paolo Franceschini. See LICENSE.
 [CmdletBinding()]
-param([switch]$SelfTest)
+param([switch]$SelfTest, [switch]$UiSmokeTest)
+if ($SelfTest -and $UiSmokeTest) { throw 'Select only one test mode.' }
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 function Get-AegisCommands { @('status','demo-policy','demo-wifi','demo-incidents','--version') }
@@ -420,6 +421,17 @@ $exe = Join-Path $root 'target\release\aegis-policy.exe'
 if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
     throw 'Build the reviewed development checkout first: cargo build --release --locked'
 }
+# Shared fixed-command bridge used by the UI and noninteractive smoke test.
+function Get-AegisCliReport([string]$Command) {
+    if (-not (Test-AegisCommand $Command)) { return 'Command rejected.' }
+    try {
+        $result = & $exe $Command 2>&1
+        $code = $LASTEXITCODE
+        return ("Exit code: $code" + [Environment]::NewLine + ($result -join [Environment]::NewLine))
+    } catch {
+        return 'Development executable could not be started.'
+    }
+}
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 $form = New-Object Windows.Forms.Form
@@ -456,14 +468,7 @@ for ($i=0; $i -lt $commands.Count; $i++) {
     $button.Add_Click({
         param($sender,$eventArgs)
         $command = [string]$sender.Tag
-        if (-not (Test-AegisCommand $command)) { $output.Text = 'Command rejected.'; return }
-        try {
-            $result = & $exe $command 2>&1
-            $code = $LASTEXITCODE
-            $output.Text = "Exit code: $code" + [Environment]::NewLine + ($result -join [Environment]::NewLine)
-        } catch {
-            $output.Text = 'Development executable could not be started.'
-        }
+        $output.Text = Get-AegisCliReport $command
     })
     $form.Controls.Add($button)
 }
@@ -526,12 +531,7 @@ $incidents.Location = New-Object Drawing.Point(365,240)
 $incidents.Size = New-Object Drawing.Size(340,36)
 $incidents.Text = 'Incident correlation (synthetic)'
 $incidents.Add_Click({
-    try {
-        if (-not (Test-AegisCommand 'demo-incidents')) { throw 'Command rejected' }
-        $result = & $exe 'demo-incidents' 2>&1
-        $code = $LASTEXITCODE
-        $output.Text = "Exit code: $code" + [Environment]::NewLine + ($result -join [Environment]::NewLine)
-    } catch { $output.Text = 'Incident demonstration unavailable.' }
+    $output.Text = Get-AegisCliReport 'demo-incidents'
 })
 $form.Controls.Add($incidents)
 
@@ -590,4 +590,37 @@ $linkCheck.Add_Click({
 })
 $form.Controls.Add($linkCheck)
 
-try { [void]$form.ShowDialog() } finally { $form.Dispose() }
+try {
+    if ($UiSmokeTest) {
+        # Construct real controls but do not display a window or call native providers.
+        $buttons = @($form.Controls | Where-Object { $_ -is [Windows.Forms.Button] })
+        $labels = @('Status','AI policy demo','Wi-Fi demo','Version',
+            'Windows native protection (read-only)','DNS configuration (read-only)',
+            'Verify local file integrity (16 MiB max)','Incident correlation (synthetic)',
+            'Windows VPN profiles (read-only)','Suspicious link (offline advisory)')
+        if ($buttons.Count -ne $labels.Count) { throw 'Unexpected GUI button count.' }
+        foreach ($label in $labels) {
+            if (@($buttons | Where-Object { $_.Text -ceq $label }).Count -ne 1) {
+                throw 'Required GUI control missing or duplicated.'
+            }
+        }
+        if (-not $output.ReadOnly -or -not $banner.Text.Contains('Active protection unavailable')) {
+            throw 'GUI safety labels or output restriction missing.'
+        }
+        foreach ($command in (Get-AegisCommands)) {
+            $report = Get-AegisCliReport $command
+            if (-not $report.StartsWith('Exit code: 0' + [Environment]::NewLine)) {
+                throw 'Fixed CLI bridge smoke failed.'
+            }
+        }
+        if (-not (Get-AegisCliReport 'status').Contains('Active protection: unavailable')) {
+            throw 'CLI limitation missing.'
+        }
+        if ((Get-AegisCliReport 'scan') -cne 'Command rejected.') {
+            throw 'Invalid command bridge regression.'
+        }
+        Write-Output 'PASS: GUI constructed; ten controls, safety labels, five CLI calls and denied command.'
+    } else {
+        [void]$form.ShowDialog()
+    }
+} finally { $form.Dispose() }
