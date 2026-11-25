@@ -43,7 +43,10 @@ fn synthetic_demos_have_expected_results() {
     let policy = run(&["demo-policy"]);
     assert_eq!(policy.status.code(), Some(0));
     for expected in ["unscoped read: Deny", "scoped read: Allow",
-                     "scoped export: RequireApproval", "policy change: Deny"] {
+                     "scoped export: RequireApproval", "policy change: Deny",
+                     "no containment or rollback performed", "bounded proposal: DryRunCandidateOnly",
+                     "aggregate impact: ImpactBudgetExceeded", "recovery channel: ProtectedService",
+                     "kill switch: Stopped"] {
         assert!(stdout(&policy).contains(expected));
     }
     assert!(policy.stderr.is_empty());

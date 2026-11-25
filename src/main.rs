@@ -31,6 +31,28 @@ fn run(args: &[OsString]) -> (i32, String) {
                 return (1, report);
             }
         }
+        use aegis_policy::response::{plan, Proposal, Reservation, Role, Service, Snapshot, Verdict};
+        let registry = [
+            Service { id: 1, role: Role::Ordinary, impact: 2 },
+            Service { id: 2, role: Role::Ordinary, impact: 3 },
+            Service { id: 3, role: Role::Administration, impact: 1 },
+            Service { id: 4, role: Role::Recovery, impact: 1 },
+        ];
+        let snapshot = Snapshot { policy_version: 1, observed_at: 90, now: 100,
+            reviewed_fixture: true, recovery_available: true, stopped: false };
+        let proposal = Proposal { service: 1, policy_version: 1, expires: 120,
+            reversible_in_fixture: true };
+        let reservation = [Reservation { service: 2, expires: 110 }];
+        report.push_str("Synthetic response dry-run; no containment or rollback performed.\n");
+        for (label, observed, expected) in [
+            ("bounded proposal", plan(&registry, 5, snapshot, &[], proposal), Verdict::DryRunCandidateOnly),
+            ("aggregate impact", plan(&registry, 4, snapshot, &reservation, proposal), Verdict::ImpactBudgetExceeded),
+            ("recovery channel", plan(&registry, 5, snapshot, &[], Proposal { service: 4, ..proposal }), Verdict::ProtectedService),
+            ("kill switch", plan(&registry, 5, Snapshot { stopped: true, ..snapshot }, &[], proposal), Verdict::Stopped),
+        ] {
+            report.push_str(&format!("{label}: {observed:?}\n"));
+            if observed != expected { return (1, report); }
+        }
         return (0, report);
     }
     if arg == OsStr::new("demo-wifi") {

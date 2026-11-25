@@ -4,6 +4,7 @@
 
 pub mod wifi;
 pub mod patch;
+pub mod response;
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Action { Read, Write, Export, Execute, ChangePolicy, Unknown }
 #[derive(Debug, PartialEq, Eq)]
