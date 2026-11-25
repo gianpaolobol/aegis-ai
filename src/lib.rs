@@ -314,3 +314,171 @@ pub mod alis_drift {
         }
     }
 }
+
+
+/// ALIS-03: deterministic offline fixture precheck. This is NOT a deployment
+/// authority, signature verifier, or evidence of actual independent evaluation.
+pub mod alis_promotion {
+    pub type Digest = [u8; 32];
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Binding {
+        pub model: Digest,
+        pub training_manifest: Digest,
+        pub holdout_manifest: Digest,
+        pub reference: Digest,
+        pub policy_version: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct MockEvidence {
+        pub evaluated: Binding,
+        pub reviewed: Binding,
+        pub expected_policy_version: u64,
+        pub lineage_verified_in_fixture: bool,
+        pub quarantine_clear_in_fixture: bool,
+        pub split_disjoint_in_fixture: bool,
+        pub invariant_failures: u32,
+        pub evaluated_cases: u32,
+        pub statistical_gate_passed_in_fixture: bool,
+        pub independent_review_in_fixture: bool,
+        pub rollback_verified_in_fixture: bool,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Verdict {
+        InvalidBinding,
+        PolicyMismatch,
+        EvidenceMismatch,
+        LineageOrQuarantine,
+        HoldoutNotDisjoint,
+        InvariantFailureOrEmptyEvaluation,
+        StatisticalGateMissing,
+        ReviewMissing,
+        RollbackMissing,
+        EligibleForExternalReviewOnly,
+    }
+
+    /// Caller-supplied fixture flags prove nothing about real evidence.
+    /// Manifest inequality does not establish record-level disjointness.
+    /// This precheck never grants deployment, training or privilege changes.
+    pub fn precheck(candidate: Binding, evidence: MockEvidence) -> Verdict {
+        if candidate.policy_version == 0 ||
+            [candidate.model, candidate.training_manifest, candidate.holdout_manifest,
+             candidate.reference].contains(&[0; 32]) {
+            return Verdict::InvalidBinding;
+        }
+        if candidate.policy_version != evidence.expected_policy_version {
+            return Verdict::PolicyMismatch;
+        }
+        if evidence.evaluated != candidate || evidence.reviewed != candidate {
+            return Verdict::EvidenceMismatch;
+        }
+        if !evidence.lineage_verified_in_fixture || !evidence.quarantine_clear_in_fixture {
+            return Verdict::LineageOrQuarantine;
+        }
+        if candidate.training_manifest == candidate.holdout_manifest ||
+            !evidence.split_disjoint_in_fixture {
+            return Verdict::HoldoutNotDisjoint;
+        }
+        if evidence.evaluated_cases == 0 || evidence.invariant_failures != 0 {
+            return Verdict::InvariantFailureOrEmptyEvaluation;
+        }
+        if !evidence.statistical_gate_passed_in_fixture {
+            return Verdict::StatisticalGateMissing;
+        }
+        if !evidence.independent_review_in_fixture {
+            return Verdict::ReviewMissing;
+        }
+        if !evidence.rollback_verified_in_fixture {
+            return Verdict::RollbackMissing;
+        }
+        Verdict::EligibleForExternalReviewOnly
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        fn binding() -> Binding {
+            Binding { model: [1; 32], training_manifest: [2; 32],
+                holdout_manifest: [3; 32], reference: [4; 32], policy_version: 1 }
+        }
+        fn evidence(b: Binding) -> MockEvidence {
+            MockEvidence { evaluated: b, reviewed: b, expected_policy_version: 1,
+                lineage_verified_in_fixture: true, quarantine_clear_in_fixture: true,
+                split_disjoint_in_fixture: true, invariant_failures: 0,
+                evaluated_cases: 100, statistical_gate_passed_in_fixture: true,
+                independent_review_in_fixture: true, rollback_verified_in_fixture: true }
+        }
+        #[test]
+        fn all_fixture_gates_only_enable_external_review() {
+            let b = binding();
+            assert_eq!(precheck(b, evidence(b)), Verdict::EligibleForExternalReviewOnly);
+        }
+        #[test]
+        fn zero_identifiers_and_version_rejected() {
+            let b = binding();
+            for invalid in [Binding { model: [0; 32], ..b },
+                Binding { training_manifest: [0; 32], ..b },
+                Binding { holdout_manifest: [0; 32], ..b },
+                Binding { reference: [0; 32], ..b },
+                Binding { policy_version: 0, ..b }] {
+                assert_eq!(precheck(invalid, evidence(invalid)), Verdict::InvalidBinding);
+            }
+        }
+        #[test]
+        fn stale_policy_rejected_even_if_evidence_agrees() {
+            let b = binding();
+            assert_eq!(precheck(b, MockEvidence { expected_policy_version: 2, ..evidence(b) }),
+                Verdict::PolicyMismatch);
+        }
+        #[test]
+        fn evidence_and_review_bound_to_every_field() {
+            let b = binding();
+            for changed in [Binding { model: [9; 32], ..b },
+                Binding { training_manifest: [9; 32], ..b },
+                Binding { holdout_manifest: [9; 32], ..b },
+                Binding { reference: [9; 32], ..b },
+                Binding { policy_version: 2, ..b }] {
+                assert_eq!(precheck(b, MockEvidence { evaluated: changed, ..evidence(b) }),
+                    Verdict::EvidenceMismatch);
+                assert_eq!(precheck(b, MockEvidence { reviewed: changed, ..evidence(b) }),
+                    Verdict::EvidenceMismatch);
+            }
+        }
+        #[test]
+        fn quarantine_and_lineage_are_required() {
+            let b = binding();
+            for e in [MockEvidence { lineage_verified_in_fixture: false, ..evidence(b) },
+                MockEvidence { quarantine_clear_in_fixture: false, ..evidence(b) }] {
+                assert_eq!(precheck(b, e), Verdict::LineageOrQuarantine);
+            }
+        }
+        #[test]
+        fn equal_manifests_or_missing_split_evidence_rejected() {
+            let b = binding();
+            let same = Binding { holdout_manifest: b.training_manifest, ..b };
+            assert_eq!(precheck(same, evidence(same)), Verdict::HoldoutNotDisjoint);
+            assert_eq!(precheck(b, MockEvidence { split_disjoint_in_fixture: false, ..evidence(b) }),
+                Verdict::HoldoutNotDisjoint);
+        }
+        #[test]
+        fn empty_evaluation_or_single_invariant_failure_rejected() {
+            let b = binding();
+            for e in [MockEvidence { evaluated_cases: 0, ..evidence(b) },
+                MockEvidence { invariant_failures: 1, ..evidence(b) }] {
+                assert_eq!(precheck(b, e), Verdict::InvariantFailureOrEmptyEvaluation);
+            }
+        }
+        #[test]
+        fn statistical_review_and_rollback_gates_are_individually_required() {
+            let b = binding();
+            assert_eq!(precheck(b, MockEvidence { statistical_gate_passed_in_fixture: false, ..evidence(b) }),
+                Verdict::StatisticalGateMissing);
+            assert_eq!(precheck(b, MockEvidence { independent_review_in_fixture: false, ..evidence(b) }),
+                Verdict::ReviewMissing);
+            assert_eq!(precheck(b, MockEvidence { rollback_verified_in_fixture: false, ..evidence(b) }),
+                Verdict::RollbackMissing);
+        }
+    }
+}
