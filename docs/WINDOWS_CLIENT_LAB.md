@@ -1,0 +1,23 @@
+# Windows client lab acceptance — ADE-012
+2026-11-25. Design and checklist only; not executed. The green GitHub-hosted Windows packaging/signing job is not Windows client installation evidence.
+## Preconditions
+- Use a separately authorized disposable Windows 11 x64 client VM, standard local user and separate lab admin; take a clean snapshot. No production credentials, personal files, shared writable drives, external network or changes to native protection. Record build, architecture, user privilege and VM image ID. Windows Sandbox is a candidate for smoke tests only, not equivalent to an independently controlled client VM or full OS support.
+- Build from exact reviewed commit, record package SHA-256, public certificate thumbprint and expiry, publisher, package identity, SBOM hash and signature checks. Transfer via controlled offline/read-only channel; no private key or production key transfer. A separate lab-only signing leaf must be valid for the test duration; current CI leaf and packages are deleted and cannot be reused.
+- The current CI manifest identity is AEGISAI.CIAlpha, publisher CN=AEGIS AI CI Rehearsal, x64, version 0.1.0.0. Do not use it for public distribution. Verify expected identity and digest independently before any trust change. Trust only the exact test leaf in the disposable guest with admin authorization, never a root CA. Never use AllowUnsigned or disable signature enforcement.
+## Test sequence
+| ID | Evidence / acceptance |
+|---|---|
+| WIN-LAB-01 | Clean baseline: no matching package or alias, record OS build, baseline services, startup entries, relevant firewall settings and native protection status. Abort on a collision rather than remove an existing package. |
+| WIN-LAB-02 | Standard user installation of signed package before trust must fail with a trust-related deployment diagnostic; package remains absent. Confirm unsigned and tampered fixture rejection separately. Do not classify arbitrary deployment failures as a passing security test. |
+| WIN-LAB-03 | After the separate lab admin imports the exact test leaf, verify signature and expected signer; install with supported per-user AppX deployment interface as standard user; capture exit status, exact package full name and version. |
+| WIN-LAB-04 | In a fresh standard-user terminal, resolve the declared aegis-policy-alpha.exe alias to the registered package, not an unrelated executable. Run fixed help/status/version and synthetic fixtures, check exact expected output and exit codes; unknown argument rejected without echo. No active protection claims or real telemetry. |
+| WIN-LAB-05 | Verify ordinary medium integrity execution, no new elevation prompt for normal CLI usage, no additional service, startup or firewall changes attributable to the package. Native protection remains enabled. Measure install duration and CLI latency with machine/build context. |
+| WIN-LAB-06 | Remove exactly the installed package for that user; verify absence of package registration, alias and application-owned data, compare baseline. Do not delete unrelated user data or manipulate OS protections. Verify a fresh install/remove cycle. |
+| WIN-LAB-07 | Remove only the exact lab leaf from guest trust, confirm no registration/trust residue and reject subsequent signature verification; restore clean VM snapshot even if any assertion fails. Collect sanitized test record without private keys or personal data. |
+## Release gates
+Do not mark installable or independently reviewed until client evidence exists for exact artifact. Record Windows versions separately; declared minimum 19041 is not tested support. Public alpha needs separate approved publisher identity, trusted signing and timestamp, independently reviewed candidate, complete distribution notices, SBOM/provenance and verified publication permission. No release or personal-device deployment by this protocol.
+## Primary sources checked 2026-11-25
+- https://learn.microsoft.com/en-us/windows/msix/package/sign-msix-package-guide (test certificate trust versus public distribution).
+- https://learn.microsoft.com/windows/msix/msix-troubleshooting-guide (per-user deployment and identity).
+- https://learn.microsoft.com/en-us/windows/apps/dev-tools/winapp-cli/security (scope of TrustedPeople and removing test trust).
+- https://learn.microsoft.com/en-us/windows/security/application-security/application-isolation/windows-sandbox/windows-sandbox-sample-configuration and https://learn.microsoft.com/windows/security/application-security/application-isolation/windows-sandbox/windows-sandbox-configure-using-wsb-file (network disabled, read-only mappings; not an isolation guarantee).
