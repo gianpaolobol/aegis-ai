@@ -993,3 +993,109 @@ pub mod gateway_fixture {
         }
     }
 }
+
+ 
+/// XDR-01: bounded correlation of synthetic, pseudonymous advisory events.
+/// No collection, authentication, causal inference, probability or response.
+pub mod incident {
+    use std::collections::{BTreeMap, BTreeSet};
+    pub const MAX_EVENTS: usize = 256;
+    pub const WINDOW_SECONDS: u64 = 300;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Signal { Normal, IntegrityMismatch, PolicyDenied, NativeProtectionDisabled }
+    #[derive(Clone, Copy, Debug)]
+    pub struct Event {
+        pub id: u32,
+        pub asset: u32,
+        pub seconds: u64,
+        pub signal: Signal,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Error { TooManyEvents, InvalidIdentifier, DuplicateEvent }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Summary {
+        pub event_count: usize,
+        pub assets_observed: usize,
+        pub assets_with_advisories: usize,
+        pub assets_for_review: usize,
+    }
+    /// Review when two distinct non-normal signal categories occur for the same
+    /// asset within the inclusive window. Counts are not unique incidents.
+    /// IDs, time and signal labels are caller-supplied fixtures, not trusted telemetry.
+    /// Entire input is validated before a result; no persistent or privileged action.
+    pub fn correlate(events: &[Event]) -> Result<Summary, Error> {
+        if events.len() > MAX_EVENTS { return Err(Error::TooManyEvents); }
+        let mut seen = BTreeSet::new();
+        let mut by_asset = BTreeMap::<u32, Vec<Event>>::new();
+        for &event in events {
+            if event.id == 0 || event.asset == 0 { return Err(Error::InvalidIdentifier); }
+            if !seen.insert(event.id) { return Err(Error::DuplicateEvent); }
+            by_asset.entry(event.asset).or_default().push(event);
+        }
+        let mut advisory = 0;
+        let mut review = 0;
+        for group in by_asset.values_mut() {
+            group.retain(|e| e.signal != Signal::Normal);
+            if group.is_empty() { continue; }
+            advisory += 1;
+            group.sort_unstable_by_key(|e| (e.seconds, e.id));
+            let mut matched = false;
+            for (i, left) in group.iter().enumerate() {
+                for right in &group[i+1..] {
+                    if right.seconds - left.seconds > WINDOW_SECONDS { break; }
+                    if left.signal != right.signal { matched = true; break; }
+                }
+                if matched { break; }
+            }
+            if matched { review += 1; }
+        }
+        Ok(Summary { event_count: events.len(), assets_observed: by_asset.len(),
+            assets_with_advisories: advisory, assets_for_review: review })
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use Signal::*;
+        fn e(id: u32, asset: u32, seconds: u64, signal: Signal) -> Event {
+            Event { id, asset, seconds, signal }
+        }
+        #[test] fn empty_and_normal_not_safety_claim() {
+            assert_eq!(correlate(&[]).unwrap().assets_observed, 0);
+            let s = correlate(&[e(1,1,0,Normal)]).unwrap();
+            assert_eq!((s.assets_observed,s.assets_with_advisories,s.assets_for_review),(1,0,0));
+        }
+        #[test] fn distinct_signals_same_asset() {
+            let s = correlate(&[e(1,1,0,IntegrityMismatch),e(2,1,300,PolicyDenied),
+                e(3,1,300,NativeProtectionDisabled)]).unwrap();
+            assert_eq!((s.event_count,s.assets_with_advisories,s.assets_for_review),(3,1,1));
+        }
+        #[test] fn different_assets_never_join() {
+            let s = correlate(&[e(1,1,0,IntegrityMismatch),e(2,2,0,PolicyDenied)]).unwrap();
+            assert_eq!((s.assets_with_advisories,s.assets_for_review),(2,0));
+        }
+        #[test] fn repeated_category_and_normal_never_escalate() {
+            let s = correlate(&[e(1,1,0,PolicyDenied),e(2,1,1,PolicyDenied),e(3,1,1,Normal)]).unwrap();
+            assert_eq!(s.assets_for_review,0);
+        }
+        #[test] fn outside_window_and_extreme_time() {
+            assert_eq!(correlate(&[e(1,1,0,PolicyDenied),e(2,1,301,IntegrityMismatch)]).unwrap().assets_for_review,0);
+            assert_eq!(correlate(&[e(1,1,u64::MAX,PolicyDenied),e(2,1,0,IntegrityMismatch)]).unwrap().assets_for_review,0);
+        }
+        #[test] fn order_invariant() {
+            let a = [e(1,1,300,PolicyDenied),e(2,1,0,IntegrityMismatch),e(3,2,0,Normal)];
+            let b = [a[2],a[1],a[0]];
+            assert_eq!(correlate(&a),correlate(&b));
+        }
+        #[test] fn malformed_or_duplicate_rejects_whole_batch() {
+            assert_eq!(correlate(&[e(1,1,0,Normal),e(1,2,0,PolicyDenied)]),Err(Error::DuplicateEvent));
+            assert_eq!(correlate(&[e(0,1,0,Normal)]),Err(Error::InvalidIdentifier));
+            assert_eq!(correlate(&[e(1,0,0,Normal)]),Err(Error::InvalidIdentifier));
+        }
+        #[test] fn bounded_batch() {
+            let mut events: Vec<_> = (1..=MAX_EVENTS as u32).map(|id| e(id,1,0,PolicyDenied)).collect();
+            assert_eq!(correlate(&events).unwrap().assets_for_review,0);
+            events.push(e(999,1,0,IntegrityMismatch));
+            assert_eq!(correlate(&events),Err(Error::TooManyEvents));
+        }
+    }
+}
