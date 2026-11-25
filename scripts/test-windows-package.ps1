@@ -1,8 +1,9 @@
 # Copyright 2026 Gian Paolo Franceschini. See LICENSE.
-# CI-only portable package rehearsal. No installer, settings or service changes.
+# CI-only package and disposable signing rehearsal. No installation or service changes.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-if (-not $env:RUNNER_TEMP -or -not $env:GITHUB_ACTIONS) {
+if (-not $env:RUNNER_TEMP -or $env:GITHUB_ACTIONS -cne 'true' -or
+    $env:RUNNER_ENVIRONMENT -cne 'github-hosted' -or $env:RUNNER_OS -cne 'Windows') {
     throw 'Run only in the authorized GitHub Actions test environment.'
 }
 $root = Join-Path $env:RUNNER_TEMP ('aegis-package-' + [Guid]::NewGuid().ToString('N'))
@@ -97,7 +98,7 @@ try {
     if ($LASTEXITCODE -ne 0 -or (($status -join "`n") -notmatch 'Active protection: unavailable')) {
         throw 'Extracted executable status check failed.'
     }
-    # Rehearse MSIX packaging, never signing, installing or publishing.
+    # Rehearse MSIX packaging and disposable test signing; never install or publish.
     # The SDK is a build-only proprietary Microsoft tool; no SDK binaries shipped.
     $sdk = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe'
     if (-not (Test-Path -LiteralPath $sdk -PathType Leaf)) { throw 'Pinned MakeAppx SDK path unavailable.' }
@@ -168,6 +169,10 @@ try {
         if (Test-Path -LiteralPath $trustedPath) { throw 'Unexpected pre-existing trust entry.' }
         & $signTool sign /fd SHA256 /s My /sha1 $cert.Thumbprint $signedMsix
         if ($LASTEXITCODE -ne 0) { throw 'Development MSIX signing failed.' }
+        # A valid cryptographic signature alone must not establish publisher trust.
+        & $signTool verify /pa /all $signedMsix
+        if ($LASTEXITCODE -eq 0) { throw 'Untrusted development signer unexpectedly accepted.' }
+        Write-Output 'Untrusted development signer rejected before leaf import.'
         # Trust only the newly generated public leaf certificate, never a root CA.
         $cer = Join-Path $root 'ci-public-leaf.cer'
         Export-Certificate -Cert $cert -FilePath $cer | Out-Null
@@ -222,6 +227,10 @@ try {
         if ($null -ne $cert) { $cert.Dispose() }
     }
     Write-Output 'Temporary signing certificate and trust cleanup passed.'
+    # Native verification after cleanup must reject the same package again.
+    & $signTool verify /pa /all $signedMsix
+    if ($LASTEXITCODE -eq 0) { throw 'Development signer remained trusted after cleanup.' }
+    Write-Output 'Development signer rejected after temporary trust removal.'
     # Regression for MakeAppx 0x80080204: a console alias requires multi-instance activation.
     # Modify only the disposable staging manifest, then restore exact original bytes.
     $stagedManifest = Join-Path $msixStage 'AppxManifest.xml'
