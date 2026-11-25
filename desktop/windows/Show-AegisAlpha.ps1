@@ -498,7 +498,7 @@ function Test-AegisIbanReport {
     $formatted = $a.Substring(0,4).ToLowerInvariant() + ' ' + $a.Substring(4)
     if (-not (Get-AegisIbanReport $formatted $a).StartsWith('Same normalized IBAN')) { throw 'IBAN formatting failed' }
     if (-not (Get-AegisIbanReport $a $b).StartsWith('IBAN DIFFERENCE')) { throw 'IBAN change missed' }
-    foreach ($invalid in @('', 'IT00' + $a.Substring(4), $a.Substring(0,26),
+    foreach ($invalid in @('', ('IT00' + $a.Substring(4)), $a.Substring(0,26),
         ('DE' + $a.Substring(2)), ($a + [char]0x200B), ($a + '-'), (' ' * 65 + $a))) {
         if (-not (Get-AegisIbanReport $a $invalid).StartsWith('Invalid or unsupported')) { throw 'Invalid IBAN accepted' }
     }
