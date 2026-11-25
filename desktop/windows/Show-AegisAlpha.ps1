@@ -400,6 +400,60 @@ function Test-AegisLinkReport {
     Write-Output 'PASS: offline URL structure synthetic fixtures'
 }
 
+
+# Local CBS/QFE inventory only. No Windows Update search, download or install.
+function Get-AegisPatchReport([scriptblock]$ReadPatches) {
+    $lines = @('Windows CBS/QFE patch inventory (read-only).',
+        'Partial inventory: not all Windows or application updates are reported.',
+        'No missing-patch, vulnerability, KEV, signature or support-status assessment.')
+    try {
+        $rows = @(& $ReadPatches | Select-Object -First 513)
+        if ($rows.Count -gt 512) { throw 'Inventory exceeds alpha limit' }
+        $ids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        $unknown = 0; $duplicates = 0
+        foreach ($row in $rows) {
+            $id = Get-AegisProperty $row 'HotFixID'
+            if ($id -isnot [string] -or $id -cnotmatch '\AKB[0-9]{1,10}\z') { $unknown++; continue }
+            if (-not $ids.Add($id)) { $duplicates++ }
+        }
+        $lines += @("Provider rows: $($rows.Count)", "Unique KB identifiers: $($ids.Count)",
+            "Duplicate valid rows: $duplicates", "Unknown or malformed rows: $unknown")
+        if ($rows.Count -eq 0) { $lines += 'Empty provider result; installed updates are unknown.' }
+        elseif ($ids.Count -gt 0) {
+            $visible = @($ids | Sort-Object | Select-Object -First 64)
+            $lines += ('Reported KB IDs (up to 64): ' + ($visible -join ', '))
+            if ($ids.Count -gt 64) { $lines += 'Displayed identifiers truncated; counts cover the bounded provider result.' }
+        }
+        $lines += 'Verify update status through Windows Update and official vendor advisories separately.'
+    } catch { $lines += 'Patch inventory unavailable or exceeds the alpha limit.' }
+    return ($lines -join [Environment]::NewLine)
+}
+function Test-AegisPatchReport {
+    $report = Get-AegisPatchReport {
+        [pscustomobject]@{HotFixID='KB123';InstalledBy='SYNTHETIC-PRIVATE'}
+        [pscustomobject]@{HotFixID='KB123'}
+        [pscustomobject]@{HotFixID='KB456'}
+        [pscustomobject]@{HotFixID='SYNTHETIC-PRIVATE'}
+        [pscustomobject]@{HotFixID=@('KB789')}
+        [pscustomobject]@{Other='SYNTHETIC-PRIVATE'}
+        [pscustomobject]@{HotFixID='kb123'}
+        [pscustomobject]@{HotFixID='KB12345678901'}
+    }
+    foreach ($expected in @('Provider rows: 8','Unique KB identifiers: 2','Duplicate valid rows: 1',
+        'Unknown or malformed rows: 5','KB123, KB456','No missing-patch')) {
+        if (-not $report.Contains($expected)) { throw 'Patch inventory fixture mismatch' }
+    }
+    if ($report.Contains('SYNTHETIC-PRIVATE') -or $report.Contains('KB789')) { throw 'Unexpected field disclosure' }
+    if (-not (Get-AegisPatchReport {}).Contains('installed updates are unknown')) { throw 'Empty inventory misrepresented' }
+    $report = Get-AegisPatchReport { throw 'SYNTHETIC-PRIVATE' }
+    if (-not $report.Contains('inventory unavailable') -or $report.Contains('SYNTHETIC-PRIVATE')) { throw 'Provider failure mishandled' }
+    $report = Get-AegisPatchReport { for ($i=1;$i -le 65;$i++) { [pscustomobject]@{HotFixID=('KB' + $i)} } }
+    if (-not $report.Contains('Unique KB identifiers: 65') -or -not $report.Contains('identifiers truncated')) { throw 'Display limit failed' }
+    $report = Get-AegisPatchReport { for ($i=1;$i -le 513;$i++) { [pscustomobject]@{HotFixID=('KB' + $i)} } }
+    if (-not $report.Contains('inventory unavailable') -or $report.Contains('Unique KB identifiers:')) { throw 'Inventory bound failed' }
+    Write-Output 'PASS: partial patch inventory synthetic fixtures'
+}
+
 if ($SelfTest) {
     foreach ($command in (Get-AegisCommands)) {
         if (-not (Test-AegisCommand $command)) { throw 'Allowlist failure' }
@@ -412,6 +466,7 @@ if ($SelfTest) {
     Test-AegisDnsReport
     Test-AegisVpnReport
     Test-AegisLinkReport
+    Test-AegisPatchReport
     Write-Output 'PASS: fixed development UI command allowlist'
     return
 }
@@ -436,8 +491,8 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 $form = New-Object Windows.Forms.Form
 $form.Text = 'AEGIS AI - Development Alpha'
-$form.Size = New-Object Drawing.Size(760,640)
-$form.MinimumSize = New-Object Drawing.Size(760,640)
+$form.Size = New-Object Drawing.Size(760,684)
+$form.MinimumSize = New-Object Drawing.Size(760,684)
 $form.StartPosition = 'CenterScreen'
 $banner = New-Object Windows.Forms.Label
 $banner.Location = New-Object Drawing.Point(18,14)
@@ -445,7 +500,7 @@ $banner.Size = New-Object Drawing.Size(700,62)
 $banner.Text = @('DEVELOPMENT ONLY - Active protection unavailable.', 'Keep native antivirus and firewall enabled. No scan, VPN or enforcement.', 'Run only from a trusted, reviewed development checkout.') -join [Environment]::NewLine
 $form.Controls.Add($banner)
 $output = New-Object Windows.Forms.TextBox
-$output.Location = New-Object Drawing.Point(18,330)
+$output.Location = New-Object Drawing.Point(18,374)
 $output.Size = New-Object Drawing.Size(705,230)
 $output.Multiline = $true
 $output.ReadOnly = $true
@@ -590,6 +645,17 @@ $linkCheck.Add_Click({
 })
 $form.Controls.Add($linkCheck)
 
+$patches = New-Object Windows.Forms.Button
+$patches.Location = New-Object Drawing.Point(18,328)
+$patches.Size = New-Object Drawing.Size(340,36)
+$patches.Text = 'Windows patch inventory (partial)'
+$patches.Add_Click({
+    $output.Text = Get-AegisPatchReport {
+        Microsoft.PowerShell.Management\Get-HotFix -ErrorAction Stop -WarningAction SilentlyContinue
+    }
+})
+$form.Controls.Add($patches)
+
 try {
     if ($UiSmokeTest) {
         # Construct real controls but do not display a window or call native providers.
@@ -597,7 +663,8 @@ try {
         $labels = @('Status','AI policy demo','Wi-Fi demo','Version',
             'Windows native protection (read-only)','DNS configuration (read-only)',
             'Verify local file integrity (16 MiB max)','Incident correlation (synthetic)',
-            'Windows VPN profiles (read-only)','Suspicious link (offline advisory)')
+            'Windows VPN profiles (read-only)','Suspicious link (offline advisory)',
+            'Windows patch inventory (partial)')
         if ($buttons.Count -ne $labels.Count) { throw 'Unexpected GUI button count.' }
         foreach ($label in $labels) {
             if (@($buttons | Where-Object { $_.Text -ceq $label }).Count -ne 1) {
@@ -619,7 +686,7 @@ try {
         if ((Get-AegisCliReport 'scan') -cne 'Command rejected.') {
             throw 'Invalid command bridge regression.'
         }
-        Write-Output 'PASS: GUI constructed; ten controls, safety labels, five CLI calls and denied command.'
+        Write-Output 'PASS: GUI constructed; eleven controls, safety labels, five CLI calls and denied command.'
     } else {
         [void]$form.ShowDialog()
     }
