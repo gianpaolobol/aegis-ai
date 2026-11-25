@@ -753,3 +753,243 @@ pub mod alis_quarantine {
         }
     }
 }
+
+
+/// ADE-GW-01: deterministic in-memory authorization rehearsal, synthetic only.
+/// Caller-supplied identities, grants, approvals, time and control snapshots
+/// are NOT authenticated. No dispatcher, IO, real credential or production authority.
+pub mod gateway_fixture {
+    use super::Action;
+    use std::collections::BTreeSet;
+    pub type Id = [u8; 32];
+    pub const MAX_BUDGET: u16 = 256;
+    pub const MAX_TTL: u64 = 300;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Binding {
+        pub principal: Id,
+        pub session: Id,
+        pub resource: Id,
+        pub action: Action,
+        pub payload_digest: Id,
+        pub transaction: Id,
+        pub policy_version: u64,
+    }
+    #[derive(Clone, Copy, Debug)]
+    pub struct Grant {
+        pub id: Id,
+        pub principal: Id,
+        pub session: Id,
+        pub resource: Id,
+        pub action: Action,
+        pub policy_version: u64,
+        pub issued_at: u64,
+        pub expires_at: u64,
+    }
+    #[derive(Clone, Copy, Debug)]
+    pub struct Approval {
+        pub binding: Binding,
+        pub grant_id: Id,
+        pub reviewer: Id,
+        pub issued_at: u64,
+        pub expires_at: u64,
+    }
+    #[derive(Clone, Copy, Debug)]
+    pub struct Control {
+        pub policy_version: u64,
+        pub stopped: bool,
+        pub revoked: bool,
+        pub now: u64,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Verdict {
+        Invalid, Stopped, Revoked, Forbidden, StalePolicy, ClockRegression,
+        ScopeMismatch, Expired, Replay, BudgetExhausted, ApprovalRequired,
+        ApprovalMismatch, AcceptedFixtureOnly,
+    }
+    #[derive(Debug)]
+    pub struct Ledger {
+        grant: Grant,
+        remaining: u16,
+        seen: BTreeSet<Id>,
+        last_time: u64,
+    }
+    fn nonzero(id: Id) -> bool { id != [0; 32] }
+    fn short_window(start: u64, end: u64) -> bool {
+        end.checked_sub(start).is_some_and(|n| n > 0 && n <= MAX_TTL)
+    }
+    fn live(start: u64, end: u64, now: u64) -> bool {
+        short_window(start, end) && start <= now && now < end
+    }
+    fn allowed(action: Action) -> bool {
+        matches!(action, Action::Read | Action::Write | Action::Export)
+    }
+    impl Ledger {
+        /// A ledger is scoped to exactly one grant, never shared across sessions.
+        /// Reset/restart loses state; this is not durable replay protection.
+        pub fn new(grant: Grant, budget: u16) -> Result<Self, Verdict> {
+            if ![grant.id, grant.principal, grant.session, grant.resource].into_iter().all(nonzero)
+                || grant.policy_version == 0 || !short_window(grant.issued_at, grant.expires_at)
+                || budget == 0 || budget > MAX_BUDGET {
+                return Err(Verdict::Invalid);
+            }
+            if !allowed(grant.action) { return Err(Verdict::Forbidden); }
+            Ok(Self { grant, remaining: budget, seen: BTreeSet::new(),
+                last_time: grant.issued_at })
+        }
+        pub fn remaining(&self) -> u16 { self.remaining }
+
+        /// Single mutable ledger serializes fixture decisions. Positive verdict
+        /// consumes a transaction and a unit of budget, but never executes it.
+        /// Rejected requests do not consume budget or transaction IDs.
+        pub fn evaluate(&mut self, req: Binding, ctl: Control, approval: Option<Approval>) -> Verdict {
+            use Verdict::*;
+            if ctl.stopped { return Stopped; }
+            if ctl.revoked { return Revoked; }
+            if !allowed(req.action) { return Forbidden; }
+            if ![req.principal, req.session, req.resource, req.payload_digest, req.transaction]
+                .into_iter().all(nonzero) || req.policy_version == 0 || ctl.policy_version == 0 {
+                return Invalid;
+            }
+            let g = self.grant;
+            if req.policy_version != g.policy_version || ctl.policy_version != g.policy_version {
+                return StalePolicy;
+            }
+            if ctl.now < self.last_time { return ClockRegression; }
+            if !live(g.issued_at, g.expires_at, ctl.now) { return Expired; }
+            if (req.principal, req.session, req.resource, req.action)
+                != (g.principal, g.session, g.resource, g.action) { return ScopeMismatch; }
+            if self.seen.contains(&req.transaction) { return Replay; }
+            if self.remaining == 0 { return BudgetExhausted; }
+            if matches!(req.action, Action::Write | Action::Export) {
+                let Some(a) = approval else { return ApprovalRequired; };
+                if a.binding != req || a.grant_id != g.id || !nonzero(a.reviewer)
+                    || a.reviewer == g.principal || a.issued_at < g.issued_at
+                    || a.expires_at > g.expires_at || !live(a.issued_at, a.expires_at, ctl.now) {
+                    return ApprovalMismatch;
+                }
+            }
+            self.seen.insert(req.transaction);
+            self.remaining -= 1;
+            self.last_time = ctl.now;
+            AcceptedFixtureOnly
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        fn id(n: u8) -> Id { [n; 32] }
+        fn grant(action: Action) -> Grant {
+            Grant { id: id(1), principal: id(2), session: id(3), resource: id(4),
+                action, policy_version: 1, issued_at: 10, expires_at: 100 }
+        }
+        fn req(g: Grant) -> Binding {
+            Binding { principal: g.principal, session: g.session, resource: g.resource,
+                action: g.action, payload_digest: id(5), transaction: id(6),
+                policy_version: g.policy_version }
+        }
+        fn control(now: u64) -> Control {
+            Control { policy_version: 1, stopped: false, revoked: false, now }
+        }
+        fn approval(g: Grant, b: Binding) -> Approval {
+            Approval { binding: b, grant_id: g.id, reviewer: id(7), issued_at: 11, expires_at: 30 }
+        }
+        #[test]
+        fn read_is_fixture_only_and_replay_denied() {
+            let g = grant(Action::Read);
+            let mut l = Ledger::new(g, 2).unwrap();
+            assert_eq!(l.evaluate(req(g), control(20), None), Verdict::AcceptedFixtureOnly);
+            assert_eq!(l.evaluate(req(g), control(20), None), Verdict::Replay);
+            assert_eq!(l.remaining(), 1);
+        }
+        #[test]
+        fn scope_exact_for_all_fields() {
+            let g = grant(Action::Read);
+            let b = req(g);
+            let mut l = Ledger::new(g, 1).unwrap();
+            for bad in [Binding { principal: id(8), ..b }, Binding { session: id(8), ..b },
+                Binding { resource: id(8), ..b }, Binding { action: Action::Write, ..b }] {
+                assert_eq!(l.evaluate(bad, control(20), None), Verdict::ScopeMismatch);
+            }
+            assert_eq!(l.remaining(), 1);
+        }
+        #[test]
+        fn forbidden_actions_cannot_be_granted_or_requested() {
+            let g = grant(Action::Read);
+            let mut l = Ledger::new(g, 1).unwrap();
+            for a in [Action::Execute, Action::ChangePolicy, Action::Unknown] {
+                assert_eq!(Ledger::new(grant(a), 1).unwrap_err(), Verdict::Forbidden);
+                assert_eq!(l.evaluate(Binding { action: a, ..req(g) }, control(20), None),
+                    Verdict::Forbidden);
+            }
+        }
+        #[test]
+        fn stop_revoke_and_stale_policy_fail_closed() {
+            let g = grant(Action::Read);
+            let b = req(g);
+            let mut l = Ledger::new(g, 1).unwrap();
+            assert_eq!(l.evaluate(b, Control { stopped: true, ..control(20) }, None), Verdict::Stopped);
+            assert_eq!(l.evaluate(b, Control { revoked: true, ..control(20) }, None), Verdict::Revoked);
+            assert_eq!(l.evaluate(b, Control { policy_version: 2, ..control(20) }, None), Verdict::StalePolicy);
+            assert_eq!(l.evaluate(Binding { policy_version: 2, ..b }, control(20), None), Verdict::StalePolicy);
+            assert_eq!(l.remaining(), 1);
+        }
+        #[test]
+        fn expiry_and_clock_regression() {
+            let g = grant(Action::Read);
+            let b = req(g);
+            let mut l = Ledger::new(g, 2).unwrap();
+            assert_eq!(l.evaluate(b, control(100), None), Verdict::Expired);
+            assert_eq!(l.evaluate(b, control(9), None), Verdict::ClockRegression);
+            assert_eq!(l.evaluate(b, control(20), None), Verdict::AcceptedFixtureOnly);
+            assert_eq!(l.evaluate(Binding { transaction: id(9), ..b }, control(19), None),
+                Verdict::ClockRegression);
+        }
+        #[test]
+        fn approval_binds_sensitive_transaction_and_payload() {
+            for action in [Action::Write, Action::Export] {
+                let g = grant(action);
+                let b = req(g);
+                let a = approval(g, b);
+                let mut l = Ledger::new(g, 2).unwrap();
+                assert_eq!(l.evaluate(b, control(20), None), Verdict::ApprovalRequired);
+                for bad in [Binding { transaction: id(9), ..b }, Binding { payload_digest: id(9), ..b }] {
+                    assert_eq!(l.evaluate(bad, control(20), Some(a)), Verdict::ApprovalMismatch);
+                }
+                assert_eq!(l.evaluate(b, control(20), Some(a)), Verdict::AcceptedFixtureOnly);
+                assert_eq!(l.evaluate(b, control(20), Some(a)), Verdict::Replay);
+            }
+        }
+        #[test]
+        fn approval_separation_time_and_grant_binding() {
+            let g = grant(Action::Export);
+            let b = req(g);
+            let a = approval(g, b);
+            let mut l = Ledger::new(g, 1).unwrap();
+            for bad in [Approval { reviewer: g.principal, ..a }, Approval { reviewer: id(0), ..a },
+                Approval { grant_id: id(9), ..a }, Approval { issued_at: 21, ..a },
+                Approval { expires_at: 20, ..a }, Approval { expires_at: 101, ..a },
+                Approval { issued_at: 9, ..a }] {
+                assert_eq!(l.evaluate(b, control(20), Some(bad)), Verdict::ApprovalMismatch);
+            }
+            assert_eq!(l.remaining(), 1);
+        }
+        #[test]
+        fn bounds_and_budget_exhaustion() {
+            let g = grant(Action::Read);
+            for bad in [0, MAX_BUDGET + 1] {
+                assert_eq!(Ledger::new(g, bad).unwrap_err(), Verdict::Invalid);
+            }
+            for bad in [Grant { id: id(0), ..g }, Grant { expires_at: 10, ..g },
+                Grant { expires_at: 311, ..g }, Grant { policy_version: 0, ..g }] {
+                assert_eq!(Ledger::new(bad, 1).unwrap_err(), Verdict::Invalid);
+            }
+            let b = req(g);
+            let mut l = Ledger::new(g, 1).unwrap();
+            assert_eq!(l.evaluate(Binding { payload_digest: id(0), ..b }, control(20), None), Verdict::Invalid);
+            assert_eq!(l.evaluate(b, control(20), None), Verdict::AcceptedFixtureOnly);
+            assert_eq!(l.evaluate(Binding { transaction: id(9), ..b }, control(20), None), Verdict::BudgetExhausted);
+        }
+    }
+}
