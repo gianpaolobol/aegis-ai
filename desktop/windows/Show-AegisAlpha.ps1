@@ -69,6 +69,82 @@ function Test-AegisNativeReport {
     Write-Output 'PASS: native diagnostic synthetic fixtures'
 }
 
+
+# DNS configuration only: no resolution, probes, remote CIM, or changes.
+# Counts are per provider row/address occurrence, not unique interfaces or servers.
+function Get-AegisDnsReport([scriptblock]$ReadDns) {
+    $intro = @('Windows DNS configuration (read-only).',
+        'Configured entries only; may include inactive interfaces.',
+        'No resolver trust, encryption, filtering, VPN or reachability assessment.')
+    try {
+        $records = @(& $ReadDns)
+        if ($records.Count -eq 0 -or $records.Count -gt 256) { throw 'Unavailable inventory' }
+        $configured = 0; $empty = 0; $unknown = 0; $loopback = 0; $other = 0
+        foreach ($record in $records) {
+            if ($null -eq $record) { $unknown++; continue }
+            $property = $record.PSObject.Properties['ServerAddresses']
+            if ($null -eq $property -or $null -eq $property.Value) { $unknown++; continue }
+            $values = $property.Value
+            if ($values -isnot [array] -or $values.Count -gt 32) { $unknown++; continue }
+            if ($values.Count -eq 0) { $empty++; continue }
+            $localCount = 0; $otherCount = 0; $valid = $true
+            foreach ($value in $values) {
+                $ip = $null
+                if ($value -isnot [string] -or $value.Length -gt 80 -or
+                    $value -cnotmatch '\A[0-9a-fA-F:.]+(?:%[0-9]+)?\z' -or
+                    -not [Net.IPAddress]::TryParse($value,[ref]$ip)) {
+                    $valid = $false; break
+                }
+                # Reject unspecified addresses, including mapped IPv4 unspecified.
+                if ($ip.IsIPv4MappedToIPv6) { $ip = $ip.MapToIPv4() }
+                if ($ip.Equals([Net.IPAddress]::Any) -or $ip.Equals([Net.IPAddress]::IPv6Any)) {
+                    $valid = $false; break
+                }
+                # Reject noncanonical IPv4 shorthand and ambiguous leading zeroes.
+                if ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork -and
+                    $value -notmatch ':' -and $ip.ToString() -cne $value) { $valid = $false; break }
+                if ([Net.IPAddress]::IsLoopback($ip)) { $localCount++ } else { $otherCount++ }
+            }
+            if (-not $valid) { $unknown++; continue }
+            $configured++; $loopback += $localCount; $other += $otherCount
+        }
+        $intro += @("Provider rows with addresses: $configured",
+            "Provider rows with empty lists: $empty", "Unknown or malformed rows: $unknown",
+            "Loopback address occurrences: $loopback", "Other address occurrences: $other",
+            'Empty lists do not prove DNS is absent. A loopback address does not prove local filtering.')
+    } catch { $intro += 'DNS inventory unavailable.' }
+    return ($intro -join [Environment]::NewLine)
+}
+function Test-AegisDnsReport {
+    $report = Get-AegisDnsReport {
+        [pscustomobject]@{ServerAddresses=@('127.0.0.1','::1','192.0.2.1');InterfaceAlias='SYNTHETIC-PRIVATE'}
+        [pscustomobject]@{ServerAddresses=@()}
+        [pscustomobject]@{ServerAddresses=@('2001:db8::1','invalid')}
+        [pscustomobject]@{InterfaceAlias='SYNTHETIC-PRIVATE'}
+        [pscustomobject]@{ServerAddresses=@('::ffff:127.0.0.1','2001:db8::2')}
+    }
+    foreach ($expected in @('Provider rows with addresses: 2','Provider rows with empty lists: 1',
+        'Unknown or malformed rows: 2','Loopback address occurrences: 3','Other address occurrences: 2')) {
+        if (-not $report.Contains($expected)) { throw 'DNS fixture count mismatch' }
+    }
+    foreach ($private in @('192.0.2.1','2001:db8','127.0.0.1','SYNTHETIC-PRIVATE','invalid')) {
+        if ($report.Contains($private)) { throw 'DNS diagnostic disclosed raw data' }
+    }
+    $report = Get-AegisDnsReport { throw 'SYNTHETIC-PRIVATE' }
+    if (-not $report.Contains('DNS inventory unavailable.') -or $report.Contains('SYNTHETIC-PRIVATE')) { throw 'DNS provider failure mishandled' }
+    if (-not (Get-AegisDnsReport {}).Contains('DNS inventory unavailable.')) { throw 'Missing DNS inventory accepted' }
+    $report = Get-AegisDnsReport {
+        foreach ($value in @('0.0.0.0','::','::ffff:0.0.0.0','127.1','010.0.0.1')) {
+            [pscustomobject]@{ServerAddresses=@($value)}
+        }
+        [pscustomobject]@{ServerAddresses='192.0.2.1'}
+        [pscustomobject]@{ServerAddresses=@('192.0.2.1')*33}
+    }
+    if (-not $report.Contains('Unknown or malformed rows: 7') -or -not $report.Contains('Provider rows with addresses: 0')) { throw 'Malformed DNS row accepted' }
+    if (-not (Get-AegisDnsReport { for ($i=0;$i -lt 257;$i++) { [pscustomobject]@{ServerAddresses=@()} } }).Contains('DNS inventory unavailable.')) { throw 'DNS row limit failed' }
+    Write-Output 'PASS: minimized DNS configuration synthetic fixtures'
+}
+
 # Local file integrity: explicit user selection, no execution or quarantine.
 # A matching digest proves equality to the supplied reference, not publisher trust.
 function Get-AegisDigestResult([System.IO.Stream]$Stream, [string]$Expected) {
@@ -176,6 +252,7 @@ if ($SelfTest) {
     }
     Test-AegisNativeReport
     Test-AegisIntegrity
+    Test-AegisDnsReport
     Write-Output 'PASS: fixed development UI command allowlist'
     return
 }
@@ -246,6 +323,17 @@ $native.Add_Click({
     } catch { $output.Text = 'Native diagnostic unavailable; no changes made.' }
 })
 $form.Controls.Add($native)
+
+$dns = New-Object Windows.Forms.Button
+$dns.Location = New-Object Drawing.Point(365,126)
+$dns.Size = New-Object Drawing.Size(340,36)
+$dns.Text = 'DNS configuration (read-only)'
+$dns.Add_Click({
+    $output.Text = Get-AegisDnsReport {
+        DnsClient\Get-DnsClientServerAddress -ErrorAction Stop -WarningAction SilentlyContinue
+    }
+})
+$form.Controls.Add($dns)
 
 $pathLabel = New-Object Windows.Forms.Label
 $pathLabel.Location = New-Object Drawing.Point(18,176)
