@@ -187,3 +187,130 @@ pub mod alis {
         }
     }
 }
+
+
+/// ALIS-02: bounded, deterministic comparison of synthetic aggregate windows.
+/// Advisory only: no authenticated baseline, statistical calibration, learning,
+/// persistence, system action, or production authorization.
+pub mod alis_drift {
+    pub const MAX_SAMPLES: u32 = 1_000_000;
+    pub const SCALE: u64 = 1_000_000;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Window {
+        pub observed: u32,
+        pub flagged: u32,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Config {
+        pub min_samples: u32,
+        pub tolerance_ppm: u32,
+        pub reference_version: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Verdict {
+        InvalidConfiguration,
+        InvalidWindow,
+        InsufficientEvidence,
+        WithinTolerance,
+        ReviewRequired,
+    }
+
+    /// Compare absolute differences between observed proportions, exactly as
+    /// rational numbers. Equality at the threshold is within tolerance.
+    /// Config and frozen reference must come from a separate trusted authority
+    /// in a real integration; a version number alone proves no authenticity.
+    /// No observation can modify the reference or authorize training.
+    pub fn compare(config: Config, reference: Window, current: Window) -> Verdict {
+        if config.reference_version == 0 || config.min_samples == 0 ||
+            config.min_samples > MAX_SAMPLES || u64::from(config.tolerance_ppm) > SCALE {
+            return Verdict::InvalidConfiguration;
+        }
+        for w in [reference, current] {
+            if w.observed > MAX_SAMPLES || w.flagged > w.observed {
+                return Verdict::InvalidWindow;
+            }
+        }
+        if reference.observed < config.min_samples || current.observed < config.min_samples {
+            return Verdict::InsufficientEvidence;
+        }
+        // Products <= 10^12, scaled products <= 10^18: fit in u64.
+        let a = u64::from(reference.flagged) * u64::from(current.observed);
+        let b = u64::from(current.flagged) * u64::from(reference.observed);
+        let denominator = u64::from(reference.observed) * u64::from(current.observed);
+        if a.abs_diff(b) * SCALE > denominator * u64::from(config.tolerance_ppm) {
+            Verdict::ReviewRequired
+        } else {
+            Verdict::WithinTolerance
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        fn config() -> Config {
+            Config { min_samples: 100, tolerance_ppm: 20_000, reference_version: 1 }
+        }
+        fn w(observed: u32, flagged: u32) -> Window { Window { observed, flagged } }
+        #[test]
+        fn same_proportion_different_window_sizes() {
+            assert_eq!(compare(config(), w(100, 10), w(1000, 100)), Verdict::WithinTolerance);
+        }
+        #[test]
+        fn threshold_inclusive_and_both_directions() {
+            assert_eq!(compare(config(), w(100, 10), w(100, 12)), Verdict::WithinTolerance);
+            assert_eq!(compare(config(), w(100, 10), w(100, 8)), Verdict::WithinTolerance);
+            assert_eq!(compare(config(), w(100, 10), w(100, 13)), Verdict::ReviewRequired);
+            assert_eq!(compare(config(), w(100, 10), w(100, 7)), Verdict::ReviewRequired);
+        }
+        #[test]
+        fn zero_reference_and_small_fraction() {
+            assert_eq!(compare(config(), w(100, 0), w(100, 3)), Verdict::ReviewRequired);
+            assert_eq!(compare(config(), w(100, 0), w(101, 2)), Verdict::WithinTolerance);
+            let mut c = config();
+            c.tolerance_ppm = 0;
+            assert_eq!(compare(c, w(MAX_SAMPLES, 0), w(MAX_SAMPLES, 1)), Verdict::ReviewRequired);
+        }
+        #[test]
+        fn missing_and_small_windows_are_not_stable() {
+            assert_eq!(compare(config(), w(0, 0), w(100, 0)), Verdict::InsufficientEvidence);
+            assert_eq!(compare(config(), w(100, 0), w(99, 0)), Verdict::InsufficientEvidence);
+        }
+        #[test]
+        fn invalid_windows_fail_closed() {
+            assert_eq!(compare(config(), w(100, 101), w(100, 0)), Verdict::InvalidWindow);
+            assert_eq!(compare(config(), w(100, 0), w(MAX_SAMPLES + 1, 0)), Verdict::InvalidWindow);
+            assert_eq!(compare(config(), w(0, 1), w(0, 0)), Verdict::InvalidWindow);
+        }
+        #[test]
+        fn invalid_configuration() {
+            for c in [
+                Config { reference_version: 0, ..config() },
+                Config { min_samples: 0, ..config() },
+                Config { min_samples: MAX_SAMPLES + 1, ..config() },
+                Config { tolerance_ppm: 1_000_001, ..config() },
+            ] {
+                assert_eq!(compare(c, w(100, 0), w(100, 0)), Verdict::InvalidConfiguration);
+            }
+        }
+        #[test]
+        fn maximum_bounds_do_not_overflow() {
+            assert_eq!(compare(config(), w(MAX_SAMPLES, 0), w(MAX_SAMPLES, MAX_SAMPLES)),
+                Verdict::ReviewRequired);
+            let c = Config { tolerance_ppm: 1_000_000, ..config() };
+            assert_eq!(compare(c, w(MAX_SAMPLES, 0), w(MAX_SAMPLES, MAX_SAMPLES)),
+                Verdict::WithinTolerance);
+        }
+        #[test]
+        fn successive_small_changes_use_same_frozen_reference() {
+            let reference = w(1000, 100);
+            for (flagged, expected) in [(110, Verdict::WithinTolerance),
+                (120, Verdict::WithinTolerance), (130, Verdict::ReviewRequired)] {
+                assert_eq!(compare(config(), reference, w(1000, flagged)), expected);
+            }
+            assert_eq!(reference, w(1000, 100));
+        }
+    }
+}
