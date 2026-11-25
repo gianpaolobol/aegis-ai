@@ -409,10 +409,14 @@ function Get-AegisPatchReport([scriptblock]$ReadPatches) {
     try {
         $rows = @(& $ReadPatches | Select-Object -First 513)
         if ($rows.Count -gt 512) { throw 'Inventory exceeds alpha limit' }
-        $ids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        $ids = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         $unknown = 0; $duplicates = 0
         foreach ($row in $rows) {
-            $id = Get-AegisProperty $row 'HotFixID'
+            if ($null -eq $row) { $unknown++; continue }
+            $property = $row.PSObject.Properties['HotFixID']
+            if ($null -eq $property) { $unknown++; continue }
+            # Preserve array shape: function pipeline output would unwrap singleton arrays.
+            $id = $property.Value
             if ($id -isnot [string] -or $id -cnotmatch '\AKB[0-9]{1,10}\z') { $unknown++; continue }
             if (-not $ids.Add($id)) { $duplicates++ }
         }
