@@ -79,6 +79,13 @@ jobs:
           Assert-EqualDigest $second (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
           Write-Output 'Same-runner rebuild and negative digest regressions passed.'
           exit 0
+      - name: Construct Windows GUI and smoke-test fixed CLI bridge
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & powershell.exe -NoProfile -NonInteractive -STA -File ./desktop/windows/Show-AegisAlpha.ps1 -UiSmokeTest
+          if ($LASTEXITCODE -ne 0) { throw 'Windows GUI construction or CLI bridge smoke failed.' }
       - name: Collect Windows release license and direct dependency evidence (no redistribution)
         if: runner.os == 'Windows'
         shell: pwsh
