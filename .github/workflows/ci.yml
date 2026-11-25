@@ -113,3 +113,42 @@ jobs:
             }
           }
           exit 0
+
+      - name: Compare static CRT candidate (CI only, never package)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $canonical = 'target/release/aegis-policy.exe'
+          $canonicalHash = (Get-FileHash -LiteralPath $canonical -Algorithm SHA256).Hash
+          $candidateDir = 'target/crt-static-research'
+          $candidate = "$candidateDir/release/aegis-policy.exe"
+          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = '-C link-arg=/Brepro -C target-feature=+crt-static'
+          & cargo +1.100.0 build --locked --offline --release --bin aegis-policy --target-dir $candidateDir
+          if ($LASTEXITCODE -ne 0) { throw 'Static CRT candidate build failed.' }
+          $first = (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash
+          & cargo +1.100.0 clean --release --target-dir $candidateDir
+          if ($LASTEXITCODE -ne 0 -or (Test-Path -LiteralPath $candidate)) { throw 'Static CRT candidate clean failed.' }
+          & cargo +1.100.0 build --locked --offline --release --bin aegis-policy --target-dir $candidateDir
+          if ($LASTEXITCODE -ne 0) { throw 'Static CRT candidate rebuild failed.' }
+          $second = (Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash
+          if ($first -cne $second) { throw 'Static CRT candidate rebuild mismatch.' }
+          & cargo +1.100.0 test --locked --offline --release --test cli_smoke --target-dir $candidateDir
+          if ($LASTEXITCODE -ne 0) { throw 'Static CRT candidate smoke tests failed.' }
+          if ((Get-FileHash -LiteralPath $candidate -Algorithm SHA256).Hash -cne $second) { throw 'Candidate changed during smoke tests.' }
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or @($installation).Count -ne 1 -or [string]::IsNullOrWhiteSpace($installation)) { throw 'VC discovery failed.' }
+          $version = (Get-Content -LiteralPath (Join-Path $installation 'VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt') -Raw).Trim()
+          if ($version -cnotmatch '^[0-9]+(\.[0-9]+){1,3}$') { throw 'Unexpected VC version.' }
+          $dumpbin = Join-Path $installation "VC/Tools/MSVC/$version/bin/Hostx64/x64/dumpbin.exe"
+          $imports = & $dumpbin /DEPENDENTS $candidate
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate PE inspection failed.' }
+          $imports | Write-Output
+          $runtimePresent = [bool]($imports -match '^\s*VCRUNTIME140(?:_[0-9]+)?\.dll\s*$')
+          Write-Output "Static CRT candidate direct VCRUNTIME140 import reported: $runtimePresent"
+          Write-Output "Candidate SHA256: $second; bytes: $((Get-Item -LiteralPath $candidate).Length); canonical bytes: $((Get-Item -LiteralPath $canonical).Length)"
+          if ((Get-FileHash -LiteralPath $canonical -Algorithm SHA256).Hash -cne $canonicalHash) { throw 'Canonical executable changed during research.' }
+          Write-Output 'Research only: no package, upload, installation or license clearance.'
+          exit 0
