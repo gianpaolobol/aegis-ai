@@ -32,10 +32,17 @@ function Get-AegisNativeReport([scriptblock]$ReadDefender, [scriptblock]$ReadFir
         $records = @(& $ReadDefender)
         if ($records.Count -eq 1) { $defender = $records[0] }
     } catch { $defender = $null }
-    foreach ($key in @('AntivirusEnabled','RealTimeProtectionEnabled','AMServiceEnabled','IsTamperProtected')) {
+    foreach ($key in @('AntivirusEnabled','RealTimeProtectionEnabled','AMServiceEnabled','IsTamperProtected','BehaviorMonitorEnabled','IoavProtectionEnabled')) {
         $state = Convert-AegisState (Get-AegisProperty $defender $key)
         $lines += "Defender $key : $state"
     }
+    $freshness = Get-AegisProperty $defender 'DefenderSignaturesOutOfDate'
+    $freshnessState = 'Unknown'
+    if ($freshness -is [bool]) {
+        if ($freshness) { $freshnessState = 'ReportedOutOfDate' }
+        else { $freshnessState = 'NotReportedOutOfDate' }
+    }
+    $lines += "Defender signature freshness : $freshnessState"
     $profiles = @()
     try { $profiles = @(& $ReadFirewall) } catch { $profiles = @() }
     foreach ($name in @('Domain','Private','Public')) {
@@ -50,22 +57,26 @@ function Get-AegisNativeReport([scriptblock]$ReadDefender, [scriptblock]$ReadFir
     return ($lines -join [Environment]::NewLine)
 }
 function Test-AegisNativeReport {
-    $good = { [pscustomobject]@{AntivirusEnabled=$true;RealTimeProtectionEnabled=$false;AMServiceEnabled=$true; ComputerID='SYNTHETIC-PRIVATE'} }
+    $good = { [pscustomobject]@{AntivirusEnabled=$true;RealTimeProtectionEnabled=$false;AMServiceEnabled=$true;BehaviorMonitorEnabled=$true;IoavProtectionEnabled=$false;DefenderSignaturesOutOfDate=$true; ComputerID='SYNTHETIC-PRIVATE'} }
     $firewall = {
         [pscustomobject]@{Name='Domain';Enabled='True'}
         [pscustomobject]@{Name='Private';Enabled='NotConfigured'}
         [pscustomobject]@{Name='Public';Enabled='False'}
     }
     $report = Get-AegisNativeReport $good $firewall
-    foreach ($expected in @('Defender AntivirusEnabled : Enabled','Defender RealTimeProtectionEnabled : Disabled','Defender IsTamperProtected : Unknown','Firewall Domain : Enabled','Firewall Private : Unknown','Firewall Public : Disabled')) {
+    foreach ($expected in @('Defender AntivirusEnabled : Enabled','Defender RealTimeProtectionEnabled : Disabled','Defender IsTamperProtected : Unknown','Defender BehaviorMonitorEnabled : Enabled','Defender IoavProtectionEnabled : Disabled','Defender signature freshness : ReportedOutOfDate','Firewall Domain : Enabled','Firewall Private : Unknown','Firewall Public : Disabled')) {
         if (-not $report.Contains($expected)) { throw "Unexpected diagnostic fixture result: $expected" }
     }
     if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'Unexpected private field disclosure' }
     $report = Get-AegisNativeReport { throw 'SYNTHETIC-PRIVATE' } { throw 'SYNTHETIC-PRIVATE' }
-    if (($report.Split([char]10) | Where-Object { $_ -match ' : Unknown' }).Count -ne 7 -or $report.Contains('SYNTHETIC-PRIVATE')) { throw 'Provider failure not safely represented' }
+    if (($report.Split([char]10) | Where-Object { $_ -match ' : Unknown' }).Count -ne 10 -or $report.Contains('SYNTHETIC-PRIVATE')) { throw 'Provider failure not safely represented' }
     $report = Get-AegisNativeReport { & $good; & $good } { & $firewall; & $firewall }
-    if (($report.Split([char]10) | Where-Object { $_ -match ' : Unknown' }).Count -ne 7) { throw 'Duplicate provider records accepted' }
+    if (($report.Split([char]10) | Where-Object { $_ -match ' : Unknown' }).Count -ne 10) { throw 'Duplicate provider records accepted' }
     if ((Convert-AegisState 'false') -ne 'Unknown' -or (Convert-AegisState 1) -ne 'Unknown') { throw 'Ambiguous state accepted' }
+    $report = Get-AegisNativeReport { [pscustomobject]@{DefenderSignaturesOutOfDate=$false} } {}
+    if (-not $report.Contains('Defender signature freshness : NotReportedOutOfDate')) { throw 'Signature flag inversion' }
+    $report = Get-AegisNativeReport { [pscustomobject]@{DefenderSignaturesOutOfDate='False'} } {}
+    if (-not $report.Contains('Defender signature freshness : Unknown')) { throw 'Nonboolean signature flag accepted' }
     Write-Output 'PASS: native diagnostic synthetic fixtures'
 }
 
