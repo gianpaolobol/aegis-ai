@@ -3,6 +3,7 @@
 Not an attestation verifier, package installer or approval to execute code.
 """
 import hashlib
+import json
 import base64
 import csv
 import re
@@ -147,18 +148,63 @@ def inspect_bytes(data, expected):
         return "InvalidArchive"
 
 
+def read_candidate(path):
+    p = Path(path)
+    if p.name != FILENAME or p.is_symlink() or not p.is_file():
+        raise ValueError("candidate unavailable")
+    with p.open("rb") as f:
+        if not stat.S_ISREG(__import__("os").fstat(f.fileno()).st_mode):
+            raise ValueError("candidate unavailable")
+        return f.read(MAX_WHEEL + 1)
+
+
 def inspect_path(path):
     try:
-        p = Path(path)
-        if p.name != FILENAME or p.is_symlink() or not p.is_file():
-            return "Unavailable"
-        with p.open("rb") as f:
-            if not stat.S_ISREG(__import__("os").fstat(f.fileno()).st_mode):
-                return "Unavailable"
-            data = f.read(MAX_WHEEL + 1)
-        return inspect_bytes(data, SHA256)
+        return inspect_bytes(read_candidate(path), SHA256)
     except (OSError, ValueError):
         return "Unavailable"
+
+
+def inventory_bytes(data, expected):
+    """Evidence only: exact archive bytes, no extraction, import or approval."""
+    if inspect_bytes(data, expected) != "DigestAndMetadataMatch":
+        return None
+    try:
+        entries = []
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            for item in sorted(z.infolist(), key=lambda i: i.filename):
+                if item.is_dir():
+                    continue
+                name = item.filename
+                lower = name.lower()
+                leaf = lower.rsplit("/", 1)[-1]
+                # Candidate hints, not legal conclusions or a complete linkage graph.
+                notice = (lower.startswith(PREFIX.lower() + "licenses/") or
+                          leaf.startswith(("license", "licence", "notice", "copying", "copyright")))
+                native = leaf.endswith((".pyd", ".dll", ".exe", ".lib", ".so", ".dylib"))
+                digest = hashlib.sha256()
+                count = 0
+                with z.open(item) as stream:
+                    while True:
+                        chunk = stream.read(65536)
+                        if not chunk:
+                            break
+                        count += len(chunk)
+                        if count > item.file_size:
+                            return None
+                        digest.update(chunk)
+                if count != item.file_size:
+                    return None
+                entries.append({"path": name, "size": count, "sha256": digest.hexdigest(),
+                                "notice_candidate": notice, "native_candidate": native})
+        return {"schema": "aegis-wheel-evidence-v1",
+                "archive_sha256": hashlib.sha256(data).hexdigest(),
+                "coverage": "archive-members-only",
+                "license_review": "not-performed",
+                "provenance_review": "not-performed",
+                "execution_approved": False, "members": entries}
+    except Exception:
+        return None
 
 
 class Fixtures(unittest.TestCase):
@@ -261,6 +307,40 @@ class Fixtures(unittest.TestCase):
     def test_invalid_archive_and_size(self):
         self.assertEqual(self.check(b"not zip"), "InvalidArchive")
         self.assertEqual(inspect_bytes(b"x"*(MAX_WHEEL+1), ""), "InvalidSize")
+    def test_inventory_exact_and_deterministic(self):
+        data = self.wheel(member=PREFIX + "licenses/LICENSE.txt")
+        expected = hashlib.sha256(data).hexdigest()
+        evidence = inventory_bytes(data, expected)
+        self.assertEqual(evidence, inventory_bytes(data, expected))
+        self.assertEqual(evidence["archive_sha256"], expected)
+        self.assertFalse(evidence["execution_approved"])
+        self.assertEqual(evidence["license_review"], "not-performed")
+        self.assertEqual(evidence["provenance_review"], "not-performed")
+        self.assertEqual(evidence["coverage"], "archive-members-only")
+        paths = [entry["path"] for entry in evidence["members"]]
+        self.assertEqual(paths, sorted(paths))
+        self.assertIn(PREFIX + "RECORD", paths)
+        notice = next(e for e in evidence["members"] if e["notice_candidate"])
+        self.assertEqual(notice["path"], PREFIX + "licenses/LICENSE.txt")
+        self.assertEqual(notice["size"], len(b"synthetic"))
+        self.assertEqual(notice["sha256"], hashlib.sha256(b"synthetic").hexdigest())
+        self.assertFalse(notice["native_candidate"])
+
+    def test_inventory_native_hint_not_approval(self):
+        data = self.wheel(member="yara_x/fixture.PYD")
+        evidence = inventory_bytes(data, hashlib.sha256(data).hexdigest())
+        self.assertEqual([e["path"] for e in evidence["members"] if e["native_candidate"]],
+                         ["yara_x/fixture.PYD"])
+        self.assertFalse(any(e["notice_candidate"] for e in evidence["members"]))
+        self.assertFalse(evidence["execution_approved"])
+
+    def test_inventory_refuses_invalid_preflight(self):
+        for data in (self.wheel(record_mode="bad_hash"),
+                     self.wheel(member="CON"), self.wheel(extra="Requires-Dist: synthetic\n")):
+            self.assertIsNone(inventory_bytes(data, hashlib.sha256(data).hexdigest()))
+        data = self.wheel()
+        self.assertIsNone(inventory_bytes(data, "0" * 64))
+
     def test_missing_path(self):
         self.assertEqual(inspect_path("not-the-candidate.whl"), "Unavailable")
     def test_oversize_metadata(self):
@@ -274,5 +354,13 @@ if __name__ == "__main__":
         result = inspect_path(sys.argv[2])
         print(result + "; independent attestation, license, advisory and lab review still required.")
         sys.exit(0 if result == "DigestAndMetadataMatch" else 2)
+    elif len(sys.argv) == 3 and sys.argv[1] == "--inventory":
+        try:
+            evidence = inventory_bytes(read_candidate(sys.argv[2]), SHA256)
+        except (OSError, ValueError):
+            evidence = None
+        if evidence is None:
+            sys.exit("Candidate inventory unavailable; preflight required.")
+        print(json.dumps(evidence, sort_keys=True, ensure_ascii=True))
     else:
-        sys.exit("Use --self-test or --inspect with the explicitly selected offline candidate.")
+        sys.exit("Use --self-test, --inspect or --inventory with the explicitly selected offline candidate.")
