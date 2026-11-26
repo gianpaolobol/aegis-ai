@@ -1067,15 +1067,29 @@ pub mod incident {
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Error { TooManyEvents, InvalidIdentifier, DuplicateEvent }
+    /// One deterministic supporting pair per reviewed synthetic asset.
+    /// This is a correlation explanation, not causal attribution or proof.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ReviewEvidence {
+        pub asset: u32,
+        pub first_event: u32,
+        pub second_event: u32,
+        pub first_signal: Signal,
+        pub second_signal: Signal,
+        pub elapsed_seconds: u64,
+    }
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub struct Summary {
         pub event_count: usize,
         pub assets_observed: usize,
         pub assets_with_advisories: usize,
         pub assets_for_review: usize,
+        pub review_evidence: Vec<ReviewEvidence>,
     }
     /// Review when two distinct non-normal signal categories occur for the same
     /// asset within the inclusive window. Counts are not unique incidents.
+    /// Evidence is ordered by asset, then the first qualifying pair in
+    /// chronological/event-ID order; no cross-asset edges or causal inference.
     /// IDs, time and signal labels are caller-supplied fixtures, not trusted telemetry.
     /// Entire input is validated before a result; no persistent or privileged action.
     pub fn correlate(events: &[Event]) -> Result<Summary, Error> {
@@ -1088,24 +1102,30 @@ pub mod incident {
             by_asset.entry(event.asset).or_default().push(event);
         }
         let mut advisory = 0;
-        let mut review = 0;
-        for group in by_asset.values_mut() {
+        let mut review_evidence = Vec::new();
+        for (&asset, group) in by_asset.iter_mut() {
             group.retain(|e| e.signal != Signal::Normal);
             if group.is_empty() { continue; }
             advisory += 1;
             group.sort_unstable_by_key(|e| (e.seconds, e.id));
-            let mut matched = false;
-            for (i, left) in group.iter().enumerate() {
+            'pairs: for (i, left) in group.iter().enumerate() {
                 for right in &group[i+1..] {
-                    if right.seconds - left.seconds > WINDOW_SECONDS { break; }
-                    if left.signal != right.signal { matched = true; break; }
+                    let elapsed_seconds = right.seconds - left.seconds;
+                    if elapsed_seconds > WINDOW_SECONDS { break; }
+                    if left.signal != right.signal {
+                        review_evidence.push(ReviewEvidence {
+                            asset, first_event: left.id, second_event: right.id,
+                            first_signal: left.signal, second_signal: right.signal,
+                            elapsed_seconds,
+                        });
+                        break 'pairs;
+                    }
                 }
-                if matched { break; }
             }
-            if matched { review += 1; }
         }
         Ok(Summary { event_count: events.len(), assets_observed: by_asset.len(),
-            assets_with_advisories: advisory, assets_for_review: review })
+            assets_with_advisories: advisory, assets_for_review: review_evidence.len(),
+            review_evidence })
     }
     #[cfg(test)]
     mod tests {
@@ -1145,6 +1165,35 @@ pub mod incident {
             assert_eq!(correlate(&[e(1,1,0,Normal),e(1,2,0,PolicyDenied)]),Err(Error::DuplicateEvent));
             assert_eq!(correlate(&[e(0,1,0,Normal)]),Err(Error::InvalidIdentifier));
             assert_eq!(correlate(&[e(1,0,0,Normal)]),Err(Error::InvalidIdentifier));
+        }
+        #[test] fn evidence_is_exact_and_inclusive() {
+            let s = correlate(&[e(3,1,300,NativeProtectionDisabled), e(2,1,300,PolicyDenied),
+                e(1,1,0,IntegrityMismatch), e(4,1,1,Normal)]).unwrap();
+            assert_eq!(s.review_evidence, vec![ReviewEvidence { asset: 1, first_event: 1,
+                second_event: 2, first_signal: IntegrityMismatch, second_signal: PolicyDenied,
+                elapsed_seconds: 300 }]);
+        }
+        #[test] fn evidence_is_order_invariant_and_asset_scoped() {
+            let a = [e(4,2,11,PolicyDenied), e(3,2,10,IntegrityMismatch),
+                e(2,1,8,PolicyDenied), e(1,1,8,IntegrityMismatch),
+                e(5,3,8,IntegrityMismatch)];
+            let mut b = a;
+            b.reverse();
+            let s = correlate(&a).unwrap();
+            assert_eq!(s, correlate(&b).unwrap());
+            assert_eq!(s.assets_for_review, s.review_evidence.len());
+            assert_eq!(s.review_evidence.iter().map(|p| (p.asset,p.first_event,p.second_event,p.elapsed_seconds))
+                .collect::<Vec<_>>(), vec![(1,1,2,0),(2,3,4,1)]);
+        }
+        #[test] fn unsupported_pairs_have_no_evidence() {
+            for events in [
+                [e(1,1,0,IntegrityMismatch),e(2,2,0,PolicyDenied)],
+                [e(1,1,0,IntegrityMismatch),e(2,1,301,PolicyDenied)],
+                [e(1,1,0,IntegrityMismatch),e(2,1,0,Normal)],
+                [e(1,1,0,IntegrityMismatch),e(2,1,0,IntegrityMismatch)],
+            ] {
+                assert!(correlate(&events).unwrap().review_evidence.is_empty());
+            }
         }
         #[test] fn bounded_batch() {
             let mut events: Vec<_> = (1..=MAX_EVENTS as u32).map(|id| e(id,1,0,PolicyDenied)).collect();

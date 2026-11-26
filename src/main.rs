@@ -120,8 +120,16 @@ fn run(args: &[OsString]) -> (i32, String) {
             Event { id: 4, asset: 3, seconds: 60, signal: Signal::Normal },
         ];
         match correlate(&events) {
-            Ok(s) => return (0, format!("Synthetic incident correlation; not live telemetry or enforcement.\nEvents: {}\nAssets observed: {}\nAssets with advisories: {}\nAssets for review: {}\nNo attack probability or safety established.\n",
-                s.event_count, s.assets_observed, s.assets_with_advisories, s.assets_for_review)),
+            Ok(s) => {
+                let mut report = format!("Synthetic incident correlation; not live telemetry or enforcement.\nEvents: {}\nAssets observed: {}\nAssets with advisories: {}\nAssets for review: {}\nNo attack probability or safety established.\n",
+                    s.event_count, s.assets_observed, s.assets_with_advisories, s.assets_for_review);
+                for p in s.review_evidence {
+                    report.push_str(&format!("Fixture asset {}: event {} ({:?}) + event {} ({:?}), {} seconds apart.\n",
+                        p.asset, p.first_event, p.first_signal, p.second_event, p.second_signal, p.elapsed_seconds));
+                }
+                report.push_str("Correlation explanation only; no causal attribution.\n");
+                return (0, report);
+            }
             Err(_) => return (1, "Synthetic correlation unavailable.\n".into()),
         }
     }

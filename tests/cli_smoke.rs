@@ -83,7 +83,9 @@ fn incident_demo_reports_counts_and_limitations() {
     assert_eq!(output.status.code(), Some(0));
     for expected in ["Events: 4", "Assets observed: 3", "Assets with advisories: 2",
                      "Assets for review: 1", "not live telemetry or enforcement",
-                     "No attack probability or safety established"] {
+                     "No attack probability or safety established",
+                     "Fixture asset 1: event 1 (IntegrityMismatch) + event 2 (PolicyDenied), 60 seconds apart.",
+                     "Correlation explanation only; no causal attribution."] {
         assert!(stdout(&output).contains(expected));
     }
     assert!(output.stderr.is_empty());
