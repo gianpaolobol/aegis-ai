@@ -39,7 +39,7 @@ fn run(args: &[OsString]) -> (i32, String) {
             Service { id: 4, role: Role::Recovery, impact: 1 },
         ];
         let snapshot = Snapshot { policy_version: 1, observed_at: 90, now: 100,
-            reviewed_fixture: true, recovery_available: true, stopped: false };
+            reviewed_fixture: true, recovery_available: true, administration_available: true, stopped: false };
         let proposal = Proposal { service: 1, policy_version: 1, expires: 120,
             reversible_in_fixture: true };
         let reservation = [Reservation { service: 2, expires: 110 }];
@@ -48,6 +48,8 @@ fn run(args: &[OsString]) -> (i32, String) {
             ("bounded proposal", plan(&registry, 5, snapshot, &[], proposal), Verdict::DryRunCandidateOnly),
             ("aggregate impact", plan(&registry, 4, snapshot, &reservation, proposal), Verdict::ImpactBudgetExceeded),
             ("recovery channel", plan(&registry, 5, snapshot, &[], Proposal { service: 4, ..proposal }), Verdict::ProtectedService),
+            ("expired unresolved reservation", plan(&registry, 5, snapshot, &[Reservation { service: 2, expires: 100 }], proposal), Verdict::RecoveryVerificationRequired),
+            ("administration channel unavailable", plan(&registry, 5, Snapshot { administration_available: false, ..snapshot }, &[], proposal), Verdict::AdministrationUnavailable),
             ("kill switch", plan(&registry, 5, Snapshot { stopped: true, ..snapshot }, &[], proposal), Verdict::Stopped),
         ] {
             report.push_str(&format!("{label}: {observed:?}\n"));

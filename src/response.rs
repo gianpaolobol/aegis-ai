@@ -24,6 +24,7 @@ pub struct Snapshot {
     pub now: u64,
     pub reviewed_fixture: bool,
     pub recovery_available: bool,
+    pub administration_available: bool,
     pub stopped: bool,
 }
 
@@ -37,15 +38,17 @@ pub struct Proposal {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
-    InvalidPolicy, InvalidSnapshot, Stopped, RecoveryUnavailable, StalePolicy,
+    InvalidPolicy, InvalidSnapshot, Stopped, RecoveryUnavailable, AdministrationUnavailable, StalePolicy,
     InvalidProposal, ProtectedService, UnknownService, AlreadyReserved,
-    ImpactBudgetExceeded, DryRunCandidateOnly,
+    ImpactBudgetExceeded, RecoveryVerificationRequired, DryRunCandidateOnly,
 }
 
 /// The registry and budget are separate from the proposal. Impact units are
 /// synthetic configured costs, not measurements of actual service availability.
-/// Expired reservations no longer count in this model; actual rollback must
-/// be verified separately before releasing a real reservation.
+/// The snapshot lists all unresolved reservations, including expired ones.
+/// Expiry is not proof of recovery. An expired unresolved reservation blocks
+/// new candidates until an independently reconciled snapshot is available.
+/// This pure fixture cannot authenticate reconciliation or prove rollback.
 pub fn plan(registry: &[Service], budget: u32, snapshot: Snapshot,
     active: &[Reservation], proposal: Proposal) -> Verdict {
     use Verdict::*;
@@ -69,6 +72,7 @@ pub fn plan(registry: &[Service], budget: u32, snapshot: Snapshot,
         return InvalidSnapshot;
     }
     if !snapshot.recovery_available { return RecoveryUnavailable; }
+    if !snapshot.administration_available { return AdministrationUnavailable; }
     if proposal.policy_version != snapshot.policy_version { return StalePolicy; }
     if !proposal.reversible_in_fixture ||
         !proposal.expires.checked_sub(snapshot.now).is_some_and(|ttl| ttl > 0 && ttl <= MAX_TTL) {
@@ -79,18 +83,21 @@ pub fn plan(registry: &[Service], budget: u32, snapshot: Snapshot,
 
     let mut seen = BTreeSet::new();
     let mut used = 0u32;
+    let mut unresolved_expiry = false;
     for reservation in active {
         let Some(s) = services.get(&reservation.service) else { return InvalidSnapshot; };
         if s.role != Role::Ordinary || !seen.insert(s.id) ||
+            reservation.expires == 0 ||
             reservation.expires.saturating_sub(snapshot.now) > MAX_TTL {
             return InvalidSnapshot;
         }
-        if reservation.expires > snapshot.now {
-            // At most 128 * 1000, bounded well below u32::MAX.
-            used += s.impact;
-        }
+        // Never release the impact reservation merely because its TTL elapsed.
+        // At most 128 * 1000, bounded well below u32::MAX.
+        used += s.impact;
+        unresolved_expiry |= reservation.expires <= snapshot.now;
     }
-    if active.iter().any(|r| r.service == target.id && r.expires > snapshot.now) {
+    if unresolved_expiry { return RecoveryVerificationRequired; }
+    if active.iter().any(|r| r.service == target.id) {
         return AlreadyReserved;
     }
     if used + target.impact > budget { return ImpactBudgetExceeded; }
@@ -109,7 +116,7 @@ mod tests {
     ];
     fn snapshot() -> Snapshot {
         Snapshot { policy_version: 1, observed_at: 90, now: 100,
-            reviewed_fixture: true, recovery_available: true, stopped: false }
+            reviewed_fixture: true, recovery_available: true, administration_available: true, stopped: false }
     }
     fn proposal(service: u16) -> Proposal {
         Proposal { service, policy_version: 1, expires: 120, reversible_in_fixture: true }
@@ -134,14 +141,38 @@ mod tests {
         assert_eq!(plan(&SERVICES, 5, snapshot(), &active, proposal(2)), Verdict::AlreadyReserved);
     }
     #[test]
-    fn expired_reservation_only_in_simulation() {
-        let active = [Reservation { service: 2, expires: 100 }];
-        assert_eq!(plan(&SERVICES, 2, snapshot(), &active, proposal(1)), Verdict::DryRunCandidateOnly);
+    fn unresolved_expiry_blocks_new_and_repeat_candidates() {
+        for expires in [99, 100] {
+            let active = [Reservation { service: 2, expires }];
+            for target in [1, 2] {
+                assert_eq!(plan(&SERVICES, 10, snapshot(), &active, proposal(target)),
+                    Verdict::RecoveryVerificationRequired);
+            }
+        }
+        // A later, independently reconciled fixture can be evaluated again.
+        // An empty list itself is not evidence of real-world rollback.
+        assert_eq!(plan(&SERVICES, 10, snapshot(), &[], proposal(1)), Verdict::DryRunCandidateOnly);
+    }
+    #[test]
+    fn expired_records_do_not_hide_malformed_snapshot() {
+        let expired = Reservation { service: 2, expires: 99 };
+        let unknown = Reservation { service: 99, expires: 110 };
+        for active in [[expired, unknown], [unknown, expired]] {
+            assert_eq!(plan(&SERVICES, 10, snapshot(), &active, proposal(1)), Verdict::InvalidSnapshot);
+        }
+        assert_eq!(plan(&SERVICES, 10, snapshot(), &[expired, expired], proposal(1)), Verdict::InvalidSnapshot);
     }
     #[test]
     fn kill_switch_and_recovery() {
         assert_eq!(plan(&SERVICES, 5, Snapshot { stopped: true, ..snapshot() }, &[], proposal(1)), Verdict::Stopped);
         assert_eq!(plan(&SERVICES, 5, Snapshot { recovery_available: false, ..snapshot() }, &[], proposal(1)), Verdict::RecoveryUnavailable);
+    }
+    #[test]
+    fn administration_channel_is_independent() {
+        assert_eq!(plan(&SERVICES, 5, Snapshot { administration_available: false, ..snapshot() }, &[], proposal(1)),
+            Verdict::AdministrationUnavailable);
+        assert_eq!(plan(&SERVICES, 5, Snapshot { stopped: true, administration_available: false, ..snapshot() }, &[], proposal(1)),
+            Verdict::Stopped);
     }
     #[test]
     fn stale_missing_or_future_snapshot_and_policy() {
@@ -170,6 +201,7 @@ mod tests {
             vec![Reservation { service: 4, expires: 120 }],
             vec![Reservation { service: 2, expires: 120 }; 2],
             vec![Reservation { service: 2, expires: 401 }],
+            vec![Reservation { service: 2, expires: 0 }],
             vec![Reservation { service: 2, expires: 120 }; MAX_SERVICES + 1]] {
             assert_eq!(plan(&SERVICES, 5, snapshot(), &active, proposal(1)), Verdict::InvalidSnapshot);
         }

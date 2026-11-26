@@ -46,6 +46,8 @@ fn synthetic_demos_have_expected_results() {
                      "scoped export: RequireApproval", "policy change: Deny",
                      "no containment or rollback performed", "bounded proposal: DryRunCandidateOnly",
                      "aggregate impact: ImpactBudgetExceeded", "recovery channel: ProtectedService",
+                     "expired unresolved reservation: RecoveryVerificationRequired",
+                     "administration channel unavailable: AdministrationUnavailable",
                      "kill switch: Stopped"] {
         assert!(stdout(&policy).contains(expected));
     }
