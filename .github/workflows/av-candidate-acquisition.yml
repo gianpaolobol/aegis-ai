@@ -1,0 +1,33 @@
+# Copyright 2026 Gian Paolo Franceschini. See LICENSE.
+# Temporary public-source acquisition job; not an offline fixture test.
+name: AV candidate acquisition (no execution)
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/av-candidate-acquisition.yml'
+permissions:
+  contents: read
+jobs:
+  acquire:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'dev/ade-bootstrap-002'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Acquire fixed public wheel and check bytes without execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          tmp="$(mktemp -d)"
+          trap 'rm -rf -- "$tmp"' EXIT
+          candidate="$tmp/yara_x-1.24.0-cp39-abi3-win_amd64.whl"
+          # No redirects, no pip, no import, no secrets, no artifact upload.
+          curl --disable --proto '=https' --connect-timeout 10 --max-time 60 --max-filesize 16777216 --fail --silent --show-error --output "$candidate" 'https://files.pythonhosted.org/packages/8c/52/6381a0e38246dfd81965b5f24c34dcd20bf7bb73dc5795183cf746a8c305/yara_x-1.24.0-cp39-abi3-win_amd64.whl'
+          python -I lab/av/verify_wheel.py --inspect "$candidate"
+          echo 'Acquired and preflighted only; no execution, independent attestation or licensing approval.'
+          rm -rf -- "$tmp"
+          test ! -e "$tmp"
+          trap - EXIT
