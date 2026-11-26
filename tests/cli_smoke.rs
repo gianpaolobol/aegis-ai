@@ -119,3 +119,19 @@ fn mail_auth_demo_is_advisory_and_rejects_extra_arguments() {
     assert!(invalid.stdout.is_empty());
     assert!(!stderr(&invalid).contains("synthetic-secret"));
 }
+
+#[test]
+fn recovery_demo_is_advisory_and_rejects_extra_arguments() {
+    let output = run(&["demo-recovery"]);
+    assert_eq!(output.status.code(), Some(0));
+    for expected in ["Copies: 3", "Failure domains: 3", "Known media: 2",
+        "Complete fixture: FixtureCriteriaReported", "Missing isolated restore: ReviewRequired",
+        "no backup inspection or restore performed", "Recovery capability not established"] {
+        assert!(stdout(&output).contains(expected));
+    }
+    assert!(output.stderr.is_empty());
+    let invalid = run(&["demo-recovery", "synthetic-secret"]);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(invalid.stdout.is_empty());
+    assert!(!stderr(&invalid).contains("synthetic-secret"));
+}

@@ -5,7 +5,7 @@ use aegis_policy::{classify, Action, Decision};
 use aegis_policy::wifi::{audit, Audit, Metadata, Observation, Pmf, Reported, SecurityMode};
 use std::ffi::{OsStr, OsString};
 
-const HELP: &str = "AEGIS AI — alpha demonstrator (not validated)\nUsage: aegis-policy [status|demo-policy|demo-wifi|demo-incidents|demo-patches|demo-mail-auth|--help|--version]\nNo device access, network operations, antivirus or active protection.\n";
+const HELP: &str = "AEGIS AI — alpha demonstrator (not validated)\nUsage: aegis-policy [status|demo-policy|demo-wifi|demo-incidents|demo-patches|demo-mail-auth|demo-recovery|--help|--version]\nNo device access, network operations, antivirus or active protection.\n";
 const STATUS: &str = "AEGIS AI — development alpha\nActive protection: unavailable\nPolicy: pure classifier, not enforcement\nWi-Fi: synthetic metadata only, no radio access\nNo system settings changed. Keep native protections enabled.\n";
 fn run(args: &[OsString]) -> (i32, String) {
     if args.is_empty() { return (0, HELP.into()); }
@@ -126,6 +126,20 @@ fn run(args: &[OsString]) -> (i32, String) {
         }
         report.push_str("Payment/account changes require independent confirmation even with domain alignment. No sender identity or message safety established.\n");
         return (0, report);
+    }
+    if arg == OsStr::new("demo-recovery") {
+        use aegis_policy::recovery::{assess, example, Verdict};
+        let mut c = example();
+        let complete = assess(&c, 100, 20);
+        c[2].restore_verified_at = None;
+        let missing = assess(&c, 100, 20);
+        match (complete, missing) {
+            (Ok(a), Ok(b)) if a.verdict == Verdict::FixtureCriteriaReported &&
+                b.verdict == Verdict::ReviewRequired => return (0, format!(
+                    "Synthetic recovery readiness; no backup inspection or restore performed.\nCopies: {}\nFailure domains: {}\nKnown media: {}\nComplete fixture: {:?}\nMissing isolated restore: {:?}\nRecovery capability not established.\n",
+                    a.copies, a.failure_domains, a.known_media, a.verdict, b.verdict)),
+            _ => return (1, "Synthetic recovery assessment unavailable.\n".into()),
+        }
     }
     (2, "Unknown command. Use --help.\n".into())
 }
