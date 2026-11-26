@@ -52,3 +52,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'AV review queue regression failed' }
           python -I lab/av/review_candidate.py --review-queue
           if ($LASTEXITCODE -ne 0) { throw 'Retained AV evidence inconsistent' }
+
+      - name: Run offline publisher provenance preflight synthetic regressions
+        shell: powershell
+        run: |
+          python -I lab/av/provenance_preflight.py --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'Provenance preflight regressions failed' }

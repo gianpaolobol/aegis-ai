@@ -29,6 +29,9 @@ jobs:
           python -I lab/av/verify_wheel.py --self-test
           python -I lab/av/verify_wheel.py --sbom-components "$candidate" > "$tmp/components.json"
           python -I -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); rows=d.pop("components"); print("AEGIS_SBOM_SUMMARY "+json.dumps(d,sort_keys=True,ensure_ascii=True)); [print("AEGIS_SBOM_ROW "+json.dumps(row,sort_keys=True,ensure_ascii=True)) for row in rows]' "$tmp/components.json"
+          # Public registry evidence, no signature verification or native execution.
+          curl --disable --proto '=https' --connect-timeout 10 --max-time 30 --max-filesize 1048576 --fail --silent --show-error --header 'Accept: application/vnd.pypi.integrity.v1+json' --output "$tmp/provenance.json" 'https://pypi.org/integrity/yara-x/1.24.0/yara_x-1.24.0-cp39-abi3-win_amd64.whl/provenance'
+          python -I lab/av/provenance_preflight.py --inspect "$tmp/provenance.json"
           echo 'Acquired and inventoried only; no execution, independent attestation or licensing approval.'
           rm -rf -- "$tmp"
           test ! -e "$tmp"
