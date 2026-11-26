@@ -4,7 +4,7 @@ param([switch]$SelfTest, [switch]$UiSmokeTest)
 if ($SelfTest -and $UiSmokeTest) { throw 'Select only one test mode.' }
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-function Get-AegisCommands { @('status','demo-policy','demo-wifi','demo-incidents','demo-patches','--version') }
+function Get-AegisCommands { @('status','demo-policy','demo-wifi','demo-incidents','demo-patches','demo-mail-auth','--version') }
 function Test-AegisCommand([string]$Command) { return (Get-AegisCommands) -ccontains $Command }
 # Native diagnostic readings are advisory, not AEGIS enforcement.
 function Convert-AegisState($Value) {
@@ -610,8 +610,8 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 $form = New-Object Windows.Forms.Form
 $form.Text = 'AEGIS AI - Development Alpha'
-$form.Size = New-Object Drawing.Size(760,728)
-$form.MinimumSize = New-Object Drawing.Size(760,728)
+$form.Size = New-Object Drawing.Size(760,772)
+$form.MinimumSize = New-Object Drawing.Size(760,772)
 $form.StartPosition = 'CenterScreen'
 $banner = New-Object Windows.Forms.Label
 $banner.Location = New-Object Drawing.Point(18,14)
@@ -619,7 +619,7 @@ $banner.Size = New-Object Drawing.Size(700,62)
 $banner.Text = @('DEVELOPMENT ONLY - Active protection unavailable.', 'Keep native antivirus and firewall enabled. No scan, VPN or enforcement.', 'Run only from a trusted, reviewed development checkout.') -join [Environment]::NewLine
 $form.Controls.Add($banner)
 $output = New-Object Windows.Forms.TextBox
-$output.Location = New-Object Drawing.Point(18,418)
+$output.Location = New-Object Drawing.Point(18,462)
 $output.Size = New-Object Drawing.Size(705,230)
 $output.Multiline = $true
 $output.ReadOnly = $true
@@ -854,6 +854,15 @@ $patchPriority.Add_Click({
 })
 $form.Controls.Add($patchPriority)
 
+$mailAuth = New-Object Windows.Forms.Button
+$mailAuth.Location = New-Object Drawing.Point(18,416)
+$mailAuth.Size = New-Object Drawing.Size(340,36)
+$mailAuth.Text = 'Mail authentication (synthetic)'
+$mailAuth.Add_Click({
+    $output.Text = Get-AegisCliReport 'demo-mail-auth'
+})
+$form.Controls.Add($mailAuth)
+
 
 try {
     if ($UiSmokeTest) {
@@ -864,7 +873,7 @@ try {
             'Verify local file integrity (16 MiB max)','Incident correlation (synthetic)',
             'Windows VPN profiles (read-only)','Suspicious link (offline advisory)',
             'Windows patch inventory (partial)','Invoice IBAN comparison (offline, IT)',
-            'Windows disk encryption (read-only)','Patch priority (synthetic)')
+            'Windows disk encryption (read-only)','Patch priority (synthetic)','Mail authentication (synthetic)')
         if ($buttons.Count -ne $labels.Count) { throw 'Unexpected GUI button count.' }
         foreach ($label in $labels) {
             if (@($buttons | Where-Object { $_.Text -ceq $label }).Count -ne 1) {
@@ -886,7 +895,7 @@ try {
         if ((Get-AegisCliReport 'scan') -cne 'Command rejected.') {
             throw 'Invalid command bridge regression.'
         }
-        Write-Output 'PASS: GUI constructed; fourteen controls, safety labels, six CLI calls and denied command.'
+        Write-Output 'PASS: GUI constructed; fifteen controls, safety labels, seven CLI calls and denied command.'
     } else {
         [void]$form.ShowDialog()
     }

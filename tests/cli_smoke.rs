@@ -101,3 +101,21 @@ fn patch_demo_is_advisory_and_denies_extra_arguments() {
     assert!(invalid.stdout.is_empty());
     assert!(!stderr(&invalid).contains("synthetic-secret"));
 }
+
+#[test]
+fn mail_auth_demo_is_advisory_and_rejects_extra_arguments() {
+    let output = run(&["demo-mail-auth"]);
+    assert_eq!(output.status.code(), Some(0));
+    for expected in ["no mail access, DNS or signature validation",
+        "aligned payment fixture: DomainAlignmentReported",
+        "unaligned fixture: InconsistentEvidence", "missing fixture: IncompleteEvidence",
+        "untrusted fixture: UntrustedEvidence", "require independent confirmation",
+        "No sender identity or message safety established"] {
+        assert!(stdout(&output).contains(expected));
+    }
+    assert!(output.stderr.is_empty());
+    let invalid = run(&["demo-mail-auth", "synthetic-secret"]);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(invalid.stdout.is_empty());
+    assert!(!stderr(&invalid).contains("synthetic-secret"));
+}

@@ -5,7 +5,7 @@ use aegis_policy::{classify, Action, Decision};
 use aegis_policy::wifi::{audit, Audit, Metadata, Observation, Pmf, Reported, SecurityMode};
 use std::ffi::{OsStr, OsString};
 
-const HELP: &str = "AEGIS AI — alpha demonstrator (not validated)\nUsage: aegis-policy [status|demo-policy|demo-wifi|demo-incidents|demo-patches|--help|--version]\nNo device access, network operations, antivirus or active protection.\n";
+const HELP: &str = "AEGIS AI — alpha demonstrator (not validated)\nUsage: aegis-policy [status|demo-policy|demo-wifi|demo-incidents|demo-patches|demo-mail-auth|--help|--version]\nNo device access, network operations, antivirus or active protection.\n";
 const STATUS: &str = "AEGIS AI — development alpha\nActive protection: unavailable\nPolicy: pure classifier, not enforcement\nWi-Fi: synthetic metadata only, no radio access\nNo system settings changed. Keep native protections enabled.\n";
 fn run(args: &[OsString]) -> (i32, String) {
     if args.is_empty() { return (0, HELP.into()); }
@@ -105,6 +105,27 @@ fn run(args: &[OsString]) -> (i32, String) {
             }
             Err(_) => return (1, "Synthetic patch priority unavailable.\n".into()),
         }
+    }
+    if arg == OsStr::new("demo-mail-auth") {
+        use aegis_policy::mail_auth::{assess, Authentication, Dmarc, Fixture, Mechanism, Source};
+        let f = Fixture { source: Source::ReviewedFixture, valid_single_author: true,
+            spf: Mechanism::AlignedPass, dkim: Mechanism::NoPass, dmarc: Dmarc::Pass,
+            payment_or_account_change: true };
+        let mut report = String::from("Synthetic mail authentication advisory; no mail access, DNS or signature validation.\n");
+        for (label, input, expected) in [
+            ("aligned payment fixture", f, Authentication::DomainAlignmentReported),
+            ("unaligned fixture", Fixture { spf: Mechanism::UnalignedPass, ..f }, Authentication::InconsistentEvidence),
+            ("missing fixture", Fixture { spf: Mechanism::Unknown, ..f }, Authentication::IncompleteEvidence),
+            ("untrusted fixture", Fixture { source: Source::Untrusted, ..f }, Authentication::UntrustedEvidence),
+        ] {
+            let result = assess(input);
+            report.push_str(&format!("{label}: {:?}\n", result.authentication));
+            if result.authentication != expected || !result.independent_confirmation_required {
+                return (1, report);
+            }
+        }
+        report.push_str("Payment/account changes require independent confirmation even with domain alignment. No sender identity or message safety established.\n");
+        return (0, report);
     }
     (2, "Unknown command. Use --help.\n".into())
 }
