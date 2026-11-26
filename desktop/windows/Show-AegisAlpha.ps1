@@ -24,6 +24,18 @@ function Get-AegisProperty($Object, [string]$Name) {
     if ($null -eq $property) { return $null }
     return $property.Value
 }
+# Only known scalar actions; never interpret numeric values or arrays.
+function Convert-AegisFirewallAction($Record,[string]$Name) {
+    if ($null -eq $Record) { return 'Unknown' }
+    $property = $Record.PSObject.Properties[$Name]
+    if ($null -eq $property) { return 'Unknown' }
+    $value = $property.Value
+    if ($value -is [string] -or $value -is [System.Enum]) {
+        if ([string]$value -ceq 'Allow') { return 'Allow' }
+        if ([string]$value -ceq 'Block') { return 'Block' }
+    }
+    return 'Unknown'
+}
 function Get-AegisNativeReport([scriptblock]$ReadDefender, [scriptblock]$ReadFirewall) {
     $lines = @('Windows native protection snapshot (read-only).',
         'Not AEGIS protection; third-party antivirus not assessed.',
@@ -45,39 +57,71 @@ function Get-AegisNativeReport([scriptblock]$ReadDefender, [scriptblock]$ReadFir
     }
     $lines += "Defender signature freshness : $freshnessState"
     $profiles = @()
-    try { $profiles = @(& $ReadFirewall) } catch { $profiles = @() }
+    try {
+        $profiles = @(& $ReadFirewall | Select-Object -First 4)
+        if ($profiles.Count -gt 3) { $profiles = @() }
+    } catch { $profiles = @() }
     foreach ($name in @('Domain','Private','Public')) {
-        $matching = @($profiles | Where-Object { (Get-AegisProperty $_ 'Name') -ceq $name })
+        $matching = @($profiles | Where-Object {
+            if ($null -eq $_) { return $false }
+            $p = $_.PSObject.Properties['Name']
+            if ($null -eq $p) { return $false }
+            $v = $p.Value
+            return (($v -is [string] -or $v -is [System.Enum]) -and ([string]$v -ceq $name))
+        })
         $state = 'Unknown'
+        $inbound = 'Unknown'
+        $outbound = 'Unknown'
         if ($matching.Count -eq 1) {
-            $state = Convert-AegisState (Get-AegisProperty $matching[0] 'Enabled')
+            $enabled = $matching[0].PSObject.Properties['Enabled']
+            if ($null -ne $enabled) { $state = Convert-AegisState $enabled.Value }
+            $inbound = Convert-AegisFirewallAction $matching[0] 'DefaultInboundAction'
+            $outbound = Convert-AegisFirewallAction $matching[0] 'DefaultOutboundAction'
         }
         $lines += "Firewall $name : $state"
+        $lines += "Firewall $name default inbound : $inbound"
+        $lines += "Firewall $name default outbound : $outbound"
     }
     $lines += 'Firewall values are per-profile active policy, not an identification of the current network.'
+    $lines += 'Reported default actions are not effective packet decisions; rules, exceptions and disabled profiles are not evaluated.'
     return ($lines -join [Environment]::NewLine)
 }
 function Test-AegisNativeReport {
     $good = { [pscustomobject]@{AntivirusEnabled=$true;RealTimeProtectionEnabled=$false;AMServiceEnabled=$true;BehaviorMonitorEnabled=$true;IoavProtectionEnabled=$false;DefenderSignaturesOutOfDate=$true; ComputerID='SYNTHETIC-PRIVATE'} }
     $firewall = {
-        [pscustomobject]@{Name='Domain';Enabled='True'}
-        [pscustomobject]@{Name='Private';Enabled='NotConfigured'}
-        [pscustomobject]@{Name='Public';Enabled='False'}
+        [pscustomobject]@{Name='Domain';Enabled='True';DefaultInboundAction='Block';DefaultOutboundAction='Allow'}
+        [pscustomobject]@{Name='Private';Enabled='NotConfigured';DefaultInboundAction='NotConfigured';DefaultOutboundAction=1}
+        [pscustomobject]@{Name='Public';Enabled='False';DefaultInboundAction='Allow';DefaultOutboundAction='Block';LogFileName='SYNTHETIC-PRIVATE'}
     }
     $report = Get-AegisNativeReport $good $firewall
-    foreach ($expected in @('Defender AntivirusEnabled : Enabled','Defender RealTimeProtectionEnabled : Disabled','Defender IsTamperProtected : Unknown','Defender BehaviorMonitorEnabled : Enabled','Defender IoavProtectionEnabled : Disabled','Defender signature freshness : ReportedOutOfDate','Firewall Domain : Enabled','Firewall Private : Unknown','Firewall Public : Disabled')) {
+    foreach ($expected in @('Defender AntivirusEnabled : Enabled','Defender RealTimeProtectionEnabled : Disabled','Defender IsTamperProtected : Unknown','Defender BehaviorMonitorEnabled : Enabled','Defender IoavProtectionEnabled : Disabled','Defender signature freshness : ReportedOutOfDate','Firewall Domain : Enabled','Firewall Private : Unknown','Firewall Public : Disabled','Firewall Domain default inbound : Block','Firewall Domain default outbound : Allow','Firewall Private default inbound : Unknown','Firewall Private default outbound : Unknown','Firewall Public default inbound : Allow','Firewall Public default outbound : Block')) {
         if (-not $report.Contains($expected)) { throw "Unexpected diagnostic fixture result: $expected" }
     }
     if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'Unexpected private field disclosure' }
     $report = Get-AegisNativeReport { throw 'SYNTHETIC-PRIVATE' } { throw 'SYNTHETIC-PRIVATE' }
-    if (($report.Split([char]10) | Where-Object { $_ -match ' : Unknown' }).Count -ne 10 -or $report.Contains('SYNTHETIC-PRIVATE')) { throw 'Provider failure not safely represented' }
+    if (($report.Split([char]10) | Where-Object { $_ -match ' : Unknown' }).Count -ne 16 -or $report.Contains('SYNTHETIC-PRIVATE')) { throw 'Provider failure not safely represented' }
     $report = Get-AegisNativeReport { & $good; & $good } { & $firewall; & $firewall }
-    if (($report.Split([char]10) | Where-Object { $_ -match ' : Unknown' }).Count -ne 10) { throw 'Duplicate provider records accepted' }
+    if (($report.Split([char]10) | Where-Object { $_ -match ' : Unknown' }).Count -ne 16) { throw 'Duplicate provider records accepted' }
     if ((Convert-AegisState 'false') -ne 'Unknown' -or (Convert-AegisState 1) -ne 'Unknown') { throw 'Ambiguous state accepted' }
     $report = Get-AegisNativeReport { [pscustomobject]@{DefenderSignaturesOutOfDate=$false} } {}
     if (-not $report.Contains('Defender signature freshness : NotReportedOutOfDate')) { throw 'Signature flag inversion' }
     $report = Get-AegisNativeReport { [pscustomobject]@{DefenderSignaturesOutOfDate='False'} } {}
     if (-not $report.Contains('Defender signature freshness : Unknown')) { throw 'Nonboolean signature flag accepted' }
+    $report = Get-AegisNativeReport $good {
+        [pscustomobject]@{Name='Domain';Enabled=@('True');DefaultInboundAction=@('Block');DefaultOutboundAction='allow'}
+        [pscustomobject]@{Name=@('Private');Enabled=$true;DefaultInboundAction='Allow'}
+        [pscustomobject]@{Name='Public';DefaultOutboundAction='SYNTHETIC-PRIVATE'}
+    }
+    foreach ($expected in @('Firewall Domain : Unknown','Firewall Domain default inbound : Unknown','Firewall Domain default outbound : Unknown','Firewall Private default inbound : Unknown','Firewall Public default outbound : Unknown')) {
+        if (-not $report.Contains($expected)) { throw 'Malformed firewall metadata accepted' }
+    }
+    if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'Raw firewall value disclosed' }
+    $report = Get-AegisNativeReport $good {
+        [pscustomobject]@{Name='Domain';DefaultInboundAction='Allow'}
+        [pscustomobject]@{Name='Domain';DefaultInboundAction='Block'}
+        [pscustomobject]@{Name='Public';DefaultInboundAction='Block'}
+    }
+    if (-not $report.Contains('Firewall Domain default inbound : Unknown') -or -not $report.Contains('Firewall Public default inbound : Block')) { throw 'Ambiguous firewall profile accepted or unrelated profile suppressed' }
     Write-Output 'PASS: native diagnostic synthetic fixtures'
 }
 
