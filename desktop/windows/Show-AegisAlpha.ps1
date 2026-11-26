@@ -82,6 +82,103 @@ function Test-AegisNativeReport {
 }
 
 
+# Device Guard is an optional, local, read-only provider; never elevate or change policy.
+function Test-AegisDgInteger($Value) {
+    return ($Value -is [uint32] -or $Value -is [int32] -or $Value -is [uint16] -or $Value -is [int16] -or $Value -is [byte])
+}
+function Get-AegisDgScalar($Record,[string]$Name,[string[]]$Labels) {
+    if ($null -eq $Record) { return 'Unknown' }
+    $p = $Record.PSObject.Properties[$Name]
+    if ($null -eq $p) { return 'Unknown' }
+    $v = $p.Value
+    if (-not (Test-AegisDgInteger $v) -or $v -lt 0 -or $v -ge $Labels.Count) { return 'Unknown' }
+    return $Labels[[int]$v]
+}
+function Get-AegisDgService($Record,[string]$Name,[int]$Service) {
+    if ($null -eq $Record) { return 'Unknown' }
+    $p = $Record.PSObject.Properties[$Name]
+    if ($null -eq $p) { return 'Unknown' }
+    $v = $p.Value
+    if ($v -isnot [array] -or $v.Rank -ne 1 -or $v.Count -eq 0 -or $v.Count -gt 8) { return 'Unknown' }
+    $seen = @{}
+    foreach ($item in $v) {
+        if (-not (Test-AegisDgInteger $item) -or $item -lt 0 -or $item -gt 7) { return 'Unknown' }
+        $key = [int]$item
+        if ($seen.ContainsKey($key)) { return 'Unknown' }
+        $seen[$key] = $true
+    }
+    if ($seen.ContainsKey(0) -and $seen.Count -ne 1) { return 'Unknown' }
+    if ($seen.ContainsKey($Service)) { return 'Reported present' }
+    return 'Reported absent'
+}
+function Get-AegisDeviceGuardReport([scriptblock]$ReadDeviceGuard) {
+    $record = $null
+    try {
+        $records = @(& $ReadDeviceGuard | Select-Object -First 2)
+        if ($records.Count -eq 1) { $record = $records[0] }
+    } catch { $record = $null }
+    $vbs = Get-AegisDgScalar $record 'VirtualizationBasedSecurityStatus' @('Reported disabled','Reported enabled, not running','Reported running')
+    $cgConfigured = Get-AegisDgService $record 'SecurityServicesConfigured' 1
+    $hvciConfigured = Get-AegisDgService $record 'SecurityServicesConfigured' 2
+    $cgRunning = Get-AegisDgService $record 'SecurityServicesRunning' 1
+    $hvciRunning = Get-AegisDgService $record 'SecurityServicesRunning' 2
+    $kernel = Get-AegisDgScalar $record 'CodeIntegrityPolicyEnforcementStatus' @('Reported off','Reported audit','Reported enforced')
+    $userMode = Get-AegisDgScalar $record 'UsermodeCodeIntegrityPolicyEnforcementStatus' @('Reported off','Reported audit','Reported enforced')
+    $note = 'Reported states are not attestation or proof of protection.'
+    if (@('Reported disabled','Reported enabled, not running') -ccontains $vbs -and
+        ($cgRunning -ceq 'Reported present' -or $hvciRunning -ceq 'Reported present')) {
+        $vbs = 'Unknown'; $cgRunning = 'Unknown'; $hvciRunning = 'Unknown'
+        $note = 'Conflicting VBS and running-service readings; no positive conclusion.'
+    }
+    return (@('Windows Device Guard snapshot (read-only, optional provider).',
+        "VBS : $vbs",
+        "Credential Guard configured : $cgConfigured",
+        "Credential Guard running : $cgRunning",
+        "Memory integrity configured : $hvciConfigured",
+        "Memory integrity running : $hvciRunning",
+        "Kernel code integrity policy : $kernel",
+        "User-mode code integrity policy : $userMode",
+        $note,
+        'Access denied or unsupported fields remain Unknown; no elevation or configuration change.') -join [Environment]::NewLine)
+}
+function Test-AegisDeviceGuardReport {
+    $good = {
+        [pscustomobject]@{VirtualizationBasedSecurityStatus=[uint32]2;
+            SecurityServicesConfigured=[uint32[]]@(1,2);SecurityServicesRunning=[uint32[]]@(2);
+            CodeIntegrityPolicyEnforcementStatus=[uint32]2;UsermodeCodeIntegrityPolicyEnforcementStatus=[uint32]1;
+            InstanceIdentifier='SYNTHETIC-PRIVATE'}
+    }
+    $report = Get-AegisDeviceGuardReport $good
+    foreach ($expected in @('VBS : Reported running','Credential Guard configured : Reported present',
+        'Credential Guard running : Reported absent','Memory integrity configured : Reported present',
+        'Memory integrity running : Reported present','Kernel code integrity policy : Reported enforced',
+        'User-mode code integrity policy : Reported audit')) {
+        if (-not $report.Contains($expected)) { throw 'Device Guard expected state missing' }
+    }
+    if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'Device identifier disclosed' }
+    foreach ($provider in @({ throw 'SYNTHETIC-PRIVATE' }, {}, { & $good; & $good })) {
+        $report = Get-AegisDeviceGuardReport $provider
+        if (@($report.Split([char]10) | Where-Object { $_ -match ' : Unknown' }).Count -ne 7 -or
+            $report.Contains('SYNTHETIC-PRIVATE')) { throw 'Device Guard provider failure mishandled' }
+    }
+    foreach ($bad in @(@{v=@(0,2)},@{v=@(2,2)},@{v=@(2,99)},@{v=@('2')},@{v=2},@{v=@()},@{v=@($true)})) {
+        $record = [pscustomobject]@{SecurityServicesRunning=$bad.v}
+        if ((Get-AegisDgService $record 'SecurityServicesRunning' 2) -cne 'Unknown') { throw 'Invalid service array accepted' }
+    }
+    $record = [pscustomobject]@{SecurityServicesRunning=[uint32[]]@(0)}
+    if ((Get-AegisDgService $record 'SecurityServicesRunning' 2) -cne 'Reported absent') { throw 'Explicit zero not recognized' }
+    foreach ($bad in @('2',$true,2.0,-1,3)) {
+        $record = [pscustomobject]@{VirtualizationBasedSecurityStatus=$bad}
+        if ((Get-AegisDgScalar $record 'VirtualizationBasedSecurityStatus' @('a','b','c')) -cne 'Unknown') { throw 'Invalid scalar accepted' }
+    }
+    $report = Get-AegisDeviceGuardReport {
+        [pscustomobject]@{VirtualizationBasedSecurityStatus=0;SecurityServicesRunning=[uint32[]]@(2)}
+    }
+    if (-not $report.Contains('Conflicting VBS') -or -not $report.Contains('Memory integrity running : Unknown') -or
+        -not $report.Contains('VBS : Unknown')) { throw 'Contradictory readings accepted' }
+    Write-Output 'PASS: Device Guard synthetic fixtures (no native provider invoked)'
+}
+
 # DNS configuration only: no resolution, probes, remote CIM, or changes.
 # Counts are per provider row/address occurrence, not unique interfaces or servers.
 function Get-AegisDnsReport([scriptblock]$ReadDns) {
@@ -579,6 +676,7 @@ if ($SelfTest) {
         if (Test-AegisCommand $command) { throw 'Unexpected command accepted' }
     }
     Test-AegisNativeReport
+    Test-AegisDeviceGuardReport
     Test-AegisIntegrity
     Test-AegisDnsReport
     Test-AegisVpnReport
@@ -657,6 +755,9 @@ $native.Add_Click({
         } {
             NetSecurity\Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop -WarningAction SilentlyContinue
         }
+        $output.Text += [Environment]::NewLine + [Environment]::NewLine + (Get-AegisDeviceGuardReport {
+            CimCmdlets\Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -Property VirtualizationBasedSecurityStatus,SecurityServicesConfigured,SecurityServicesRunning,CodeIntegrityPolicyEnforcementStatus,UsermodeCodeIntegrityPolicyEnforcementStatus -OperationTimeoutSec 5 -ErrorAction Stop -WarningAction SilentlyContinue
+        })
     } catch { $output.Text = 'Native diagnostic unavailable; no changes made.' }
 })
 $form.Controls.Add($native)
