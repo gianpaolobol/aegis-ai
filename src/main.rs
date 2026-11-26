@@ -94,6 +94,19 @@ fn run(args: &[OsString]) -> (i32, String) {
             }
             _ => return (1, "Synthetic workload identity assessment unavailable.\n".into()),
         }
+        use aegis_policy::nhi::{assess_rotation, Rotation, RotationReview};
+        let rotation = Rotation { workload: 1, previous: 2, successor: 3, issued: 80,
+            successor_check: Some(85), previous_revocation: Some(90), observed: 95,
+            reviewed_fixture: true, successor_scoped: Reported::Yes, previous_revoked: Revocation::Revoked };
+        report.push_str("Synthetic rotation evidence; no credential rotation or revocation performed.\n");
+        for (label, observed, expected) in [
+            ("rotation handoff", assess_rotation(rotation,100,10,10), RotationReview::FixtureReviewOnly),
+            ("rotation without continuity", assess_rotation(Rotation { successor_check: None, ..rotation },100,10,10), RotationReview::ContinuityUnknown),
+            ("rotation overlap", assess_rotation(Rotation { previous_revocation: None, ..rotation },100,10,10), RotationReview::OverlapExceeded),
+        ] {
+            report.push_str(&format!("{label}: {observed:?}\n"));
+            if observed != expected { return (1, report); }
+        }
         return (0, report);
     }
     if arg == OsStr::new("demo-wifi") {

@@ -125,3 +125,88 @@ mod tests {
         assert_eq!(assess(&[],100,Limits {max_lifetime:0,..LIMITS}), Err(Error::InvalidConfiguration));
     }
 }
+
+
+/// Offline rotation evidence: fixture identifiers only, no credentials or actions.
+/// The timestamps describe a synthetic handoff, not verified authentication.
+#[derive(Clone, Copy, Debug)]
+pub struct Rotation {
+    pub workload: u32,
+    pub previous: u32,
+    pub successor: u32,
+    pub issued: u64,
+    pub successor_check: Option<u64>,
+    pub previous_revocation: Option<u64>,
+    pub observed: u64,
+    pub reviewed_fixture: bool,
+    pub successor_scoped: Reported,
+    pub previous_revoked: Revocation,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RotationReview {
+    InvalidPlan, Unverified, Stale, InvalidTimeline, ScopeReview,
+    ContinuityUnknown, RevocationReview, OverlapExceeded, FixtureReviewOnly,
+}
+
+/// Never recommends automatic revocation. A successful synthetic handoff is
+/// review evidence only. All time arithmetic follows explicit ordering checks.
+pub fn assess_rotation(r: Rotation, now: u64, max_age: u64, max_overlap: u64)
+    -> RotationReview
+{
+    use RotationReview::*;
+    if r.workload == 0 || r.previous == 0 || r.successor == 0 ||
+        r.previous == r.successor || max_age == 0 || max_overlap == 0 {
+        return InvalidPlan;
+    }
+    if !r.reviewed_fixture { return Unverified; }
+    if r.issued > r.observed || r.observed > now { return InvalidTimeline; }
+    if now - r.observed > max_age { return Stale; }
+    if r.successor_scoped != Reported::Yes { return ScopeReview; }
+    let Some(check) = r.successor_check else { return ContinuityUnknown; };
+    if check < r.issued || check > r.observed { return InvalidTimeline; }
+    if let Some(revoked) = r.previous_revocation {
+        if revoked < check || revoked > r.observed { return InvalidTimeline; }
+        if revoked - r.issued > max_overlap { return OverlapExceeded; }
+        if r.previous_revoked != Revocation::Revoked { return RevocationReview; }
+    } else {
+        if now - r.issued > max_overlap { return OverlapExceeded; }
+        return RevocationReview;
+    }
+    FixtureReviewOnly
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+    const R: Rotation = Rotation { workload: 1, previous: 2, successor: 3,
+        issued: 80, successor_check: Some(85), previous_revocation: Some(90),
+        observed: 95, reviewed_fixture: true, successor_scoped: Reported::Yes,
+        previous_revoked: Revocation::Revoked };
+    fn check(r: Rotation) -> RotationReview { assess_rotation(r, 100, 10, 10) }
+    #[test] fn exact_overlap_boundary_is_review_only() {
+        assert_eq!(check(R), RotationReview::FixtureReviewOnly);
+        assert_eq!(check(Rotation { previous_revocation: Some(91), ..R }), RotationReview::OverlapExceeded);
+    }
+    #[test] fn missing_continuity_or_revocation_never_passes() {
+        assert_eq!(check(Rotation { successor_check: None, ..R }), RotationReview::ContinuityUnknown);
+        assert_eq!(check(Rotation { previous_revoked: Revocation::Unknown, ..R }), RotationReview::RevocationReview);
+        assert_eq!(check(Rotation { previous_revocation: None, ..R }), RotationReview::OverlapExceeded);
+        assert_eq!(assess_rotation(Rotation { previous_revocation: None, ..R }, 100, 10, 20), RotationReview::RevocationReview);
+    }
+    #[test] fn invalid_time_order_is_rejected() {
+        for r in [Rotation { issued: 96, ..R }, Rotation { observed: 101, ..R },
+            Rotation { successor_check: Some(79), ..R },
+            Rotation { previous_revocation: Some(84), ..R },
+            Rotation { previous_revocation: Some(96), ..R }] {
+            assert_eq!(check(r), RotationReview::InvalidTimeline);
+        }
+        assert_eq!(check(Rotation { observed: 89, ..R }), RotationReview::Stale);
+    }
+    #[test] fn scope_identity_and_provenance_required() {
+        assert_eq!(check(Rotation { successor: 2, ..R }), RotationReview::InvalidPlan);
+        assert_eq!(check(Rotation { workload: 0, ..R }), RotationReview::InvalidPlan);
+        assert_eq!(check(Rotation { reviewed_fixture: false, ..R }), RotationReview::Unverified);
+        assert_eq!(check(Rotation { successor_scoped: Reported::Unknown, ..R }), RotationReview::ScopeReview);
+        assert_eq!(assess_rotation(R, 100, 0, 10), RotationReview::InvalidPlan);
+    }
+}

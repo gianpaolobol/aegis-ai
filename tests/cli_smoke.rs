@@ -54,7 +54,11 @@ fn synthetic_demos_have_expected_results() {
                      "revocation: Revoked", "revocation remains latched: Revoked",
                      "Workload fixture: criteria reported, not verified",
                      "Revoked fixture: Revoked, Expired",
-                     "Unknown scope: ScopeReview, RevocationUnknown"] {
+                     "Unknown scope: ScopeReview, RevocationUnknown",
+                     "no credential rotation or revocation performed",
+                     "rotation handoff: FixtureReviewOnly",
+                     "rotation without continuity: ContinuityUnknown",
+                     "rotation overlap: OverlapExceeded"] {
         assert!(stdout(&policy).contains(expected));
     }
     assert!(policy.stderr.is_empty());
