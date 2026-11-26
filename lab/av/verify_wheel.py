@@ -24,6 +24,48 @@ MAX_RECORD = 256 * 1024
 PREFIX = "yara_x-1.24.0.dist-info/"
 
 
+
+def valid_windows_members(items):
+    """Conservative Windows wheel namespace profile; never extracts files."""
+    seen = {}
+    explicit = set()
+    for item in items:
+        name = item.filename
+        if item.orig_filename != name or not name or len(name) > 1024:
+            return False
+        is_dir = item.is_dir()
+        parts = (name[:-1] if is_dir else name).split("/")
+        if len(parts) > 32:
+            return False
+        mode = stat.S_IFMT(item.external_attr >> 16)
+        if mode not in (0, stat.S_IFREG, stat.S_IFDIR):
+            return False
+        if (mode == stat.S_IFDIR and not is_dir) or (mode == stat.S_IFREG and is_dir):
+            return False
+        for part in parts:
+            # Narrow ASCII profile for this exact candidate; no short-name aliases.
+            if (not re.fullmatch(r"[A-Za-z0-9_.+ -]{1,255}", part)
+                    or part.startswith(" ") or part.endswith((" ", "."))
+                    or part in (".", "..")):
+                return False
+            stem = part.split(".", 1)[0].rstrip(" ").upper()
+            if (stem in ("CON", "PRN", "AUX", "NUL")
+                    or re.fullmatch(r"(?:COM|LPT)[0-9]", stem)):
+                return False
+        for depth in range(1, len(parts) + 1):
+            spelling = "/".join(parts[:depth])
+            key = spelling.lower()
+            directory = depth < len(parts) or is_dir
+            previous = seen.get(key)
+            if previous is not None and previous != (spelling, directory):
+                return False
+            seen[key] = (spelling, directory)
+        if key in explicit:
+            return False
+        explicit.add(key)
+    return True
+
+
 def verify_record(z, items):
     """Strict candidate profile: SHA-256 only, no legacy detached signatures."""
     files = {i.filename: i for i in items if not i.is_dir()}
@@ -79,15 +121,8 @@ def inspect_bytes(data, expected):
             items = z.infolist()
             if len(items) > 2048:
                 return "InvalidArchive"
-            names = [i.filename for i in items]
-            if len(names) != len(set(n.casefold() for n in names)):
+            if not valid_windows_members(items):
                 return "InvalidArchive"
-            for item in items:
-                name = item.filename
-                if (not name or name.startswith("/") or chr(92) in name or
-                    ":" in name or any(p in ("", ".", "..") for p in name.rstrip("/").split("/")) or
-                    stat.S_ISLNK(item.external_attr >> 16)):
-                    return "InvalidArchive"
             def metadata(name):
                 item = z.getinfo(PREFIX + name)
                 if item.file_size > MAX_METADATA:
@@ -189,6 +224,40 @@ class Fixtures(unittest.TestCase):
         for n in ("../example", "/example", "C:/example", "a/../b",
                   PREFIX+"metadata"):
             self.assertEqual(self.check(self.wheel(member=n)), "InvalidArchive")
+
+    def test_windows_namespace(self):
+        for name in ("CON", "nested/AUX.txt", "com1.log", "LPT9",
+                     "COM\u00b9.txt", "a/NUL .txt", "x.", " x", "x ",
+                     "dir./child", "dir /child", "x~1.txt", "a//b",
+                     "bad?.txt", "bad\tname", "caf\u00e9.txt"):
+            with self.subTest(name=name):
+                self.assertEqual(self.check(self.wheel(member=name)), "InvalidArchive")
+
+    def test_windows_hierarchy(self):
+        def member(name):
+            return zipfile.ZipInfo(name)
+        for names in (("a", "a/b"), ("a/b", "a"), ("A/b", "a/c"),
+                      ("a/", "a"), ("a", "A"), ("a/", "a/")):
+            with self.subTest(names=names):
+                self.assertFalse(valid_windows_members([member(n) for n in names]))
+        for names in (("a/", "a/b", "a/c"), ("a/b", "a/"),
+                      ("a/b", "a/c"), ("x-1.0.dist-info/METADATA",)):
+            self.assertTrue(valid_windows_members([member(n) for n in names]))
+
+    def test_windows_special_members(self):
+        for mode in (stat.S_IFLNK, stat.S_IFIFO, stat.S_IFSOCK, stat.S_IFCHR):
+            item = zipfile.ZipInfo("synthetic")
+            item.external_attr = mode << 16
+            self.assertFalse(valid_windows_members([item]))
+        item = zipfile.ZipInfo("synthetic")
+        item.external_attr = stat.S_IFDIR << 16
+        self.assertFalse(valid_windows_members([item]))
+        item = zipfile.ZipInfo("synthetic/")
+        item.external_attr = stat.S_IFREG << 16
+        self.assertFalse(valid_windows_members([item]))
+        item = zipfile.ZipInfo("synthetic\x00alias")
+        self.assertFalse(valid_windows_members([item]))
+
     def test_invalid_archive_and_size(self):
         self.assertEqual(self.check(b"not zip"), "InvalidArchive")
         self.assertEqual(inspect_bytes(b"x"*(MAX_WHEEL+1), ""), "InvalidSize")
