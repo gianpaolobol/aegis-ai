@@ -1,11 +1,8 @@
 # Copyright 2026 Gian Paolo Franceschini. See LICENSE.
-# One scoped public-source evidence acquisition; retire push trigger after result.
+# Explicitly dispatched public-source evidence acquisition; not a fixture test.
 name: AV candidate acquisition (no execution)
 on:
   workflow_dispatch:
-  push:
-    branches: ['dev/ade-bootstrap-002']
-    paths: ['.github/workflows/av-candidate-acquisition.yml']
 permissions:
   contents: read
 jobs:
