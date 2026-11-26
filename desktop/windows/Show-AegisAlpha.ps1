@@ -30,7 +30,7 @@ function Get-AegisDefenderMode($Record) {
     if ($null -eq $Record) { return 'Unknown' }
     $property = $Record.PSObject.Properties['AMRunningMode']
     if ($null -eq $property -or $property.Value -isnot [string]) { return 'Unknown' }
-    switch -Exact ($property.Value) {
+    switch -CaseSensitive -Exact ($property.Value) {
         'Normal' { return 'Reported active mode' }
         'Passive' { return 'Reported passive mode' }
         'Passive Mode' { return 'Reported passive mode' }
@@ -38,6 +38,17 @@ function Get-AegisDefenderMode($Record) {
         'SxS Passive Mode' { return 'Reported side-by-side passive mode' }
         default { return 'Unknown' }
     }
+}
+# Provider ages are whole days, not timestamps or proof of successful scanning.
+# 65535 and UINT32_MAX are sentinel/unavailable values in Microsoft examples.
+function Get-AegisDefenderAge($Record,[string]$Name) {
+    if ($null -eq $Record) { return 'Unknown' }
+    $property = $Record.PSObject.Properties[$Name]
+    if ($null -eq $property) { return 'Unknown' }
+    $value = $property.Value
+    if ($value -isnot [uint32] -and $value -isnot [int32]) { return 'Unknown' }
+    if ($value -lt 0 -or $value -ge 65535) { return 'Unknown' }
+    return ('Reported ' + $value.ToString([Globalization.CultureInfo]::InvariantCulture) + ' day(s)')
 }
 # Only known scalar actions; never interpret numeric values or arrays.
 function Convert-AegisFirewallAction($Record,[string]$Name) {
@@ -60,12 +71,30 @@ function Get-AegisNativeReport([scriptblock]$ReadDefender, [scriptblock]$ReadFir
         $records = @(& $ReadDefender | Select-Object -First 2)
         if ($records.Count -eq 1) { $defender = $records[0] }
     } catch { $defender = $null }
-    foreach ($key in @('AntivirusEnabled','RealTimeProtectionEnabled','AMServiceEnabled','IsTamperProtected','BehaviorMonitorEnabled','IoavProtectionEnabled')) {
+    foreach ($key in @('AntivirusEnabled','RealTimeProtectionEnabled','AMServiceEnabled','IsTamperProtected','BehaviorMonitorEnabled','IoavProtectionEnabled','OnAccessProtectionEnabled','NISEnabled')) {
         $state = Get-AegisDefenderFlag $defender $key 'Enabled' 'Disabled'
         $lines += "Defender $key : $state"
     }
     $freshnessState = Get-AegisDefenderFlag $defender 'DefenderSignaturesOutOfDate' 'ReportedOutOfDate' 'NotReportedOutOfDate'
     $lines += "Defender signature freshness : $freshnessState"
+    foreach ($entry in @(
+        @{Name='AntivirusSignatureAge';Label='signature age'},
+        @{Name='QuickScanAge';Label='quick scan age'},
+        @{Name='FullScanAge';Label='full scan age'}
+    )) {
+        $age = Get-AegisDefenderAge $defender $entry.Name
+        $lines += "Defender $($entry.Label) : $age"
+    }
+    foreach ($entry in @(
+        @{Name='QuickScanOverdue';Label='quick scan overdue'},
+        @{Name='FullScanOverdue';Label='full scan overdue'},
+        @{Name='FullScanRequired';Label='full scan required'},
+        @{Name='RebootRequired';Label='reboot required'}
+    )) {
+        $state = Get-AegisDefenderFlag $defender $entry.Name 'ReportedYes' 'NotReportedYes'
+        $lines += "Defender $($entry.Label) : $state"
+    }
+    $lines += 'Ages and maintenance flags are provider observations only; no scan, update, restart or health verdict is performed. Sentinel ages remain Unknown.'
     $mode = Get-AegisDefenderMode $defender
     $lines += "Defender operating mode : $mode"
     $lines += 'Mode is provider-reported; passive modes do not establish primary antivirus protection. EDR block mode alone does not identify the primary antivirus.'
@@ -100,21 +129,21 @@ function Get-AegisNativeReport([scriptblock]$ReadDefender, [scriptblock]$ReadFir
     return ($lines -join [Environment]::NewLine)
 }
 function Test-AegisNativeReport {
-    $good = { [pscustomobject]@{AntivirusEnabled=$true;RealTimeProtectionEnabled=$false;AMServiceEnabled=$true;BehaviorMonitorEnabled=$true;IoavProtectionEnabled=$false;DefenderSignaturesOutOfDate=$true; AMRunningMode='Normal'; ComputerID='SYNTHETIC-PRIVATE'} }
+    $good = { [pscustomobject]@{AntivirusEnabled=$true;RealTimeProtectionEnabled=$false;AMServiceEnabled=$true;BehaviorMonitorEnabled=$true;IoavProtectionEnabled=$false;DefenderSignaturesOutOfDate=$true; AMRunningMode='Normal'; OnAccessProtectionEnabled=$true; NISEnabled=$false; AntivirusSignatureAge=[uint32]3; QuickScanAge=[uint32]0; FullScanAge=[uint32]::MaxValue; QuickScanOverdue=$true; FullScanOverdue=$false; FullScanRequired=$false; RebootRequired=$true; ComputerID='SYNTHETIC-PRIVATE'} }
     $firewall = {
         [pscustomobject]@{Name='Domain';Enabled='True';DefaultInboundAction='Block';DefaultOutboundAction='Allow'}
         [pscustomobject]@{Name='Private';Enabled='NotConfigured';DefaultInboundAction='NotConfigured';DefaultOutboundAction=1}
         [pscustomobject]@{Name='Public';Enabled='False';DefaultInboundAction='Allow';DefaultOutboundAction='Block';LogFileName='SYNTHETIC-PRIVATE'}
     }
     $report = Get-AegisNativeReport $good $firewall
-    foreach ($expected in @('Defender AntivirusEnabled : Enabled','Defender RealTimeProtectionEnabled : Disabled','Defender IsTamperProtected : Unknown','Defender BehaviorMonitorEnabled : Enabled','Defender IoavProtectionEnabled : Disabled','Defender signature freshness : ReportedOutOfDate','Defender operating mode : Reported active mode','Firewall Domain : Enabled','Firewall Private : Unknown','Firewall Public : Disabled','Firewall Domain default inbound : Block','Firewall Domain default outbound : Allow','Firewall Private default inbound : Unknown','Firewall Private default outbound : Unknown','Firewall Public default inbound : Allow','Firewall Public default outbound : Block')) {
+    foreach ($expected in @('Defender AntivirusEnabled : Enabled','Defender RealTimeProtectionEnabled : Disabled','Defender IsTamperProtected : Unknown','Defender BehaviorMonitorEnabled : Enabled','Defender IoavProtectionEnabled : Disabled','Defender signature freshness : ReportedOutOfDate','Defender operating mode : Reported active mode','Defender OnAccessProtectionEnabled : Enabled','Defender NISEnabled : Disabled','Defender signature age : Reported 3 day(s)','Defender quick scan age : Reported 0 day(s)','Defender full scan age : Unknown','Defender quick scan overdue : ReportedYes','Defender full scan overdue : NotReportedYes','Defender full scan required : NotReportedYes','Defender reboot required : ReportedYes','Firewall Domain : Enabled','Firewall Private : Unknown','Firewall Public : Disabled','Firewall Domain default inbound : Block','Firewall Domain default outbound : Allow','Firewall Private default inbound : Unknown','Firewall Private default outbound : Unknown','Firewall Public default inbound : Allow','Firewall Public default outbound : Block')) {
         if (-not $report.Contains($expected)) { throw "Unexpected diagnostic fixture result: $expected" }
     }
     if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'Unexpected private field disclosure' }
     $report = Get-AegisNativeReport { throw 'SYNTHETIC-PRIVATE' } { throw 'SYNTHETIC-PRIVATE' }
-    if (($report.Split([char]10) | Where-Object { $_ -match ' : Unknown' }).Count -ne 17 -or $report.Contains('SYNTHETIC-PRIVATE')) { throw 'Provider failure not safely represented' }
+    if (($report.Split([char]10) | Where-Object { $_ -match ' : Unknown' }).Count -ne 26 -or $report.Contains('SYNTHETIC-PRIVATE')) { throw 'Provider failure not safely represented' }
     $report = Get-AegisNativeReport { & $good; & $good } { & $firewall; & $firewall }
-    if (($report.Split([char]10) | Where-Object { $_ -match ' : Unknown' }).Count -ne 17) { throw 'Duplicate provider records accepted' }
+    if (($report.Split([char]10) | Where-Object { $_ -match ' : Unknown' }).Count -ne 26) { throw 'Duplicate provider records accepted' }
     if ((Convert-AegisState 'false') -ne 'Unknown' -or (Convert-AegisState 1) -ne 'Unknown') { throw 'Ambiguous state accepted' }
     $report = Get-AegisNativeReport { [pscustomobject]@{DefenderSignaturesOutOfDate=$false} } {}
     if (-not $report.Contains('Defender signature freshness : NotReportedOutOfDate')) { throw 'Signature flag inversion' }
@@ -143,6 +172,7 @@ function Test-AegisNativeReport {
         @{Value='SxS Passive Mode'; Expected='Reported side-by-side passive mode'},
         @{Value=@('Normal'); Expected='Unknown'},
         @{Value=' Normal'; Expected='Unknown'},
+        @{Value='normal'; Expected='Unknown'},
         @{Value=1; Expected='Unknown'},
         @{Value=$null; Expected='Unknown'},
         @{Value='SYNTHETIC-PRIVATE'; Expected='Unknown'}
@@ -160,6 +190,38 @@ function Test-AegisNativeReport {
     }
     $report = Get-AegisNativeReport { [pscustomobject]@{AMRunningMode='SYNTHETIC-PRIVATE'} } {}
     if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'Raw Defender mode disclosed' }
+    foreach ($case in @(
+        @{Value=[uint32]0;Expected='Reported 0 day(s)'},
+        @{Value=[int32]7;Expected='Reported 7 day(s)'},
+        @{Value=[uint32]65535;Expected='Unknown'},
+        @{Value=[uint32]::MaxValue;Expected='Unknown'},
+        @{Value=[uint32]65536;Expected='Unknown'},
+        @{Value=-1;Expected='Unknown'},
+        @{Value=1.5;Expected='Unknown'},
+        @{Value=$true;Expected='Unknown'},
+        @{Value='3';Expected='Unknown'},
+        @{Value=@([uint32]3);Expected='Unknown'},
+        @{Value=$null;Expected='Unknown'},
+        @{Value='SYNTHETIC-PRIVATE';Expected='Unknown'}
+    )) {
+        $record = [pscustomobject]@{AntivirusSignatureAge=$case.Value}
+        if ((Get-AegisDefenderAge $record 'AntivirusSignatureAge') -cne $case.Expected) {
+            throw 'Unexpected Defender age fixture'
+        }
+    }
+    $report = Get-AegisNativeReport {
+        [pscustomobject]@{AntivirusSignatureAge='SYNTHETIC-PRIVATE';QuickScanAge=@([uint32]0);
+            FullScanAge=[uint32]65535;QuickScanOverdue=@($true);FullScanOverdue='False';
+            FullScanRequired=0;RebootRequired='SYNTHETIC-PRIVATE';OnAccessProtectionEnabled=@($true);NISEnabled='True'}
+    } {}
+    foreach ($expected in @('Defender signature age : Unknown','Defender quick scan age : Unknown',
+        'Defender full scan age : Unknown','Defender quick scan overdue : Unknown',
+        'Defender full scan overdue : Unknown','Defender full scan required : Unknown',
+        'Defender reboot required : Unknown','Defender OnAccessProtectionEnabled : Unknown',
+        'Defender NISEnabled : Unknown')) {
+        if (-not $report.Contains($expected)) { throw 'Malformed Defender maintenance metadata accepted' }
+    }
+    if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'Raw Defender maintenance value disclosed' }
     Write-Output 'PASS: native diagnostic synthetic fixtures'
 }
 
