@@ -1,15 +1,13 @@
 # Copyright 2026 Gian Paolo Franceschini. See LICENSE.
-# Temporary public-source acquisition job; not an offline fixture test.
+# Explicitly dispatched public-source acquisition job; not an offline fixture test.
 name: AV candidate acquisition (no execution)
 on:
-  pull_request:
-    paths:
-      - '.github/workflows/av-candidate-acquisition.yml'
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
   acquire:
-    if: github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'dev/ade-bootstrap-002'
+    if: github.repository == 'gianpaolobol/aegis-ai' && github.ref == 'refs/heads/dev/ade-bootstrap-002'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
