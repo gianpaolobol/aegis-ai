@@ -3,6 +3,9 @@
 name: AV candidate acquisition (no execution)
 on:
   workflow_dispatch:
+  push:
+    branches: ['dev/ade-bootstrap-002']
+    paths: ['.github/workflows/av-candidate-acquisition.yml']
 permissions:
   contents: read
 jobs:
@@ -26,6 +29,8 @@ jobs:
           curl --disable --proto '=https' --connect-timeout 10 --max-time 60 --max-filesize 16777216 --fail --silent --show-error --output "$candidate" 'https://files.pythonhosted.org/packages/8c/52/6381a0e38246dfd81965b5f24c34dcd20bf7bb73dc5795183cf746a8c305/yara_x-1.24.0-cp39-abi3-win_amd64.whl'
           python -I lab/av/verify_wheel.py --inspect "$candidate"
           python -I lab/av/verify_wheel.py --inventory "$candidate"
+          python -I lab/av/verify_wheel.py --self-test
+          python -I lab/av/verify_wheel.py --sbom-summary "$candidate"
           echo 'Acquired and inventoried only; no execution, independent attestation or licensing approval.'
           rm -rf -- "$tmp"
           test ! -e "$tmp"
