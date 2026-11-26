@@ -49,6 +49,7 @@ pub fn assess(copies: &[CopyFixture], now: u64, max_restore_age: u64) -> Result<
     let mut domains = BTreeSet::new();
     let mut media = BTreeSet::new();
     let mut originals = 0;
+    let mut original = None;
     let mut offsite = false;
     let mut isolated = false;
     let mut recent = false;
@@ -66,6 +67,7 @@ pub fn assess(copies: &[CopyFixture], now: u64, max_restore_age: u64) -> Result<
         if c.medium != Medium::Unknown { media.insert(c.medium); }
         if c.kind == Kind::Original {
             originals += 1;
+            original = Some(c);
             // Restore evidence is only meaningful on the backup tested.
             if c.restore_verified_at.is_some() { return Err(Error::InvalidInventory); }
             continue;
@@ -82,13 +84,77 @@ pub fn assess(copies: &[CopyFixture], now: u64, max_restore_age: u64) -> Result<
     if originals != 1 { return Err(Error::InvalidInventory); }
     encrypted &= backups > 0;
     separate &= backups > 0;
-    let verdict = if copies.len() >= 3 && domains.len() >= 3 && media.len() >= 2 &&
-        offsite && isolated && encrypted && separate && recent {
+    // A single coherent 3-2-1 witness, not unrelated aggregate counters.
+    // The original and two known-medium backups must have distinct failure
+    // domains, and the offsite and recently restored isolated copy must be
+    // part of that same witness. Extra backups still need security evidence.
+    let original = original.ok_or(Error::InvalidInventory)?;
+    let witness = original.medium != Medium::Unknown && copies.iter().any(|a|
+        a.kind == Kind::Backup && a.medium != Medium::Unknown &&
+        a.failure_domain != original.failure_domain && copies.iter().any(|b|
+            b.kind == Kind::Backup && b.medium != Medium::Unknown &&
+            b.failure_domain != original.failure_domain &&
+            b.failure_domain != a.failure_domain &&
+            (a.medium != original.medium || b.medium != original.medium) &&
+            (a.offsite == Evidence::ReportedYes || b.offsite == Evidence::ReportedYes) &&
+            [a,b].iter().any(|c| c.offline_or_immutable == Evidence::ReportedYes &&
+                c.restore_verified_at.is_some_and(|at| now - at <= max_restore_age))));
+    let verdict = if witness && encrypted && separate {
         Verdict::FixtureCriteriaReported
     } else { Verdict::ReviewRequired };
     Ok(Report { copies: copies.len(), failure_domains: domains.len(), known_media: media.len(),
         offsite_backup: offsite, isolated_backup: isolated, all_backups_encrypted: encrypted,
         all_backups_separate_credentials: separate, recent_isolated_restore: recent, verdict })
+}
+/// Synthetic restore objectives are expressed in seconds and bound to one
+/// planned dataset, backup copy and exercise. The caller supplies fixture
+/// evidence; nothing here authenticates it or performs a restoration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestorePlan {
+    pub dataset: u16,
+    pub copy: u16,
+    pub exercise: u64,
+    pub incident_at: u64,
+    pub max_data_loss: u64,
+    pub max_downtime: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestoreReceipt {
+    pub dataset: u16,
+    pub copy: u16,
+    pub exercise: u64,
+    pub recovery_point: u64,
+    pub completed_at: u64,
+    pub integrity: Evidence,
+    pub functional_check: Evidence,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectiveVerdict { InvalidPlan, MissingOrMismatchedEvidence, InvalidTimeline,
+    VerificationRequired, ObjectivesMissed, FixtureObjectivesReported }
+pub fn assess_objectives(plan: RestorePlan, receipt: Option<RestoreReceipt>,
+    now: u64) -> ObjectiveVerdict {
+    use ObjectiveVerdict::*;
+    if plan.dataset == 0 || plan.copy == 0 || plan.exercise == 0 ||
+        plan.incident_at == 0 || plan.incident_at > now ||
+        plan.max_downtime == 0 {
+        return InvalidPlan;
+    }
+    let Some(r) = receipt else { return MissingOrMismatchedEvidence; };
+    if (r.dataset, r.copy, r.exercise) != (plan.dataset, plan.copy, plan.exercise) {
+        return MissingOrMismatchedEvidence;
+    }
+    if r.recovery_point == 0 || r.recovery_point > plan.incident_at ||
+        r.completed_at < plan.incident_at || r.completed_at > now {
+        return InvalidTimeline;
+    }
+    if r.integrity != Evidence::ReportedYes || r.functional_check != Evidence::ReportedYes {
+        return VerificationRequired;
+    }
+    if plan.incident_at - r.recovery_point > plan.max_data_loss ||
+        r.completed_at - plan.incident_at > plan.max_downtime {
+        return ObjectivesMissed;
+    }
+    FixtureObjectivesReported
 }
 /// Fixed harmless scenario for CLI and regression tests.
 pub fn example() -> [CopyFixture; 3] {
@@ -154,6 +220,68 @@ mod tests {
         assert_eq!(run(&c).unwrap().verdict,Verdict::FixtureCriteriaReported);
         c[2].restore_verified_at = None;
         assert!(!run(&c).unwrap().recent_isolated_restore);
+    }
+    #[test] fn unrelated_offsite_or_isolated_copy_cannot_complete_witness() {
+        let mut c = example().to_vec();
+        // The sole offsite / isolated restore shares the original failure domain.
+        c[2].failure_domain = 1;
+        c.push(CopyFixture { id: 4, failure_domain: 3, medium: Medium::Tape,
+            ..c[1] });
+        let r = run(&c).unwrap();
+        assert_eq!((r.failure_domains, r.known_media), (3, 2));
+        assert!(r.offsite_backup && r.recent_isolated_restore);
+        assert_eq!(r.verdict, Verdict::ReviewRequired);
+        c[2].failure_domain = 3;
+        assert_eq!(run(&c).unwrap().verdict, Verdict::FixtureCriteriaReported);
+    }
+    #[test] fn unrelated_medium_cannot_complete_witness() {
+        let mut c = example().to_vec();
+        c[2].medium = Medium::Disk;
+        c.push(CopyFixture { id: 4, failure_domain: 1, medium: Medium::Tape,
+            ..c[1] });
+        assert_eq!(run(&c).unwrap().known_media, 2);
+        assert_eq!(run(&c).unwrap().verdict, Verdict::ReviewRequired);
+    }
+    fn objective_fixture() -> (RestorePlan, RestoreReceipt) {
+        (RestorePlan { dataset: 1, copy: 3, exercise: 7, incident_at: 100,
+            max_data_loss: 10, max_downtime: 20 },
+         RestoreReceipt { dataset: 1, copy: 3, exercise: 7, recovery_point: 90,
+            completed_at: 120, integrity: Evidence::ReportedYes,
+            functional_check: Evidence::ReportedYes })
+    }
+    #[test] fn objective_boundaries_and_missed_objectives() {
+        use ObjectiveVerdict::*;
+        let (p,r) = objective_fixture();
+        assert_eq!(assess_objectives(p,Some(r),120),FixtureObjectivesReported);
+        assert_eq!(assess_objectives(p,Some(RestoreReceipt { recovery_point: 89, ..r }),120),ObjectivesMissed);
+        assert_eq!(assess_objectives(p,Some(RestoreReceipt { completed_at: 121, ..r }),121),ObjectivesMissed);
+        assert_eq!(assess_objectives(RestorePlan { max_data_loss: 0, ..p },
+            Some(RestoreReceipt { recovery_point: 100, ..r }),120),FixtureObjectivesReported);
+    }
+    #[test] fn objectives_require_exact_scope_and_verification() {
+        use ObjectiveVerdict::*;
+        let (p,r) = objective_fixture();
+        assert_eq!(assess_objectives(p,None,120),MissingOrMismatchedEvidence);
+        for wrong in [RestoreReceipt { dataset: 2, ..r }, RestoreReceipt { copy: 4, ..r },
+            RestoreReceipt { exercise: 8, ..r }] {
+            assert_eq!(assess_objectives(p,Some(wrong),120),MissingOrMismatchedEvidence);
+        }
+        for wrong in [RestoreReceipt { integrity: Evidence::Unknown, ..r },
+            RestoreReceipt { functional_check: Evidence::ReportedNo, ..r }] {
+            assert_eq!(assess_objectives(p,Some(wrong),120),VerificationRequired);
+        }
+    }
+    #[test] fn objectives_reject_invalid_timeline_and_plan() {
+        use ObjectiveVerdict::*;
+        let (p,r) = objective_fixture();
+        for wrong in [RestoreReceipt { recovery_point: 0, ..r },
+            RestoreReceipt { recovery_point: 101, ..r },
+            RestoreReceipt { completed_at: 99, ..r },
+            RestoreReceipt { completed_at: 121, ..r }] {
+            assert_eq!(assess_objectives(p,Some(wrong),120),InvalidTimeline);
+        }
+        assert_eq!(assess_objectives(RestorePlan { exercise: 0, ..p },Some(r),120),InvalidPlan);
+        assert_eq!(assess_objectives(p,Some(r),99),InvalidPlan);
     }
     #[test] fn future_and_original_restore_rejected() {
         let mut c = example(); c[2].restore_verified_at = Some(101);

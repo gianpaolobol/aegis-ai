@@ -203,16 +203,28 @@ fn run(args: &[OsString]) -> (i32, String) {
         return (0, report);
     }
     if arg == OsStr::new("demo-recovery") {
-        use aegis_policy::recovery::{assess, example, Verdict};
+        use aegis_policy::recovery::{assess, example, Verdict, assess_objectives,
+            RestorePlan, RestoreReceipt, Evidence, ObjectiveVerdict};
         let mut c = example();
         let complete = assess(&c, 100, 20);
         c[2].restore_verified_at = None;
         let missing = assess(&c, 100, 20);
+        let plan = RestorePlan { dataset: 1, copy: 3, exercise: 7, incident_at: 100,
+            max_data_loss: 10, max_downtime: 20 };
+        let receipt = RestoreReceipt { dataset: 1, copy: 3, exercise: 7, recovery_point: 90,
+            completed_at: 120, integrity: Evidence::ReportedYes,
+            functional_check: Evidence::ReportedYes };
+        let objectives = assess_objectives(plan, Some(receipt), 120);
+        let missed = assess_objectives(plan, Some(RestoreReceipt { completed_at: 121, ..receipt }), 121);
+        if objectives != ObjectiveVerdict::FixtureObjectivesReported ||
+            missed != ObjectiveVerdict::ObjectivesMissed {
+            return (1, "Synthetic recovery objectives unavailable.\n".into());
+        }
         match (complete, missing) {
             (Ok(a), Ok(b)) if a.verdict == Verdict::FixtureCriteriaReported &&
                 b.verdict == Verdict::ReviewRequired => return (0, format!(
-                    "Synthetic recovery readiness; no backup inspection or restore performed.\nCopies: {}\nFailure domains: {}\nKnown media: {}\nComplete fixture: {:?}\nMissing isolated restore: {:?}\nRecovery capability not established.\n",
-                    a.copies, a.failure_domains, a.known_media, a.verdict, b.verdict)),
+                    "Synthetic recovery readiness; no backup inspection or restore performed.\nCopies: {}\nFailure domains: {}\nKnown media: {}\nComplete fixture: {:?}\nMissing isolated restore: {:?}\nRestore objectives: {:?}\nLate restore: {:?}\nRecovery capability not established.\n",
+                    a.copies, a.failure_domains, a.known_media, a.verdict, b.verdict, objectives, missed)),
             _ => return (1, "Synthetic recovery assessment unavailable.\n".into()),
         }
     }
