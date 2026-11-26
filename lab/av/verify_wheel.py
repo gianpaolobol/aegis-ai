@@ -207,16 +207,130 @@ def inventory_bytes(data, expected):
         return None
 
 
+SBOM_MEMBER = PREFIX + "sboms/yara-x-py.cyclonedx.json"
+SBOM_SHA256 = "dac154f8c401cf5f6270c646c2f828a73bc38ed22629c0fc09d75b65ec030e23"
+MAX_SBOM = 1024 * 1024
+MAX_COMPONENTS = 4096
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def reject_constant(_):
+    raise ValueError("non-JSON constant")
+
+
+def sbom_summary(raw, expected):
+    """Bounded top-level component evidence; NOT full CycloneDX validation."""
+    if type(raw) is not bytes or len(raw) > MAX_SBOM:
+        return None
+    if hashlib.sha256(raw).hexdigest() != expected:
+        return None
+    try:
+        obj = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object,
+                         parse_constant=reject_constant)
+        if (not isinstance(obj, dict) or obj.get("bomFormat") != "CycloneDX"
+                or obj.get("specVersion") not in ("1.4", "1.5", "1.6", "1.7")):
+            return None
+        components = obj.get("components")
+        if not isinstance(components, list) or not 1 <= len(components) <= MAX_COMPONENTS:
+            return None
+        refs = set()
+        missing_version = missing_purl = nested = missing_license = 0
+        identifiers = {}
+        def label(value):
+            # Narrow printable ASCII metadata, never interpreted as commands.
+            return (isinstance(value, str) and 0 < len(value) <= 512
+                    and all(32 <= ord(c) <= 126 for c in value)
+                    and bool(value.strip()))
+        for comp in components:
+            if not isinstance(comp, dict) or not label(comp.get("name")):
+                return None
+            ref = comp.get("bom-ref")
+            if ref is not None:
+                if not label(ref) or ref in refs:
+                    return None
+                refs.add(ref)
+            if not label(comp.get("version")):
+                missing_version += 1
+            if not label(comp.get("purl")):
+                missing_purl += 1
+            if comp.get("components"):
+                nested += 1
+            licenses = comp.get("licenses", [])
+            if not isinstance(licenses, list) or len(licenses) > 64:
+                return None
+            declared = set()
+            for entry in licenses:
+                if not isinstance(entry, dict):
+                    return None
+                if ("expression" in entry) == ("license" in entry):
+                    return None
+                if "expression" in entry:
+                    value = entry["expression"]
+                    kind = "expression"
+                else:
+                    license_obj = entry["license"]
+                    if not isinstance(license_obj, dict):
+                        return None
+                    if ("id" in license_obj) == ("name" in license_obj):
+                        return None
+                    kind = "id" if "id" in license_obj else "name"
+                    value = license_obj[kind]
+                if not label(value):
+                    return None
+                declared.add(kind + ":" + value)
+            if not declared:
+                missing_license += 1
+            for item in declared:
+                identifiers[item] = identifiers.get(item, 0) + 1
+                if len(identifiers) > 256:
+                    return None
+        return {"schema": "aegis-sbom-summary-v1", "sbom_sha256": expected,
+                "spec_version": obj["specVersion"], "top_level_components": len(components),
+                "missing_declared_license": missing_license, "missing_version": missing_version,
+                "missing_purl": missing_purl, "components_with_nested_entries": nested,
+                "declared_license_counts": identifiers,
+                "coverage": "top-level-only", "schema_validation": "not-performed",
+                "license_review": "not-performed", "provenance_review": "not-performed",
+                "execution_approved": False}
+    except (ValueError, TypeError, RecursionError):
+        return None
+
+
+def embedded_sbom_summary(data, expected, sbom_expected):
+    if inspect_bytes(data, expected) != "DigestAndMetadataMatch":
+        return None
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            item = z.getinfo(SBOM_MEMBER)
+            if item.file_size > MAX_SBOM:
+                return None
+            with z.open(item) as stream:
+                raw = stream.read(MAX_SBOM + 1)
+            if len(raw) != item.file_size:
+                return None
+        return sbom_summary(raw, sbom_expected)
+    except (KeyError, OSError, ValueError, zipfile.BadZipFile, RuntimeError):
+        return None
+
+
 class Fixtures(unittest.TestCase):
     def wheel(self, name="yara-x", version="1.24.0", tag="cp39-abi3-win_amd64",
-              extra="", member=None, record_mode="valid"):
+              extra="", member=None, record_mode="valid", member_data=b"synthetic"):
         b = io.BytesIO()
         contents = {
             PREFIX + "METADATA": f"Name: {name}\nVersion: {version}\n{extra}\n".encode(),
             PREFIX + "WHEEL": f"Tag: {tag}\n\n".encode(),
         }
         if member:
-            contents[member] = b"synthetic"
+            contents[member] = member_data
         record = PREFIX + "RECORD"
         out = io.StringIO(newline="")
         writer = csv.writer(out)
@@ -347,6 +461,55 @@ class Fixtures(unittest.TestCase):
         self.assertEqual(self.check(self.wheel(extra="Summary: " + "x"*MAX_METADATA)), "InvalidArchive")
 
 
+    def test_sbom_summary_declarations_not_approval(self):
+        obj = {"bomFormat": "CycloneDX", "specVersion": "1.6", "components": [
+            {"name": "fixture-a", "version": "1", "purl": "pkg:cargo/fixture-a@1",
+             "bom-ref": "a", "licenses": [{"license": {"id": "MIT"}},
+                                          {"license": {"id": "MIT"}}]},
+            {"name": "fixture-b", "licenses": [{"expression": "MIT OR Apache-2.0"}]},
+            {"name": "fixture-c", "components": [{"name": "nested"}]}]}
+        raw = json.dumps(obj).encode()
+        report = sbom_summary(raw, hashlib.sha256(raw).hexdigest())
+        self.assertEqual(report["top_level_components"], 3)
+        self.assertEqual(report["missing_declared_license"], 1)
+        self.assertEqual(report["missing_version"], 2)
+        self.assertEqual(report["missing_purl"], 2)
+        self.assertEqual(report["components_with_nested_entries"], 1)
+        self.assertEqual(report["declared_license_counts"], {"id:MIT": 1,
+                                                             "expression:MIT OR Apache-2.0": 1})
+        self.assertFalse(report["execution_approved"])
+        self.assertEqual(report["schema_validation"], "not-performed")
+    def test_sbom_rejects_malformed(self):
+        for raw in (b'{"bomFormat":"CycloneDX","bomFormat":"other"}',
+                    b'{"bomFormat":"CycloneDX","specVersion":"9","components":[]}',
+                    b'{"bomFormat":"CycloneDX","specVersion":"1.6","components":[NaN]}',
+                    b'{"bomFormat":"CycloneDX","specVersion":"1.6","components":[{"name":"a","bom-ref":"x"},{"name":"b","bom-ref":"x"}]}',
+                    b'{"bomFormat":"CycloneDX","specVersion":"1.6","components":[{"name":"a","licenses":[{"license":{"id":"MIT","name":"other"}}]}]}',
+                    b'{"bomFormat":"CycloneDX","specVersion":"1.6","components":[{"name":"a","licenses":[{"expression":"MIT","license":{"id":"MIT"}}]}]}',
+                    b'{"bomFormat":"CycloneDX","specVersion":"1.6","components":[{"name":"a","licenses":[{"expression":" " }]}]}',
+                    b'\xff', b'[' * 2000):
+            with self.subTest(raw=raw[:80]):
+                self.assertIsNone(sbom_summary(raw, hashlib.sha256(raw).hexdigest()))
+    def test_sbom_bounds_and_digest(self):
+        raw = b'{"bomFormat":"CycloneDX","specVersion":"1.6","components":[{"name":"a"}]}'
+        self.assertIsNone(sbom_summary(raw, "0" * 64))
+        self.assertIsNone(sbom_summary(b"x" * (MAX_SBOM+1), "0" * 64))
+        obj = {"bomFormat": "CycloneDX", "specVersion": "1.6",
+               "components": [{"name": "a"}] * (MAX_COMPONENTS+1)}
+        raw = json.dumps(obj).encode()
+        self.assertIsNone(sbom_summary(raw, hashlib.sha256(raw).hexdigest()))
+    def test_embedded_sbom_requires_archive_and_member_digest(self):
+        data = self.wheel(member=SBOM_MEMBER, member_data=b'{"bomFormat":"CycloneDX","specVersion":"1.6","components":[{"name":"a"}]}')
+        digest = hashlib.sha256(data).hexdigest()
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            member_hash = hashlib.sha256(z.read(SBOM_MEMBER)).hexdigest()
+        self.assertIsNotNone(embedded_sbom_summary(data, digest, member_hash))
+        self.assertIsNone(embedded_sbom_summary(data, digest, "0" * 64))
+        self.assertIsNone(embedded_sbom_summary(data, "0" * 64, member_hash))
+        absent = self.wheel()
+        self.assertIsNone(embedded_sbom_summary(absent, hashlib.sha256(absent).hexdigest(), member_hash))
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-test"]:
         unittest.main(argv=[sys.argv[0]])
@@ -362,5 +525,13 @@ if __name__ == "__main__":
         if evidence is None:
             sys.exit("Candidate inventory unavailable; preflight required.")
         print(json.dumps(evidence, sort_keys=True, ensure_ascii=True))
+    elif len(sys.argv) == 3 and sys.argv[1] == "--sbom-summary":
+        try:
+            evidence = embedded_sbom_summary(read_candidate(sys.argv[2]), SHA256, SBOM_SHA256)
+        except (OSError, ValueError):
+            evidence = None
+        if evidence is None:
+            sys.exit("Candidate SBOM summary unavailable; review required.")
+        print(json.dumps(evidence, sort_keys=True, ensure_ascii=True))
     else:
-        sys.exit("Use --self-test, --inspect or --inventory with the explicitly selected offline candidate.")
+        sys.exit("Use --self-test, --inspect, --inventory or --sbom-summary with the explicitly selected offline candidate.")
