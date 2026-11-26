@@ -1,6 +1,5 @@
 # Copyright 2026 Gian Paolo Franceschini. See LICENSE.
 """Optional YARA-X integration rehearsal. Fixed harmless inputs only."""
-import importlib.metadata
 import sys
 import unittest
 from types import SimpleNamespace
@@ -41,21 +40,10 @@ def evaluate(engine, data):
 
 
 def real_rehearsal():
-    # The operator must provision an independently reviewed, hash-pinned wheel
-    # in an isolated offline environment first. This script never installs it.
-    try:
-        if importlib.metadata.version('yara-x') != VERSION:
-            raise ValueError('version mismatch')
-        import yara_x
-    except Exception:
-        print('Engine unavailable or version not approved for this rehearsal.')
-        return 2
-    for payload, expected in CASES:
-        if evaluate(yara_x, payload) != expected:
-            print('Engine fixture rehearsal failed.')
-            return 1
-    print('PASS: three harmless YARA-X fixtures; not malware detection validation.')
-    return 0
+    # Version metadata is not an identity or an approval. No native import until
+    # the exact artifact, notices and isolated lab are independently reviewed.
+    print('Engine execution blocked: provenance, license and lab gates pending.')
+    return 2
 
 
 class AdapterTests(unittest.TestCase):
@@ -106,6 +94,17 @@ class AdapterTests(unittest.TestCase):
 
     def test_timeout_no_disclosure(self):
         self.assertEqual(evaluate(self.engine(fail=True), b'x'), 'Unavailable')
+
+    def test_real_entrypoint_blocks_before_import(self):
+        from unittest.mock import patch
+        import io
+        from contextlib import redirect_stdout
+        output = io.StringIO()
+        with patch('builtins.__import__', side_effect=AssertionError('unexpected import')):
+            with redirect_stdout(output):
+                self.assertEqual(real_rehearsal(), 2)
+        self.assertEqual(output.getvalue().strip(),
+                         'Engine execution blocked: provenance, license and lab gates pending.')
 
     def test_compile_failure(self):
         self.assertEqual(evaluate(None, b'x'), 'Unavailable')
