@@ -818,6 +818,9 @@ pub mod gateway_fixture {
         remaining: u16,
         seen: BTreeSet<Id>,
         last_time: u64,
+        stopped: bool,
+        revoked: bool,
+        policy_invalidated: bool,
     }
     fn nonzero(id: Id) -> bool { id != [0; 32] }
     fn short_window(start: u64, end: u64) -> bool {
@@ -840,17 +843,28 @@ pub mod gateway_fixture {
             }
             if !allowed(grant.action) { return Err(Verdict::Forbidden); }
             Ok(Self { grant, remaining: budget, seen: BTreeSet::new(),
-                last_time: grant.issued_at })
+                last_time: grant.issued_at, stopped: false, revoked: false,
+                policy_invalidated: false })
         }
         pub fn remaining(&self) -> u16 { self.remaining }
 
         /// Single mutable ledger serializes fixture decisions. Positive verdict
         /// consumes a transaction and a unit of budget, but never executes it.
-        /// Rejected requests do not consume budget or transaction IDs.
+        /// Rejected requests do not consume budget or transaction IDs, but trusted
+        /// synthetic control observations advance the clock watermark and latch
+        /// stop/revocation/policy invalidation for this ledger's lifetime. The
+        /// control input is assumed to come from the harness, never an agent.
         pub fn evaluate(&mut self, req: Binding, ctl: Control, approval: Option<Approval>) -> Verdict {
             use Verdict::*;
-            if ctl.stopped { return Stopped; }
-            if ctl.revoked { return Revoked; }
+            self.stopped |= ctl.stopped;
+            self.revoked |= ctl.revoked;
+            self.policy_invalidated |= ctl.policy_version != self.grant.policy_version;
+            let regressed = ctl.now < self.last_time;
+            self.last_time = self.last_time.max(ctl.now);
+            if self.stopped { return Stopped; }
+            if self.revoked { return Revoked; }
+            if self.policy_invalidated { return StalePolicy; }
+            if regressed { return ClockRegression; }
             if !allowed(req.action) { return Forbidden; }
             if ![req.principal, req.session, req.resource, req.payload_digest, req.transaction]
                 .into_iter().all(nonzero) || req.policy_version == 0 || ctl.policy_version == 0 {
@@ -860,7 +874,6 @@ pub mod gateway_fixture {
             if req.policy_version != g.policy_version || ctl.policy_version != g.policy_version {
                 return StalePolicy;
             }
-            if ctl.now < self.last_time { return ClockRegression; }
             if !live(g.issued_at, g.expires_at, ctl.now) { return Expired; }
             if (req.principal, req.session, req.resource, req.action)
                 != (g.principal, g.session, g.resource, g.action) { return ScopeMismatch; }
@@ -876,7 +889,6 @@ pub mod gateway_fixture {
             }
             self.seen.insert(req.transaction);
             self.remaining -= 1;
-            self.last_time = ctl.now;
             AcceptedFixtureOnly
         }
     }
@@ -935,10 +947,19 @@ pub mod gateway_fixture {
             let b = req(g);
             let mut l = Ledger::new(g, 1).unwrap();
             assert_eq!(l.evaluate(b, Control { stopped: true, ..control(20) }, None), Verdict::Stopped);
-            assert_eq!(l.evaluate(b, Control { revoked: true, ..control(20) }, None), Verdict::Revoked);
-            assert_eq!(l.evaluate(b, Control { policy_version: 2, ..control(20) }, None), Verdict::StalePolicy);
-            assert_eq!(l.evaluate(Binding { policy_version: 2, ..b }, control(20), None), Verdict::StalePolicy);
+            assert_eq!(l.evaluate(b, control(21), None), Verdict::Stopped);
             assert_eq!(l.remaining(), 1);
+            let mut l = Ledger::new(g, 1).unwrap();
+            assert_eq!(l.evaluate(b, Control { revoked: true, ..control(20) }, None), Verdict::Revoked);
+            assert_eq!(l.evaluate(b, control(21), None), Verdict::Revoked);
+            assert_eq!(l.remaining(), 1);
+            let mut l = Ledger::new(g, 1).unwrap();
+            assert_eq!(l.evaluate(b, Control { policy_version: 2, ..control(20) }, None), Verdict::StalePolicy);
+            assert_eq!(l.evaluate(b, control(21), None), Verdict::StalePolicy);
+            assert_eq!(l.remaining(), 1);
+            let mut l = Ledger::new(g, 1).unwrap();
+            assert_eq!(l.evaluate(Binding { policy_version: 2, ..b }, control(20), None), Verdict::StalePolicy);
+            assert_eq!(l.evaluate(b, control(21), None), Verdict::AcceptedFixtureOnly);
         }
         #[test]
         fn expiry_and_clock_regression() {
@@ -946,10 +967,39 @@ pub mod gateway_fixture {
             let b = req(g);
             let mut l = Ledger::new(g, 2).unwrap();
             assert_eq!(l.evaluate(b, control(100), None), Verdict::Expired);
+            assert_eq!(l.evaluate(b, control(20), None), Verdict::ClockRegression);
+            assert_eq!(l.evaluate(b, control(101), None), Verdict::Expired);
+            assert_eq!(l.remaining(), 2);
+            let mut l = Ledger::new(g, 2).unwrap();
             assert_eq!(l.evaluate(b, control(9), None), Verdict::ClockRegression);
             assert_eq!(l.evaluate(b, control(20), None), Verdict::AcceptedFixtureOnly);
             assert_eq!(l.evaluate(Binding { transaction: id(9), ..b }, control(19), None),
                 Verdict::ClockRegression);
+        }
+        #[test]
+        fn denied_request_still_advances_control_clock() {
+            let g = grant(Action::Write);
+            let b = req(g);
+            let mut l = Ledger::new(g, 2).unwrap();
+            assert_eq!(l.evaluate(b, control(40), None), Verdict::ApprovalRequired);
+            assert_eq!(l.evaluate(b, control(20), Some(approval(g,b))), Verdict::ClockRegression);
+            assert_eq!(l.remaining(), 2);
+            let a = Approval { issued_at: 40, expires_at: 60, ..approval(g,b) };
+            assert_eq!(l.evaluate(b, control(41), Some(a)), Verdict::AcceptedFixtureOnly);
+            assert_eq!(l.remaining(), 1);
+        }
+        #[test]
+        fn stop_and_revocation_latch_even_with_regressed_clock() {
+            let g = grant(Action::Read);
+            for stopped in [false,true] {
+                let mut l = Ledger::new(g, 2).unwrap();
+                let b = req(g);
+                assert_eq!(l.evaluate(b, control(40), None), Verdict::AcceptedFixtureOnly);
+                let expected = if stopped { Verdict::Stopped } else { Verdict::Revoked };
+                assert_eq!(l.evaluate(b, Control { stopped, revoked: !stopped, ..control(20) }, None), expected);
+                assert_eq!(l.evaluate(Binding { transaction: id(9), ..b }, control(41), None), expected);
+                assert_eq!(l.remaining(), 1);
+            }
         }
         #[test]
         fn approval_binds_sensitive_transaction_and_payload() {

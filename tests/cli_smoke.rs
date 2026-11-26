@@ -49,6 +49,9 @@ fn synthetic_demos_have_expected_results() {
                      "expired unresolved reservation: RecoveryVerificationRequired",
                      "administration channel unavailable: AdministrationUnavailable",
                      "kill switch: Stopped", "no credential access or authentication",
+                     "no tool action or actual authorization", "missing approval: ApprovalRequired",
+                     "bound approval: AcceptedFixtureOnly", "duplicate transaction: Replay",
+                     "revocation: Revoked", "revocation remains latched: Revoked",
                      "Workload fixture: criteria reported, not verified",
                      "Revoked fixture: Revoked, Expired",
                      "Unknown scope: ScopeReview, RevocationUnknown"] {

@@ -31,6 +31,29 @@ fn run(args: &[OsString]) -> (i32, String) {
                 return (1, report);
             }
         }
+        // Expose the existing bounded transaction fixture, not an enforcement interface.
+        {
+            use aegis_policy::gateway_fixture::{Approval, Binding, Control, Grant, Ledger, Verdict};
+            let g = Grant { id: [1;32], principal: [2;32], session: [3;32], resource: [4;32],
+                action: Action::Export, policy_version: 1, issued_at: 10, expires_at: 100 };
+            let b = Binding { principal: g.principal, session: g.session, resource: g.resource,
+                action: g.action, payload_digest: [5;32], transaction: [6;32], policy_version: 1 };
+            let a = Approval { binding: b, grant_id: g.id, reviewer: [7;32], issued_at: 11, expires_at: 50 };
+            let c = Control { policy_version: 1, stopped: false, revoked: false, now: 20 };
+            let Ok(mut ledger) = Ledger::new(g, 2) else { return (1, report); };
+            report.push_str("Synthetic transaction ledger; no tool action or actual authorization.\n");
+            for (label, observed, expected) in [
+                ("missing approval", ledger.evaluate(b,c,None), Verdict::ApprovalRequired),
+                ("bound approval", ledger.evaluate(b,c,Some(a)), Verdict::AcceptedFixtureOnly),
+                ("duplicate transaction", ledger.evaluate(b,c,Some(a)), Verdict::Replay),
+                ("revocation", ledger.evaluate(b,Control { revoked: true, ..c },None), Verdict::Revoked),
+                ("revocation remains latched", ledger.evaluate(b,Control { now: 21, ..c },Some(a)), Verdict::Revoked),
+            ] {
+                report.push_str(&format!("{label}: {observed:?}\n"));
+                if observed != expected { return (1, report); }
+            }
+            if ledger.remaining() != 1 { return (1, report); }
+        }
         use aegis_policy::response::{plan, Proposal, Reservation, Role, Service, Snapshot, Verdict};
         let registry = [
             Service { id: 1, role: Role::Ordinary, impact: 2 },
