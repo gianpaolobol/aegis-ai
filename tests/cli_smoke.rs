@@ -100,7 +100,11 @@ fn patch_demo_is_advisory_and_denies_extra_arguments() {
     let output = run(&["demo-patches"]);
     assert_eq!(output.status.code(), Some(0));
     for expected in ["no real KEV catalog or CVE mapping", "Priority review: 1",
-        "Other review: 1", "Applicability unknown: 1", "No patch installation or safety established"] {
+        "Other review: 1", "Applicability unknown: 1",
+        "Synthetic healthy canary prompts human review: true",
+        "Synthetic failed canary prompts rollback review: true",
+        "Synthetic incomplete canary blocks expansion review: true",
+        "No patch installation or safety established"] {
         assert!(stdout(&output).contains(expected));
     }
     assert!(output.stderr.is_empty());

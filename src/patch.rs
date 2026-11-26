@@ -139,3 +139,121 @@ mod tests {
             Ok(vec![Advisory::ReviewNotListedInFixture]));
     }
 }
+
+/// Synthetic rollout identity; artifact is an opaque fixture label, NOT a hash
+/// or verified signature. Build numbers are synthetic monotonic integers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rollout {
+    pub from: ProductBuild,
+    pub to: ProductBuild,
+    pub artifact: u32,
+    pub policy_version: u64,
+    pub canary_count: u16,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct RolloutEvidence {
+    pub rollout: Rollout,
+    pub observed_at: u64,
+    pub source: Evidence,
+    pub rollback_rehearsal: Evidence,
+    pub checked: u16,
+    pub healthy: u16,
+    pub failed: u16,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RolloutAdvisory {
+    InvalidPlan, EvidenceUnavailable, EvidenceMismatch, InvalidCounts,
+    RollbackReviewRequired, CanaryIncomplete, ExpansionReviewOnly,
+}
+/// No deployment or approval. Even a fully healthy synthetic canary only
+/// suggests human review. A failed canary takes precedence over incomplete
+/// coverage. Neither an expiry nor a reported rehearsal proves real rollback.
+pub fn review_rollout(plan: Rollout, now: u64, evidence: RolloutEvidence) -> RolloutAdvisory {
+    use RolloutAdvisory::*;
+    if !valid_product(plan.from) || !valid_product(plan.to) ||
+        plan.from.product != plan.to.product || plan.to.build <= plan.from.build ||
+        plan.artifact == 0 || plan.policy_version == 0 ||
+        plan.canary_count == 0 || usize::from(plan.canary_count) > MAX_ROWS {
+        return InvalidPlan;
+    }
+    if evidence.rollout != plan { return EvidenceMismatch; }
+    if evidence.source != Evidence::ReviewedFixture ||
+        !now.checked_sub(evidence.observed_at).is_some_and(|age| age <= 300) {
+        return EvidenceUnavailable;
+    }
+    if evidence.checked > plan.canary_count ||
+        evidence.healthy.checked_add(evidence.failed) != Some(evidence.checked) {
+        return InvalidCounts;
+    }
+    if evidence.failed != 0 || evidence.rollback_rehearsal != Evidence::ReviewedFixture {
+        return RollbackReviewRequired;
+    }
+    if evidence.checked != plan.canary_count { return CanaryIncomplete; }
+    ExpansionReviewOnly
+}
+
+#[cfg(test)]
+mod rollout_tests {
+    use super::*;
+    const PLAN: Rollout = Rollout {
+        from: ProductBuild { product: 1, build: 1 },
+        to: ProductBuild { product: 1, build: 2 },
+        artifact: 7, policy_version: 1, canary_count: 3,
+    };
+    fn evidence() -> RolloutEvidence {
+        RolloutEvidence { rollout: PLAN, observed_at: 100,
+            source: Evidence::ReviewedFixture, rollback_rehearsal: Evidence::ReviewedFixture,
+            checked: 3, healthy: 3, failed: 0 }
+    }
+    #[test]
+    fn full_canary_only_suggests_review() {
+        assert_eq!(review_rollout(PLAN,400,evidence()),RolloutAdvisory::ExpansionReviewOnly);
+        assert_eq!(review_rollout(PLAN,100,RolloutEvidence { checked: 2, healthy: 2, ..evidence() }),
+            RolloutAdvisory::CanaryIncomplete);
+    }
+    #[test]
+    fn failure_even_in_partial_canary_requires_rollback_review() {
+        assert_eq!(review_rollout(PLAN,100,RolloutEvidence { checked: 1, healthy: 0, failed: 1, ..evidence() }),
+            RolloutAdvisory::RollbackReviewRequired);
+        for state in [Evidence::Stale,Evidence::Unavailable] {
+            assert_eq!(review_rollout(PLAN,100,RolloutEvidence { rollback_rehearsal: state, ..evidence() }),
+                RolloutAdvisory::RollbackReviewRequired);
+        }
+    }
+    #[test]
+    fn evidence_bound_to_entire_plan() {
+        for rollout in [Rollout { artifact: 8, ..PLAN }, Rollout { policy_version: 2, ..PLAN },
+            Rollout { canary_count: 4, ..PLAN }, Rollout { to: ProductBuild { product: 1, build: 3 }, ..PLAN },
+            Rollout { from: ProductBuild { product: 1, build: 2 }, ..PLAN }] {
+            assert_eq!(review_rollout(PLAN,100,RolloutEvidence { rollout, ..evidence() }),
+                RolloutAdvisory::EvidenceMismatch);
+        }
+    }
+    #[test]
+    fn missing_future_or_stale_evidence() {
+        for now in [99,401] {
+            assert_eq!(review_rollout(PLAN,now,evidence()),RolloutAdvisory::EvidenceUnavailable);
+        }
+        for source in [Evidence::Stale,Evidence::Unavailable] {
+            assert_eq!(review_rollout(PLAN,100,RolloutEvidence { source, ..evidence() }),
+                RolloutAdvisory::EvidenceUnavailable);
+        }
+    }
+    #[test]
+    fn invalid_and_overflow_counts_rejected() {
+        for e in [RolloutEvidence { checked: 4, healthy: 4, ..evidence() },
+            RolloutEvidence { healthy: 2, ..evidence() },
+            RolloutEvidence { healthy: u16::MAX, failed: 1, ..evidence() }] {
+            assert_eq!(review_rollout(PLAN,100,e),RolloutAdvisory::InvalidCounts);
+        }
+    }
+    #[test]
+    fn invalid_plan_rejected() {
+        for plan in [Rollout { artifact: 0, ..PLAN }, Rollout { policy_version: 0, ..PLAN },
+            Rollout { canary_count: 0, ..PLAN }, Rollout { canary_count: 257, ..PLAN },
+            Rollout { to: PLAN.from, ..PLAN },
+            Rollout { to: ProductBuild { product: 2, build: 2 }, ..PLAN }] {
+            assert_eq!(review_rollout(plan,100,evidence()),RolloutAdvisory::InvalidPlan);
+        }
+    }
+}
