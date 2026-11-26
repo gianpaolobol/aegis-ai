@@ -668,6 +668,59 @@ function Test-AegisEncryptionReport {
     Write-Output 'PASS: BitLocker snapshot synthetic fixtures'
 }
 
+
+# Local boot trust snapshot: no TPM methods, no key material, no elevation.
+function Convert-AegisStrictBoolean($Value) {
+    if ($Value -isnot [bool]) { return 'Unknown' }
+    if ($Value) { return 'Reported yes' }
+    return 'Reported no'
+}
+function Get-AegisBootTrustReport([scriptblock]$ReadSecureBoot,[scriptblock]$ReadTpm) {
+    $secure = 'Unknown'
+    $enabled = 'Unknown'
+    $activated = 'Unknown'
+    try {
+        $values = @(& $ReadSecureBoot | Select-Object -First 2)
+        if ($values.Count -eq 1) { $secure = Convert-AegisStrictBoolean $values[0] }
+    } catch { $secure = 'Unknown' }
+    try {
+        $records = @(& $ReadTpm | Select-Object -First 2)
+        if ($records.Count -eq 1 -and $null -ne $records[0]) {
+            $p = $records[0].PSObject.Properties['IsEnabled_InitialValue']
+            if ($null -ne $p) { $enabled = Convert-AegisStrictBoolean $p.Value }
+            $p = $records[0].PSObject.Properties['IsActivated_InitialValue']
+            if ($null -ne $p) { $activated = Convert-AegisStrictBoolean $p.Value }
+        }
+    } catch { $enabled = 'Unknown'; $activated = 'Unknown' }
+    return (@('Boot trust snapshot (read-only).',
+        "Secure Boot enabled : $secure",
+        "TPM enabled at provider instantiation : $enabled",
+        "TPM activated at provider instantiation : $activated",
+        'Unknown includes unavailable provider, denied access and unsupported platforms. No elevation attempted.',
+        'No hardware attestation, measured boot verification, key access or safety established.') -join [Environment]::NewLine)
+}
+function Test-AegisBootTrustReport {
+    $good = { [pscustomobject]@{IsEnabled_InitialValue=$true;IsActivated_InitialValue=$false;PrivateField='SYNTHETIC-PRIVATE'} }
+    $report = Get-AegisBootTrustReport { $true } $good
+    foreach ($expected in @('Secure Boot enabled : Reported yes','TPM enabled at provider instantiation : Reported yes','TPM activated at provider instantiation : Reported no','No hardware attestation')) {
+        if (-not $report.Contains($expected)) { throw 'Boot trust fixture mismatch' }
+    }
+    if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'Boot trust privacy regression' }
+    $report = Get-AegisBootTrustReport { $false } { throw 'SYNTHETIC-PRIVATE' }
+    if (-not $report.Contains('Secure Boot enabled : Reported no') -or -not $report.Contains('TPM enabled at provider instantiation : Unknown') -or $report.Contains('SYNTHETIC-PRIVATE')) { throw 'Boot trust provider isolation failed' }
+    $report = Get-AegisBootTrustReport { throw 'SYNTHETIC-PRIVATE' } $good
+    if (-not $report.Contains('Secure Boot enabled : Unknown') -or -not $report.Contains('TPM enabled at provider instantiation : Reported yes') -or $report.Contains('SYNTHETIC-PRIVATE')) { throw 'Boot trust permission handling failed' }
+    foreach ($read in @({}, { 'True' }, { 1 }, { $true; $false }, { $null })) {
+        $report = Get-AegisBootTrustReport $read {}
+        if (-not $report.Contains('Secure Boot enabled : Unknown')) { throw 'Ambiguous Secure Boot state accepted' }
+    }
+    foreach ($read in @({}, { & $good; & $good }, { [pscustomobject]@{IsEnabled_InitialValue='True';IsActivated_InitialValue=1} }, { [pscustomobject]@{IsEnabled_InitialValue=@($true);IsActivated_InitialValue=$null} }, { [pscustomobject]@{Other='SYNTHETIC-PRIVATE'} })) {
+        $report = Get-AegisBootTrustReport {} $read
+        if (-not $report.Contains('TPM enabled at provider instantiation : Unknown') -or -not $report.Contains('TPM activated at provider instantiation : Unknown') -or $report.Contains('SYNTHETIC-PRIVATE')) { throw 'Invalid TPM state accepted' }
+    }
+    Write-Output 'PASS: boot trust snapshot synthetic fixtures'
+}
+
 if ($SelfTest) {
     foreach ($command in (Get-AegisCommands)) {
         if (-not (Test-AegisCommand $command)) { throw 'Allowlist failure' }
@@ -677,6 +730,7 @@ if ($SelfTest) {
     }
     Test-AegisNativeReport
     Test-AegisDeviceGuardReport
+    Test-AegisBootTrustReport
     Test-AegisIntegrity
     Test-AegisDnsReport
     Test-AegisVpnReport
@@ -757,6 +811,11 @@ $native.Add_Click({
         }
         $output.Text += [Environment]::NewLine + [Environment]::NewLine + (Get-AegisDeviceGuardReport {
             CimCmdlets\Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -Property VirtualizationBasedSecurityStatus,SecurityServicesConfigured,SecurityServicesRunning,CodeIntegrityPolicyEnforcementStatus,UsermodeCodeIntegrityPolicyEnforcementStatus -OperationTimeoutSec 5 -ErrorAction Stop -WarningAction SilentlyContinue
+        })
+        $output.Text += [Environment]::NewLine + [Environment]::NewLine + (Get-AegisBootTrustReport {
+            SecureBoot\Confirm-SecureBootUEFI -ErrorAction Stop -WarningAction SilentlyContinue
+        } {
+            CimCmdlets\Get-CimInstance -Namespace 'root\CIMV2\Security\MicrosoftTpm' -ClassName Win32_Tpm -Property IsEnabled_InitialValue,IsActivated_InitialValue -OperationTimeoutSec 5 -ErrorAction Stop -WarningAction SilentlyContinue
         })
     } catch { $output.Text = 'Native diagnostic unavailable; no changes made.' }
 })
