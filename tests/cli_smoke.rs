@@ -48,7 +48,10 @@ fn synthetic_demos_have_expected_results() {
                      "aggregate impact: ImpactBudgetExceeded", "recovery channel: ProtectedService",
                      "expired unresolved reservation: RecoveryVerificationRequired",
                      "administration channel unavailable: AdministrationUnavailable",
-                     "kill switch: Stopped"] {
+                     "kill switch: Stopped", "no credential access or authentication",
+                     "Workload fixture: criteria reported, not verified",
+                     "Revoked fixture: Revoked, Expired",
+                     "Unknown scope: ScopeReview, RevocationUnknown"] {
         assert!(stdout(&policy).contains(expected));
     }
     assert!(policy.stderr.is_empty());

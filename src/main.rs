@@ -55,6 +55,22 @@ fn run(args: &[OsString]) -> (i32, String) {
             report.push_str(&format!("{label}: {observed:?}\n"));
             if observed != expected { return (1, report); }
         }
+        use aegis_policy::nhi::{assess, Advisory, Identity, Limits, Reported, Revocation};
+        let identity = Identity { id: 1, owner_assigned: Reported::Yes, scoped: Reported::Yes,
+            reviewed_fixture: true, observed_at: 95, issued_at: Some(90), expires_at: Some(120),
+            revocation: Revocation::NotRevoked };
+        let identities = [identity, Identity { id: 2, expires_at: Some(100),
+            revocation: Revocation::Revoked, ..identity }, Identity { id: 3,
+            scoped: Reported::Unknown, revocation: Revocation::Unknown, ..identity }];
+        report.push_str("Synthetic workload identity inventory; no credential access or authentication.\n");
+        match assess(&identities, 100, Limits { max_observation_age: 10, max_lifetime: 30 }) {
+            Ok(v) if v == vec![vec![Advisory::FixtureCriteriaReported],
+                vec![Advisory::Revoked, Advisory::Expired],
+                vec![Advisory::ScopeReview, Advisory::RevocationUnknown]] => {
+                report.push_str("Workload fixture: criteria reported, not verified.\nRevoked fixture: Revoked, Expired\nUnknown scope: ScopeReview, RevocationUnknown\n");
+            }
+            _ => return (1, "Synthetic workload identity assessment unavailable.\n".into()),
+        }
         return (0, report);
     }
     if arg == OsStr::new("demo-wifi") {

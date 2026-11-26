@@ -7,6 +7,7 @@ pub mod patch;
 pub mod response;
 pub mod mail_auth;
 pub mod recovery;
+pub mod nhi;
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Action { Read, Write, Export, Execute, ChangePolicy, Unknown }
 #[derive(Debug, PartialEq, Eq)]
