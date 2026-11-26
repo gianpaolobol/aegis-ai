@@ -116,7 +116,13 @@ fn mail_auth_demo_is_advisory_and_rejects_extra_arguments() {
         "aligned payment fixture: DomainAlignmentReported",
         "unaligned fixture: InconsistentEvidence", "missing fixture: IncompleteEvidence",
         "untrusted fixture: UntrustedEvidence", "require independent confirmation",
-        "No sender identity or message safety established"] {
+        "No sender identity or message safety established",
+        "independent confirmation fixture: FixtureConfirmationReported",
+        "missing confirmation fixture: Missing",
+        "request-supplied channel fixture: NonIndependentChannel",
+        "changed destination fixture: DifferentTransaction",
+        "expired confirmation fixture: StaleOrInvalidTime",
+        "no payment authorization or contact verification"] {
         assert!(stdout(&output).contains(expected));
     }
     assert!(output.stderr.is_empty());

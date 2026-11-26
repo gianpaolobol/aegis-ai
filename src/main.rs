@@ -164,6 +164,26 @@ fn run(args: &[OsString]) -> (i32, String) {
             }
         }
         report.push_str("Payment/account changes require independent confirmation even with domain alignment. No sender identity or message safety established.\n");
+        use aegis_policy::mail_auth::{assess_confirmation, confirmation_example,
+            ConfirmationChannel, ConfirmationFixture, ConfirmationVerdict, CriticalRequest};
+        let (request, confirmation) = confirmation_example();
+        for (label, r, c, now, expected) in [
+            ("independent confirmation fixture", request, Some(confirmation), 120,
+                ConfirmationVerdict::FixtureConfirmationReported),
+            ("missing confirmation fixture", request, None, 120, ConfirmationVerdict::Missing),
+            ("request-supplied channel fixture", request,
+                Some(ConfirmationFixture { channel: ConfirmationChannel::FromRequest, ..confirmation }),
+                120, ConfirmationVerdict::NonIndependentChannel),
+            ("changed destination fixture", CriticalRequest { destination: 9, ..request },
+                Some(confirmation), 120, ConfirmationVerdict::DifferentTransaction),
+            ("expired confirmation fixture", request, Some(confirmation), 410,
+                ConfirmationVerdict::StaleOrInvalidTime),
+        ] {
+            let observed = assess_confirmation(r, now, c);
+            report.push_str(&format!("{label}: {observed:?}\n"));
+            if observed != expected { return (1, report); }
+        }
+        report.push_str("Confirmation metadata is synthetic; no payment authorization or contact verification.\n");
         return (0, report);
     }
     if arg == OsStr::new("demo-recovery") {

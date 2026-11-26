@@ -110,3 +110,142 @@ mod tests {
         }
     }
 }
+
+/** Synthetic transaction metadata. All identifiers are fictional opaque numbers,
+ * never account numbers, contact details, credentials or real payment data. */
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Currency { Eur, Usd }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CriticalTerms {
+    Payment { amount_minor: u64, currency: Currency },
+    DestinationChange,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CriticalRequest {
+    pub request_id: u64,
+    pub revision: u32,
+    pub requester: u64,
+    pub beneficiary: u64,
+    pub destination: u64,
+    pub issued_at: u64,
+    pub terms: CriticalTerms,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmationChannel { PreviouslyRegistered, FromRequest, Unknown }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConfirmationFixture {
+    pub source: Source,
+    pub channel: ConfirmationChannel,
+    pub reviewer: u64,
+    pub confirmed_at: u64,
+    pub bound_request: CriticalRequest,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmationVerdict {
+    InvalidRequest, Missing, Untrusted, NonIndependentChannel,
+    NonIndependentReviewer, DifferentTransaction, StaleOrInvalidTime,
+    FixtureConfirmationReported,
+}
+pub const CONFIRMATION_MAX_AGE: u64 = 300;
+/// Advisory only, never authorizes payments or account changes. The caller's
+/// synthetic labels are NOT authenticated; no replay ledger or identity proof.
+/// A positive result is not payment approval or proof of a safe recipient.
+pub fn assess_confirmation(request: CriticalRequest, now: u64,
+    confirmation: Option<ConfirmationFixture>) -> ConfirmationVerdict {
+    use ConfirmationVerdict::*;
+    if request.request_id == 0 || request.revision == 0 || request.requester == 0 ||
+        request.beneficiary == 0 || request.destination == 0 ||
+        request.issued_at > now ||
+        matches!(request.terms, CriticalTerms::Payment { amount_minor: 0, .. }) {
+        return InvalidRequest;
+    }
+    let Some(c) = confirmation else { return Missing; };
+    if c.source != Source::ReviewedFixture { return Untrusted; }
+    if c.channel != ConfirmationChannel::PreviouslyRegistered { return NonIndependentChannel; }
+    if c.reviewer == 0 || c.reviewer == request.requester { return NonIndependentReviewer; }
+    if c.bound_request != request { return DifferentTransaction; }
+    if c.confirmed_at < request.issued_at ||
+        !now.checked_sub(c.confirmed_at).is_some_and(|age| age < CONFIRMATION_MAX_AGE) {
+        return StaleOrInvalidTime;
+    }
+    FixtureConfirmationReported
+}
+pub fn confirmation_example() -> (CriticalRequest, ConfirmationFixture) {
+    let request = CriticalRequest { request_id: 1, revision: 1, requester: 2,
+        beneficiary: 3, destination: 4, issued_at: 100,
+        terms: CriticalTerms::Payment { amount_minor: 500, currency: Currency::Eur } };
+    let confirmation = ConfirmationFixture { source: Source::ReviewedFixture,
+        channel: ConfirmationChannel::PreviouslyRegistered, reviewer: 5,
+        confirmed_at: 110, bound_request: request };
+    (request, confirmation)
+}
+#[cfg(test)]
+mod confirmation_tests {
+    use super::*;
+    use ConfirmationVerdict::*;
+    #[test] fn valid_fixture_and_missing_confirmation() {
+        let (r,c) = confirmation_example();
+        assert_eq!(assess_confirmation(r, 120, Some(c)), FixtureConfirmationReported);
+        assert_eq!(assess_confirmation(r, 120, None), Missing);
+        let r = CriticalRequest { terms: CriticalTerms::DestinationChange, ..r };
+        assert_eq!(assess_confirmation(r, 120, Some(ConfirmationFixture { bound_request: r, ..c })),
+            FixtureConfirmationReported);
+    }
+    #[test] fn every_bound_field_matters() {
+        let (r,c) = confirmation_example();
+        for changed in [
+            CriticalRequest { request_id: 9, ..r },
+            CriticalRequest { revision: 2, ..r },
+            CriticalRequest { requester: 8, ..r },
+            CriticalRequest { beneficiary: 8, ..r },
+            CriticalRequest { destination: 8, ..r },
+            CriticalRequest { issued_at: 101, ..r },
+            CriticalRequest { terms: CriticalTerms::Payment { amount_minor: 501, currency: Currency::Eur }, ..r },
+            CriticalRequest { terms: CriticalTerms::Payment { amount_minor: 500, currency: Currency::Usd }, ..r },
+            CriticalRequest { terms: CriticalTerms::DestinationChange, ..r },
+        ] {
+            assert_eq!(assess_confirmation(changed, 120, Some(c)), DifferentTransaction);
+        }
+    }
+    #[test] fn untrusted_or_request_supplied_channel_rejected() {
+        let (r,c) = confirmation_example();
+        for source in [Source::Untrusted, Source::Unavailable] {
+            assert_eq!(assess_confirmation(r, 120, Some(ConfirmationFixture { source, ..c })), Untrusted);
+        }
+        for channel in [ConfirmationChannel::FromRequest, ConfirmationChannel::Unknown] {
+            assert_eq!(assess_confirmation(r, 120, Some(ConfirmationFixture { channel, ..c })),
+                NonIndependentChannel);
+        }
+    }
+    #[test] fn independent_reviewer_required() {
+        let (r,c) = confirmation_example();
+        for reviewer in [0, r.requester] {
+            assert_eq!(assess_confirmation(r, 120, Some(ConfirmationFixture { reviewer, ..c })),
+                NonIndependentReviewer);
+        }
+    }
+    #[test] fn time_boundaries() {
+        let (r,c) = confirmation_example();
+        for confirmed_at in [99, 121, u64::MAX] {
+            assert_eq!(assess_confirmation(r, 120, Some(ConfirmationFixture { confirmed_at, ..c })),
+                StaleOrInvalidTime);
+        }
+        assert_eq!(assess_confirmation(r, 409, Some(c)), FixtureConfirmationReported);
+        assert_eq!(assess_confirmation(r, 410, Some(c)), StaleOrInvalidTime);
+        assert_eq!(assess_confirmation(r, 109, Some(c)), StaleOrInvalidTime);
+    }
+    #[test] fn invalid_request_fields() {
+        let (r,c) = confirmation_example();
+        for invalid in [
+            CriticalRequest { request_id: 0, ..r },
+            CriticalRequest { revision: 0, ..r },
+            CriticalRequest { requester: 0, ..r },
+            CriticalRequest { beneficiary: 0, ..r },
+            CriticalRequest { destination: 0, ..r },
+            CriticalRequest { issued_at: 121, ..r },
+            CriticalRequest { terms: CriticalTerms::Payment { amount_minor: 0, currency: Currency::Eur }, ..r },
+        ] {
+            assert_eq!(assess_confirmation(invalid, 120, Some(c)), InvalidRequest);
+        }
+    }
+}
