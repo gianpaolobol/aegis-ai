@@ -39,9 +39,43 @@ def b64(value, limit):
     if type(value) is not str or not 1 <= len(value) <= 4 * ((limit + 2) // 3):
         raise ValueError("invalid encoded field")
     data = base64.b64decode(value, validate=True)
-    if not 1 <= len(data) <= limit:
+    if not 1 <= len(data) <= limit or base64.b64encode(data).decode("ascii") != value:
         raise ValueError("invalid field size")
     return data
+
+def uint_text(value):
+    if (type(value) is not str or not 1 <= len(value) <= 19
+            or not value.isascii() or not value.isdecimal()
+            or (len(value) > 1 and value[0] == "0")):
+        raise ValueError("invalid integer field")
+    number = int(value)
+    if number > 2**63 - 1:
+        raise ValueError("integer out of range")
+    return number
+
+def transparency_shape(entry):
+    """Check a narrow Rekor v1 envelope shape, never its authenticity."""
+    if type(entry) is not dict or entry["kindVersion"] != {"kind": "dsse", "version": "0.0.1"}:
+        return False
+    if len(b64(entry["logId"]["keyId"], 32)) != 32:
+        return False
+    uint_text(entry["logIndex"])
+    if uint_text(entry["integratedTime"]) == 0:
+        return False
+    b64(entry["canonicalizedBody"], 65536)
+    b64(entry["inclusionPromise"]["signedEntryTimestamp"], 4096)
+    proof = entry["inclusionProof"]
+    if uint_text(proof["logIndex"]) >= uint_text(proof["treeSize"]):
+        return False
+    if len(b64(proof["rootHash"], 32)) != 32:
+        return False
+    hashes = proof["hashes"]
+    if type(hashes) is not list or len(hashes) > 64:
+        return False
+    if any(len(b64(item, 32)) != 32 for item in hashes):
+        return False
+    checkpoint = proof["checkpoint"]["envelope"]
+    return type(checkpoint) is str and 1 <= len(checkpoint) <= 16384 and bool(checkpoint.strip())
 
 def preflight(raw):
     """Only exact structural/declared subject binding; signatures remain unverified.
@@ -73,6 +107,7 @@ def preflight(raw):
         statement = parse(b64(env["statement"], MAX_STATEMENT))
         if (type(statement) is not dict or statement.get("_type") != STATEMENT
                 or statement.get("predicateType") != PREDICATE
+                or (statement.get("predicate") is not None and statement["predicate"] != {})
                 or statement.get("subject") != [{"name": FILENAME,
                                                    "digest": {"sha256": DIGEST}}]):
             return None
@@ -81,7 +116,7 @@ def preflight(raw):
         entries = material["transparency_entries"]
         if type(entries) is not list or not 1 <= len(entries) <= 8:
             return None
-        if any(type(entry) is not dict or not entry for entry in entries):
+        if not all(transparency_shape(entry) for entry in entries):
             return None
         return {"schema": "aegis-provenance-preflight-v1",
                 "provenance_sha256": hashlib.sha256(raw).hexdigest(),
@@ -101,12 +136,20 @@ class Fixtures(unittest.TestCase):
         st = {"_type": STATEMENT, "predicateType": PREDICATE,
               "subject": [{"name": FILENAME, "digest": {"sha256": DIGEST}}],
               "predicate": None}
+        digest = enc(b"x" * 32)
+        entry = {"kindVersion": {"kind": "dsse", "version": "0.0.1"},
+                 "logId": {"keyId": digest}, "logIndex": "3",
+                 "integratedTime": "100", "canonicalizedBody": enc(b"fake body"),
+                 "inclusionPromise": {"signedEntryTimestamp": enc(b"fake timestamp")},
+                 "inclusionProof": {"logIndex": "0", "treeSize": "2",
+                                    "rootHash": digest, "hashes": [digest],
+                                    "checkpoint": {"envelope": "synthetic checkpoint"}}}
         return {"version": 1, "attestation_bundles": [{
             "publisher": {"kind": "GitHub", "repository": REPO, "workflow": WORKFLOW},
             "attestations": [{"version": 1, "envelope": {
                 "signature": enc(b"fake signature"), "statement": enc(json.dumps(st).encode())},
                 "verification_material": {"certificate": enc(b"fake certificate"),
-                                           "transparency_entries": [{"synthetic": True}]}}]}]}
+                                           "transparency_entries": [entry]}}]}]}
     def run_obj(self, obj):
         return preflight(json.dumps(obj).encode())
     def att(self, obj):
@@ -159,6 +202,37 @@ class Fixtures(unittest.TestCase):
             self.assertIsNone(self.run_obj(obj))
         self.assertIsNone(preflight(b'{"version":1,"version":1}'))
         self.assertIsNone(preflight(b'{"version":NaN}'))
+    def test_publish_predicate_profile(self):
+        for predicate in ({}, None, {"unexpected": True}, [], False, "x"):
+            obj = self.fixture()
+            env = self.att(obj)["envelope"]
+            st = parse(base64.b64decode(env["statement"]))
+            st["predicate"] = predicate
+            env["statement"] = base64.b64encode(json.dumps(st).encode()).decode()
+            result = self.run_obj(obj)
+            if predicate is None or predicate == {}:
+                self.assertIsNotNone(result)
+                self.assertFalse(result["execution_approved"])
+            else:
+                self.assertIsNone(result)
+    def test_noncanonical_base64(self):
+        obj = self.fixture()
+        self.att(obj)["envelope"]["signature"] = "Zh=="
+        self.assertIsNone(self.run_obj(obj))
+    def test_transparency_required_fields(self):
+        for field in ("kindVersion", "logId", "logIndex", "integratedTime",
+                      "canonicalizedBody", "inclusionPromise", "inclusionProof"):
+            obj = self.fixture()
+            del self.att(obj)["verification_material"]["transparency_entries"][0][field]
+            self.assertIsNone(self.run_obj(obj))
+    def test_transparency_proof_bounds(self):
+        for field, value in (("treeSize", "0"), ("logIndex", "-1"),
+                             ("rootHash", "eA=="), ("hashes", ["eA=="]),
+                             ("hashes", ["eA=="] * 65), ("checkpoint", {"envelope": " "}),
+                             ("treeSize", "9" * 20), ("logIndex", "01")):
+            obj = self.fixture()
+            self.att(obj)["verification_material"]["transparency_entries"][0]["inclusionProof"][field] = value
+            self.assertIsNone(self.run_obj(obj))
     def test_bounds_and_shapes(self):
         for raw in (b"", b"x" * (MAX_BYTES + 1), b"[]", b"null", b"\xff"):
             self.assertIsNone(preflight(raw))
