@@ -226,7 +226,7 @@ def reject_constant(_):
     raise ValueError("non-JSON constant")
 
 
-def sbom_summary(raw, expected):
+def sbom_summary(raw, expected, *, component_detail=False):
     """Bounded top-level component evidence; NOT full CycloneDX validation."""
     if type(raw) is not bytes or len(raw) > MAX_SBOM:
         return None
@@ -244,6 +244,8 @@ def sbom_summary(raw, expected):
         refs = set()
         missing_version = missing_purl = nested = missing_license = 0
         identifiers = {}
+        rows = []
+        purl_counts = {}
         def label(value):
             # Narrow printable ASCII metadata, never interpreted as commands.
             return (isinstance(value, str) and 0 < len(value) <= 512
@@ -288,11 +290,19 @@ def sbom_summary(raw, expected):
                 declared.add(kind + ":" + value)
             if not declared:
                 missing_license += 1
+            if component_detail:
+                purl = comp.get("purl") if label(comp.get("purl")) else None
+                if purl is not None:
+                    purl_counts[purl] = purl_counts.get(purl, 0) + 1
+                rows.append({"source_index": len(rows), "name": comp["name"],
+                             "version": comp.get("version") if label(comp.get("version")) else None,
+                             "declared_purl": purl, "bom_ref": ref,
+                             "declared_licenses": sorted(declared), "review_status": "pending"})
             for item in declared:
                 identifiers[item] = identifiers.get(item, 0) + 1
                 if len(identifiers) > 256:
                     return None
-        return {"schema": "aegis-sbom-summary-v1", "sbom_sha256": expected,
+        report = {"schema": "aegis-sbom-summary-v1", "sbom_sha256": expected,
                 "spec_version": obj["specVersion"], "top_level_components": len(components),
                 "missing_declared_license": missing_license, "missing_version": missing_version,
                 "missing_purl": missing_purl, "components_with_nested_entries": nested,
@@ -300,11 +310,19 @@ def sbom_summary(raw, expected):
                 "coverage": "top-level-only", "schema_validation": "not-performed",
                 "license_review": "not-performed", "provenance_review": "not-performed",
                 "execution_approved": False}
+        if component_detail:
+            report["schema"] = "aegis-sbom-component-evidence-v1"
+            report["components"] = rows
+            report["repeated_exact_purl_groups"] = sum(count > 1 for count in purl_counts.values())
+            report["purl_validation"] = "not-performed"
+            report["license_expression_validation"] = "not-performed"
+            report["dependency_linkage_review"] = "not-performed"
+        return report
     except (ValueError, TypeError, RecursionError):
         return None
 
 
-def embedded_sbom_summary(data, expected, sbom_expected):
+def embedded_sbom_summary(data, expected, sbom_expected, *, component_detail=False):
     if inspect_bytes(data, expected) != "DigestAndMetadataMatch":
         return None
     try:
@@ -316,7 +334,7 @@ def embedded_sbom_summary(data, expected, sbom_expected):
                 raw = stream.read(MAX_SBOM + 1)
             if len(raw) != item.file_size:
                 return None
-        return sbom_summary(raw, sbom_expected)
+        return sbom_summary(raw, sbom_expected, component_detail=component_detail)
     except (KeyError, OSError, ValueError, zipfile.BadZipFile, RuntimeError):
         return None
 
@@ -509,6 +527,53 @@ class Fixtures(unittest.TestCase):
         absent = self.wheel()
         self.assertIsNone(embedded_sbom_summary(absent, hashlib.sha256(absent).hexdigest(), member_hash))
 
+    def test_component_evidence_keeps_exact_declarations(self):
+        obj = {"bomFormat": "CycloneDX", "specVersion": "1.5", "components": [
+            {"name": "fixture", "version": "1", "purl": "pkg:cargo/fixture@1", "bom-ref": "a",
+             "licenses": [{"expression": "MIT OR LGPL-2.1-or-later"}]},
+            {"name": "fixture", "version": "1", "purl": "pkg:cargo/fixture@1", "bom-ref": "b",
+             "licenses": [{"expression": "Apache-2.0  OR  MIT"}]},
+            {"name": "missing"}]}
+        raw = json.dumps(obj).encode()
+        digest = hashlib.sha256(raw).hexdigest()
+        summary = sbom_summary(raw, digest)
+        detail = sbom_summary(raw, digest, component_detail=True)
+        self.assertNotIn("components", summary)
+        self.assertEqual(detail, sbom_summary(raw, digest, component_detail=True))
+        self.assertEqual(detail["repeated_exact_purl_groups"], 1)
+        self.assertEqual([r["source_index"] for r in detail["components"]], [0, 1, 2])
+        self.assertEqual(detail["components"][0]["declared_licenses"], ["expression:MIT OR LGPL-2.1-or-later"])
+        self.assertEqual(detail["components"][1]["declared_licenses"], ["expression:Apache-2.0  OR  MIT"])
+        self.assertIsNone(detail["components"][2]["declared_purl"])
+        self.assertTrue(all(r["review_status"] == "pending" for r in detail["components"]))
+        self.assertEqual(detail["purl_validation"], "not-performed")
+        self.assertFalse(detail["execution_approved"])
+
+    def test_component_evidence_does_not_upgrade_invalid_metadata(self):
+        obj = {"bomFormat": "CycloneDX", "specVersion": "1.5", "components": [
+            {"name": "fixture", "version": 1, "purl": "bad\nvalue", "licenses": []}]}
+        raw = json.dumps(obj).encode()
+        detail = sbom_summary(raw, hashlib.sha256(raw).hexdigest(), component_detail=True)
+        self.assertIsNone(detail["components"][0]["version"])
+        self.assertIsNone(detail["components"][0]["declared_purl"])
+        self.assertEqual(detail["components"][0]["declared_licenses"], [])
+        self.assertEqual(detail["missing_version"], 1)
+        self.assertEqual(detail["missing_purl"], 1)
+        self.assertIsNone(sbom_summary(raw, "0" * 64, component_detail=True))
+        obj["components"][0]["licenses"] = [{"license": {"id": "MIT", "name": "other"}}]
+        raw = json.dumps(obj).encode()
+        self.assertIsNone(sbom_summary(raw, hashlib.sha256(raw).hexdigest(), component_detail=True))
+
+    def test_component_evidence_requires_both_pinned_digests(self):
+        raw = b'{"bomFormat":"CycloneDX","specVersion":"1.5","components":[{"name":"fixture"}]}'
+        data = self.wheel(member=SBOM_MEMBER, member_data=raw)
+        digest = hashlib.sha256(data).hexdigest()
+        member_hash = hashlib.sha256(raw).hexdigest()
+        result = embedded_sbom_summary(data, digest, member_hash, component_detail=True)
+        self.assertEqual(result["components"][0]["name"], "fixture")
+        self.assertIsNone(embedded_sbom_summary(data, digest, "0" * 64, component_detail=True))
+        self.assertIsNone(embedded_sbom_summary(data, "0" * 64, member_hash, component_detail=True))
+
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-test"]:
@@ -525,13 +590,14 @@ if __name__ == "__main__":
         if evidence is None:
             sys.exit("Candidate inventory unavailable; preflight required.")
         print(json.dumps(evidence, sort_keys=True, ensure_ascii=True))
-    elif len(sys.argv) == 3 and sys.argv[1] == "--sbom-summary":
+    elif len(sys.argv) == 3 and sys.argv[1] in ("--sbom-summary", "--sbom-components"):
         try:
-            evidence = embedded_sbom_summary(read_candidate(sys.argv[2]), SHA256, SBOM_SHA256)
+            evidence = embedded_sbom_summary(read_candidate(sys.argv[2]), SHA256, SBOM_SHA256,
+                                             component_detail=sys.argv[1] == "--sbom-components")
         except (OSError, ValueError):
             evidence = None
         if evidence is None:
             sys.exit("Candidate SBOM summary unavailable; review required.")
         print(json.dumps(evidence, sort_keys=True, ensure_ascii=True))
     else:
-        sys.exit("Use --self-test, --inspect, --inventory or --sbom-summary with the explicitly selected offline candidate.")
+        sys.exit("Use --self-test, --inspect, --inventory --sbom-summary or --sbom-components with the explicitly selected offline candidate.")
