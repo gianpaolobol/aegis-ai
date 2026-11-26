@@ -3,6 +3,9 @@
 name: AV candidate acquisition (no execution)
 on:
   workflow_dispatch:
+  push:
+    branches: [dev/ade-bootstrap-002]
+    paths: ['.github/workflows/av-candidate-acquisition.yml']
 permissions:
   contents: read
 jobs:
@@ -27,7 +30,8 @@ jobs:
           python -I lab/av/verify_wheel.py --inspect "$candidate"
           python -I lab/av/verify_wheel.py --inventory "$candidate"
           python -I lab/av/verify_wheel.py --self-test
-          python -I lab/av/verify_wheel.py --sbom-summary "$candidate"
+          python -I lab/av/verify_wheel.py --sbom-components "$candidate" > "$tmp/components.json"
+          python -I -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); rows=d.pop("components"); print("AEGIS_SBOM_SUMMARY "+json.dumps(d,sort_keys=True,ensure_ascii=True)); [print("AEGIS_SBOM_ROW "+json.dumps(row,sort_keys=True,ensure_ascii=True)) for row in rows]' "$tmp/components.json"
           echo 'Acquired and inventoried only; no execution, independent attestation or licensing approval.'
           rm -rf -- "$tmp"
           test ! -e "$tmp"
