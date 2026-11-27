@@ -30,6 +30,18 @@ SOURCE_OBSERVATIONS = (
     ("pkg:cargo/linux-raw-sys@0.12.1", "linux-raw-sys", "0.12.1",
      "expression:Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
      "https://docs.rs/crate/linux-raw-sys/latest/source/Cargo.toml", "2026-11-27"),
+    ("pkg:cargo/allocator-api2@0.2.21", "allocator-api2", "0.2.21",
+     "expression:MIT OR Apache-2.0",
+     "https://docs.rs/crate/allocator-api2/0.2.21/source/Cargo.toml", "2026-11-27"),
+    ("pkg:cargo/base64ct@1.8.3", "base64ct", "1.8.3",
+     "expression:Apache-2.0 OR MIT",
+     "https://docs.rs/crate/base64ct/1.8.3/source/Cargo.toml", "2026-11-27"),
+    ("pkg:cargo/bincode@2.0.1", "bincode", "2.0.1",
+     "expression:MIT",
+     "https://docs.rs/crate/bincode/2.0.1/source/Cargo.toml", "2026-11-27"),
+    ("pkg:cargo/bincode_derive@2.0.1", "bincode_derive", "2.0.1",
+     "expression:MIT",
+     "https://docs.rs/crate/bincode_derive/2.0.1/source/Cargo.toml", "2026-11-27"),
 )
 
 def unique_object(pairs):
@@ -102,6 +114,8 @@ def retained_review_queue(raw):
             return None
         result["retained_report_sha256"] = REPORT_SHA256
         result["source_declaration_comparison"] = evidence
+        result["batch_comparison_coverage"] = batch_comparison_coverage(
+            result["license_review_batches"], evidence["observations"])
     return result
 
 # Narrow retained inventory profile, not a general PURL parser. Workspace
@@ -138,6 +152,28 @@ def review_batches(queue):
              "component_count": len(purls), "declared_purls": sorted(purls),
              "license_review": "not-performed", "linkage_review": "not-performed"}
             for (scope, licenses), purls in sorted(groups.items())]
+
+def batch_comparison_coverage(batches, observations):
+    """Prioritize incomplete batches without treating comparison as clearance."""
+    scopes = {row["declared_purl"]: row["source_url_scope"] for row in observations}
+    output = []
+    for batch in batches:
+        purls = batch["declared_purls"]
+        versioned = sum(scopes.get(p) == "versioned-url" for p in purls)
+        mutable = sum(scopes.get(p) == "mutable-url" for p in purls)
+        output.append({
+            "source_identity_scope": batch["source_identity_scope"],
+            "declared_licenses": batch["declared_licenses"],
+            "component_count": len(purls),
+            "versioned_url_matches": versioned,
+            "mutable_url_matches": mutable,
+            "not_cross_checked": len(purls) - versioned - mutable,
+            "pending_declared_purls": [p for p in purls if p not in scopes],
+            "license_review": "not-performed",
+            "linkage_review": "not-performed",
+            "execution_approved": False,
+        })
+    return output
 
 def review_queue(raw):
     if type(raw) is not bytes or len(raw) > MAX_BYTES:
@@ -387,6 +423,30 @@ class Fixtures(unittest.TestCase):
         batches = self.run_obj(obj)["license_review_batches"]
         self.assertEqual(len(batches), 1)
         self.assertEqual(batches[0]["component_count"], 2)
+
+    def test_batch_comparison_coverage_remains_advisory(self):
+        result = self.run_obj(self.fixture())
+        rows = result["queue"]
+        observation = ("pkg:cargo/fixture-a@1", "fixture-a", "1",
+                       "expression:MIT", "https://docs.rs/crate/fixture-a/latest", "2026-11-27")
+        evidence = reconcile_observations(rows, [observation])
+        coverage = batch_comparison_coverage(result["license_review_batches"], evidence["observations"])
+        self.assertEqual(sum(b["component_count"] for b in coverage), 2)
+        self.assertEqual(sum(b["mutable_url_matches"] for b in coverage), 1)
+        self.assertEqual(sum(b["versioned_url_matches"] for b in coverage), 0)
+        self.assertEqual(sum(b["not_cross_checked"] for b in coverage), 1)
+        self.assertEqual([p for b in coverage for p in b["pending_declared_purls"]],
+                         ["pkg:cargo/fixture-b@1"])
+        self.assertTrue(all(not b["execution_approved"] and b["license_review"] == "not-performed"
+                            and b["linkage_review"] == "not-performed" for b in coverage))
+        empty = batch_comparison_coverage(result["license_review_batches"], [])
+        self.assertEqual(sum(b["not_cross_checked"] for b in empty), 2)
+        changed = list(observation)
+        changed[4] = "https://docs.rs/crate/fixture-a/1"
+        exact = reconcile_observations(rows, [changed])
+        exact_coverage = batch_comparison_coverage(result["license_review_batches"], exact["observations"])
+        self.assertEqual(sum(b["versioned_url_matches"] for b in exact_coverage), 1)
+        self.assertEqual(sum(b["mutable_url_matches"] for b in exact_coverage), 0)
 
     def test_duplicate_json_and_size(self):
         self.assertIsNone(review_queue(b'{"schema":0,"schema":1}'))
