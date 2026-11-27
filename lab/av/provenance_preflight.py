@@ -53,6 +53,23 @@ def uint_text(value):
         raise ValueError("integer out of range")
     return number
 
+def expected_path_length(index, size):
+    """Structural sibling count for a binary Merkle tree, RFC 9162 §2.1.3.1.
+    No hashes are computed or trusted. Inputs are bounded uint_text values.
+    """
+    if not 0 <= index < size:
+        raise ValueError("invalid tree coordinates")
+    count = 0
+    while size > 1:
+        split = 1 << ((size - 1).bit_length() - 1)
+        if index < split:
+            size = split
+        else:
+            index -= split
+            size -= split
+        count += 1
+    return count
+
 def transparency_shape(entry):
     """Check a narrow Rekor v1 envelope shape, never its authenticity."""
     if type(entry) is not dict or entry["kindVersion"] != {"kind": "dsse", "version": "0.0.1"}:
@@ -65,12 +82,15 @@ def transparency_shape(entry):
     b64(entry["canonicalizedBody"], 65536)
     b64(entry["inclusionPromise"]["signedEntryTimestamp"], 4096)
     proof = entry["inclusionProof"]
-    if uint_text(proof["logIndex"]) >= uint_text(proof["treeSize"]):
+    tree_index = uint_text(proof["logIndex"])
+    tree_size = uint_text(proof["treeSize"])
+    if tree_index >= tree_size:
         return False
     if len(b64(proof["rootHash"], 32)) != 32:
         return False
     hashes = proof["hashes"]
-    if type(hashes) is not list or len(hashes) > 64:
+    if (type(hashes) is not list or len(hashes) > 64
+            or len(hashes) != expected_path_length(tree_index, tree_size)):
         return False
     if any(len(b64(item, 32)) != 32 for item in hashes):
         return False
@@ -117,6 +137,11 @@ def preflight(raw):
         if type(entries) is not list or not 1 <= len(entries) <= 8:
             return None
         if not all(transparency_shape(entry) for entry in entries):
+            return None
+        # Global log index and inclusion-proof tree index are different
+        # coordinates; do not equate them. Reject repeated log observations.
+        keys = [(entry["logId"]["keyId"], entry["logIndex"]) for entry in entries]
+        if len(set(keys)) != len(keys):
             return None
         return {"schema": "aegis-provenance-preflight-v1",
                 "provenance_sha256": hashlib.sha256(raw).hexdigest(),
@@ -233,6 +258,35 @@ class Fixtures(unittest.TestCase):
             obj = self.fixture()
             self.att(obj)["verification_material"]["transparency_entries"][0]["inclusionProof"][field] = value
             self.assertIsNone(self.run_obj(obj))
+    def test_merkle_path_cardinality(self):
+        for size, counts in ((1, [0]), (2, [1, 1]), (3, [2, 2, 1]),
+                             (5, [3, 3, 3, 3, 1]), (8, [3] * 8)):
+            for index, count in enumerate(counts):
+                self.assertEqual(expected_path_length(index, size), count)
+                for supplied in range(0, 5):
+                    obj = self.fixture()
+                    proof = self.att(obj)["verification_material"]["transparency_entries"][0]["inclusionProof"]
+                    proof["logIndex"], proof["treeSize"] = str(index), str(size)
+                    proof["hashes"] = [proof["rootHash"]] * supplied
+                    result = self.run_obj(obj)
+                    if supplied == count:
+                        self.assertIsNotNone(result)
+                        self.assertFalse(result["execution_approved"])
+                    else:
+                        self.assertIsNone(result)
+        self.assertEqual(expected_path_length(0, 2**63 - 1), 63)
+        with self.assertRaises(ValueError):
+            expected_path_length(1, 1)
+
+    def test_duplicate_log_observation(self):
+        obj = self.fixture()
+        entries = self.att(obj)["verification_material"]["transparency_entries"]
+        entries.append(dict(entries[0]))
+        self.assertIsNone(self.run_obj(obj))
+        # Distinct global index remains structurally admissible, not verified.
+        entries[1]["logIndex"] = "4"
+        self.assertIsNotNone(self.run_obj(obj))
+
     def test_bounds_and_shapes(self):
         for raw in (b"", b"x" * (MAX_BYTES + 1), b"[]", b"null", b"\xff"):
             self.assertIsNone(preflight(raw))
