@@ -1,5 +1,6 @@
 # Copyright 2026 Gian Paolo Franceschini. See LICENSE.
 """Offline review queue for retained declarations; never approves execution or distribution."""
+import hashlib
 import json
 import sys
 import unittest
@@ -8,6 +9,7 @@ from pathlib import Path
 
 WHEEL = "ce52bbf23683f47515bf493ee3d7c8346f3742c0dc5c654c389b8495b3dbfaca"
 SBOM = "dac154f8c401cf5f6270c646c2f828a73bc38ed22629c0fc09d75b65ec030e23"
+REPORT_SHA256 = "64a6fe87a2de29eb6787a01aca7e9e7f698a3a5284587f1507a6fe6a3e008a83"
 REPORT = Path(__file__).resolve().parents[2] / "docs/evidence/yara-x-1.24.0-win-amd64-sbom-components.json"
 MAX_BYTES = 1024 * 1024
 
@@ -26,6 +28,19 @@ def text_label(value):
     return (type(value) is str and 0 < len(value) <= 512
             and bool(value.strip()) and all(32 <= ord(c) <= 126 for c in value))
 
+def matches_report(raw, expected_sha256):
+    """Exact retained bytes only; not upstream provenance or license clearance."""
+    return (type(raw) is bytes and 1 <= len(raw) <= MAX_BYTES
+            and hashlib.sha256(raw).hexdigest() == expected_sha256)
+
+def retained_review_queue(raw):
+    if not matches_report(raw, REPORT_SHA256):
+        return None
+    result = review_queue(raw)
+    if result is not None:
+        result["retained_report_sha256"] = REPORT_SHA256
+    return result
+
 def review_queue(raw):
     if type(raw) is not bytes or len(raw) > MAX_BYTES:
         return None
@@ -36,7 +51,12 @@ def review_queue(raw):
                 or obj.get("sbom_sha256") != SBOM or obj.get("coverage") != "top-level-only"
                 or obj.get("execution_approved") is not False
                 or obj.get("license_review") != "not-performed"
-                or obj.get("provenance_review") != "not-performed"):
+                or obj.get("provenance_review") != "not-performed"
+                or any(obj.get(field) != "not-performed" for field in (
+                    "dependency_linkage_review", "license_expression_validation",
+                    "purl_validation", "schema_validation"))
+                or type(obj.get("components_with_nested_entries")) is not int
+                or obj["components_with_nested_entries"] != 0):
             return None
         if obj.get("source", {}).get("wheel_sha256") != WHEEL:
             return None
@@ -102,6 +122,10 @@ class Fixtures(unittest.TestCase):
         return {"schema":"aegis-sbom-component-evidence-v1", "sbom_sha256":SBOM,
                 "coverage":"top-level-only", "execution_approved":False,
                 "license_review":"not-performed", "provenance_review":"not-performed",
+                "dependency_linkage_review":"not-performed",
+                "license_expression_validation":"not-performed",
+                "purl_validation":"not-performed", "schema_validation":"not-performed",
+                "components_with_nested_entries":0,
                 "source":{"wheel_sha256":WHEEL}, "top_level_components":2,
                 "missing_declared_license":0,"missing_purl":0,"missing_version":0,
                 "repeated_exact_purl_groups":0,
@@ -119,6 +143,31 @@ class Fixtures(unittest.TestCase):
         self.assertEqual(r["queue"][0]["name"], "fixture-b")
         self.assertFalse(r["execution_approved"])
         self.assertEqual(r["license_review"], "not-performed")
+    def test_retained_bytes_gate(self):
+        # No actual wheel or external data: the parser and exact-byte gate are separate.
+        raw = json.dumps(self.fixture()).encode()
+        expected = hashlib.sha256(raw).hexdigest()
+        self.assertTrue(matches_report(raw, expected))
+        self.assertFalse(matches_report(raw + b" ", expected))
+        self.assertIsNotNone(review_queue(raw + b" "))
+        self.assertIsNone(retained_review_queue(raw))
+        self.assertIsNone(retained_review_queue(raw + b" "))
+        self.assertFalse(matches_report(b"", hashlib.sha256(b"").hexdigest()))
+        oversized = b"x" * (MAX_BYTES + 1)
+        self.assertFalse(matches_report(oversized, hashlib.sha256(oversized).hexdigest()))
+
+    def test_unreviewed_scope_required(self):
+        for field in ("dependency_linkage_review", "license_expression_validation",
+                      "purl_validation", "schema_validation"):
+            for value in ("passed", None):
+                obj = self.fixture()
+                obj[field] = value
+                self.assertIsNone(self.run_obj(obj))
+        for value in (True, 1, None):
+            obj = self.fixture()
+            obj["components_with_nested_entries"] = value
+            self.assertIsNone(self.run_obj(obj))
+
     def test_wrong_binding(self):
         for field in ("sbom_sha256","source"):
             obj = self.fixture()
@@ -162,7 +211,7 @@ def main():
     elif sys.argv[1:] == ["--review-queue"]:
         try:
             with REPORT.open("rb") as stream:
-                result = review_queue(stream.read(MAX_BYTES + 1))
+                result = retained_review_queue(stream.read(MAX_BYTES + 1))
         except OSError:
             result = None
         if result is None:
