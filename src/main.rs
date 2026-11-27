@@ -122,6 +122,15 @@ fn run(args: &[OsString]) -> (i32, String) {
                 other => report.push_str(&format!("{label}: {other:?}\n")),
             }
         }
+        use aegis_policy::wifi::{compare_baseline, BaselineFixture, ScopedObservation};
+        let baseline = BaselineFixture { scope: 1, approved_at: 100, reviewed: true,
+            metadata: Metadata { security: SecurityMode::Wpa3Personal, wps: Reported::No, pmf: Pmf::Required } };
+        let current = ScopedObservation { scope: 1, at: 120, observation: Observation::Observed(
+            Metadata { security: SecurityMode::Wpa2Personal, wps: Reported::Unknown, pmf: Pmf::Disabled }) };
+        report.push_str(&format!("fixture-baseline: {:?}; change is not proof of an evil twin\n",
+            compare_baseline(baseline, current, 125)));
+        report.push_str(&format!("fixture-other-scope: {:?}\n",
+            compare_baseline(baseline, ScopedObservation { scope: 2, ..current }, 125)));
         return (0, report);
     }
     if arg == OsStr::new("demo-incidents") {

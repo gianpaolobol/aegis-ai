@@ -67,6 +67,9 @@ fn synthetic_demos_have_expected_results() {
     assert!(stdout(&wifi).contains("PermissionDenied"));
     assert!(stdout(&wifi).contains("safety not established"));
     assert!(stdout(&wifi).contains("no scan"));
+    assert!(stdout(&wifi).contains("fixture-baseline: Compared { security: Changed, wps: Unknown, pmf: Changed }"));
+    assert!(stdout(&wifi).contains("change is not proof of an evil twin"));
+    assert!(stdout(&wifi).contains("fixture-other-scope: ScopeMismatch"));
     assert!(wifi.stderr.is_empty());
 }
 #[test]

@@ -140,3 +140,105 @@ mod tests {
         assert_eq!(security_mode_changed(Wpa3Personal, Unknown), None);
     }
 }
+
+// Baseline comparison uses fictional opaque scope IDs and synthetic clock ticks.
+// No inference about SSID identity, authentication or actual network safety.
+pub const BASELINE_MAX_AGE: u64 = 86_400;
+pub const OBSERVATION_MAX_AGE: u64 = 30;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScopedObservation {
+    pub scope: u64,
+    pub at: u64,
+    pub observation: Observation,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BaselineFixture {
+    pub scope: u64,
+    pub approved_at: u64,
+    pub reviewed: bool,
+    pub metadata: Metadata,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldChange { Same, Changed, Unknown }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Comparison {
+    InvalidBaseline, ScopeMismatch, StaleObservation, Unavailable,
+    PermissionDenied,
+    Compared { security: FieldChange, wps: FieldChange, pmf: FieldChange },
+}
+fn compare_field<T: PartialEq>(a: T, b: T, unknown: T) -> FieldChange {
+    if a == unknown || b == unknown { FieldChange::Unknown }
+    else if a == b { FieldChange::Same }
+    else { FieldChange::Changed }
+}
+/// Pure advisory. The caller-supplied scope and approval labels are not
+/// authenticated; production adapters require separately verified scope.
+pub fn compare_baseline(b: BaselineFixture, o: ScopedObservation, now: u64) -> Comparison {
+    if !b.reviewed || b.scope == 0 ||
+        !now.checked_sub(b.approved_at).is_some_and(|age| age <= BASELINE_MAX_AGE) {
+        return Comparison::InvalidBaseline;
+    }
+    if o.scope != b.scope { return Comparison::ScopeMismatch; }
+    if o.at < b.approved_at ||
+        !now.checked_sub(o.at).is_some_and(|age| age <= OBSERVATION_MAX_AGE) {
+        return Comparison::StaleObservation;
+    }
+    match o.observation {
+        Observation::Unavailable => Comparison::Unavailable,
+        Observation::PermissionDenied => Comparison::PermissionDenied,
+        Observation::Observed(m) => Comparison::Compared {
+            security: compare_field(b.metadata.security, m.security, SecurityMode::Unknown),
+            wps: compare_field(b.metadata.wps, m.wps, Reported::Unknown),
+            pmf: compare_field(b.metadata.pmf, m.pmf, Pmf::Unknown),
+        },
+    }
+}
+#[cfg(test)]
+mod baseline_tests {
+    use super::*;
+    fn baseline() -> BaselineFixture {
+        BaselineFixture { scope: 1, approved_at: 100, reviewed: true,
+            metadata: Metadata { security: SecurityMode::Wpa3Personal, wps: Reported::No, pmf: Pmf::Required } }
+    }
+    fn current() -> ScopedObservation {
+        ScopedObservation { scope: 1, at: 120, observation: Observation::Observed(baseline().metadata) }
+    }
+    #[test]
+    fn per_field_changes_and_unknowns() {
+        use FieldChange::*;
+        let b = baseline();
+        assert_eq!(compare_baseline(b, current(), 125), Comparison::Compared { security: Same, wps: Same, pmf: Same });
+        let m = Metadata { security: SecurityMode::Wpa2Personal, wps: Reported::Unknown, pmf: Pmf::Disabled };
+        assert_eq!(compare_baseline(b, ScopedObservation { observation: Observation::Observed(m), ..current() }, 125),
+            Comparison::Compared { security: Changed, wps: Unknown, pmf: Changed });
+        let unknown = Metadata { security: SecurityMode::Unknown, wps: Reported::Unknown, pmf: Pmf::Unknown };
+        assert_eq!(compare_baseline(BaselineFixture { metadata: unknown, ..b }, current(), 125),
+            Comparison::Compared { security: Unknown, wps: Unknown, pmf: Unknown });
+    }
+    #[test]
+    fn approval_scope_and_clock_boundaries() {
+        let b = baseline();
+        for invalid in [BaselineFixture { reviewed: false, ..b }, BaselineFixture { scope: 0, ..b },
+            BaselineFixture { approved_at: 126, ..b }] {
+            assert_eq!(compare_baseline(invalid, current(), 125), Comparison::InvalidBaseline);
+        }
+        for scope in [0, 2] {
+            assert_eq!(compare_baseline(b, ScopedObservation { scope, ..current() }, 125), Comparison::ScopeMismatch);
+        }
+        for at in [94, 99, 126, u64::MAX] {
+            assert_eq!(compare_baseline(b, ScopedObservation { at, ..current() }, 125), Comparison::StaleObservation);
+        }
+        assert_eq!(compare_baseline(b, current(), 151), Comparison::StaleObservation);
+        assert!(matches!(compare_baseline(b, current(), 150), Comparison::Compared { .. }));
+        let now = b.approved_at + BASELINE_MAX_AGE;
+        assert!(matches!(compare_baseline(b, ScopedObservation { at: now, ..current() }, now), Comparison::Compared { .. }));
+        assert_eq!(compare_baseline(b, ScopedObservation { at: now + 1, ..current() }, now + 1), Comparison::InvalidBaseline);
+    }
+    #[test]
+    fn unavailable_and_permission_denial_remain_distinct() {
+        for (observation, expected) in [(Observation::Unavailable, Comparison::Unavailable),
+            (Observation::PermissionDenied, Comparison::PermissionDenied)] {
+            assert_eq!(compare_baseline(baseline(), ScopedObservation { observation, ..current() }, 125), expected);
+        }
+    }
+}
