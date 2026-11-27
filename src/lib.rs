@@ -1198,6 +1198,67 @@ pub mod incident {
         Ok(Some(EvidenceGraph { nodes, edges }))
     }
 
+
+    /// XDR-04: connected components of a validated synthetic evidence graph.
+    /// A component is a review cluster, NOT an incident or a causal chain.
+    /// Transitive connectivity can span more than the pairwise time window.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ReviewCluster {
+        pub event_ids: Vec<u32>,
+        pub first_seconds: u64,
+        pub last_seconds: u64,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct ClusterSummary {
+        pub clusters: Vec<ReviewCluster>,
+        pub isolated_advisories: usize,
+        pub normal_observations: usize,
+    }
+    /// Only clusters with at least one edge are returned. Isolated non-normal
+    /// observations remain visible as a separate count, never a safety verdict.
+    /// All data is bounded by current_graph; no external graph is accepted.
+    pub fn current_clusters(events: &[Event], asset: u32, now: u64)
+        -> Result<Option<ClusterSummary>, GraphError> {
+        let Some(graph) = current_graph(events, asset, now)? else { return Ok(None); };
+        let mut neighbors = BTreeMap::<u32, Vec<u32>>::new();
+        for edge in &graph.edges {
+            neighbors.entry(edge.first_event).or_default().push(edge.second_event);
+            neighbors.entry(edge.second_event).or_default().push(edge.first_event);
+        }
+        let mut visited = BTreeSet::new();
+        let mut clusters = Vec::new();
+        let mut isolated_advisories = 0;
+        let mut normal_observations = 0;
+        // Nodes are already sorted by time and ID. Mark on enqueue to bound
+        // stack growth, then project each component in that same stable order.
+        for node in &graph.nodes {
+            if node.signal == Signal::Normal { normal_observations += 1; continue; }
+            if !neighbors.contains_key(&node.id) { isolated_advisories += 1; continue; }
+            if !visited.insert(node.id) { continue; }
+            let mut component = BTreeSet::from([node.id]);
+            let mut pending = vec![node.id];
+            while let Some(id) = pending.pop() {
+                if let Some(adjacent) = neighbors.get(&id) {
+                    for &next in adjacent {
+                        if visited.insert(next) {
+                            component.insert(next);
+                            pending.push(next);
+                        }
+                    }
+                }
+            }
+            let members: Vec<_> = graph.nodes.iter().filter(|n| component.contains(&n.id)).collect();
+            // The seed is in the validated node list, so members cannot be empty.
+            let Some(first) = members.first() else { continue; };
+            let Some(last) = members.last() else { continue; };
+            clusters.push(ReviewCluster {
+                event_ids: members.iter().map(|n| n.id).collect(),
+                first_seconds: first.seconds, last_seconds: last.seconds,
+            });
+        }
+        Ok(Some(ClusterSummary { clusters, isolated_advisories, normal_observations }))
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1317,6 +1378,50 @@ pub mod incident {
                 Err(GraphError::InvalidTimeline(TimelineError::InvalidBatch(Error::DuplicateEvent))));
             assert_eq!(current_graph(&[],0,0),Err(GraphError::InvalidTimeline(TimelineError::InvalidAsset)));
             assert_eq!(current_graph(&[],1,0),Ok(None));
+        }
+
+        #[test] fn clusters_keep_transitive_connections_and_unlinked_observations() {
+            let a = [e(6,2,0,PolicyDenied), e(5,1,600,Normal),
+                e(4,1,600,IntegrityMismatch), e(3,1,300,PolicyDenied),
+                e(2,1,0,IntegrityMismatch), e(1,1,0,Normal)];
+            let result = current_clusters(&a,1,600).unwrap().unwrap();
+            assert_eq!(result.clusters, vec![ReviewCluster {
+                event_ids: vec![2,3,4], first_seconds: 0, last_seconds: 600 }]);
+            assert_eq!((result.isolated_advisories,result.normal_observations),(0,2));
+            let mut b = a; b.reverse();
+            assert_eq!(current_clusters(&b,1,600),Ok(Some(result)));
+            let other = current_clusters(&a,2,600).unwrap().unwrap();
+            assert!(other.clusters.is_empty());
+            assert_eq!(other.isolated_advisories,1);
+        }
+        #[test] fn clusters_preserve_disconnected_groups_and_isolated_signals() {
+            let a = [e(1,1,0,IntegrityMismatch),e(2,1,0,PolicyDenied),
+                e(3,1,600,IntegrityMismatch),e(4,1,600,PolicyDenied),
+                e(5,1,300,Normal),e(6,2,1,NativeProtectionDisabled)];
+            let result = current_clusters(&a,1,600).unwrap().unwrap();
+            assert_eq!(result.clusters.iter().map(|c| c.event_ids.clone()).collect::<Vec<_>>(),
+                vec![vec![1,2],vec![3,4]]);
+            assert_eq!((result.isolated_advisories,result.normal_observations),(0,1));
+            let isolated = [e(1,1,0,PolicyDenied),e(2,1,600,PolicyDenied),e(3,1,0,Normal)];
+            let s = current_clusters(&isolated,1,600).unwrap().unwrap();
+            assert!(s.clusters.is_empty());
+            assert_eq!((s.isolated_advisories,s.normal_observations),(2,1));
+        }
+        #[test] fn clusters_inherit_full_snapshot_and_edge_bounds() {
+            let a = [e(1,1,0,Normal),e(2,2,601,Normal)];
+            assert_eq!(current_clusters(&a,1,600),Err(GraphError::InvalidTimeline(TimelineError::FutureEvent)));
+            assert_eq!(current_clusters(&a,2,601),Err(GraphError::InvalidTimeline(TimelineError::StaleSnapshot)));
+            assert_eq!(current_clusters(&[a[0],a[0]],1,0),
+                Err(GraphError::InvalidTimeline(TimelineError::InvalidBatch(Error::DuplicateEvent))));
+            assert_eq!(current_clusters(&[],0,0),Err(GraphError::InvalidTimeline(TimelineError::InvalidAsset)));
+            assert_eq!(current_clusters(&[],1,0),Ok(None));
+            let mut crowded: Vec<_> = (1..=48).map(|id| e(id,1,0,
+                if id <= 16 { IntegrityMismatch } else { PolicyDenied })).collect();
+            let s = current_clusters(&crowded,1,0).unwrap().unwrap();
+            assert_eq!(s.clusters.len(),1);
+            assert_eq!(s.clusters[0].event_ids.len(),48);
+            crowded.push(e(49,1,0,PolicyDenied));
+            assert_eq!(current_clusters(&crowded,1,0),Err(GraphError::EdgeLimit));
         }
         #[test] fn graph_edge_capacity_never_returns_partial_result() {
             let mut a: Vec<_> = (1..=48).map(|id| e(id,1,0,

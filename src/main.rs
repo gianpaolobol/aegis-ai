@@ -134,7 +134,7 @@ fn run(args: &[OsString]) -> (i32, String) {
         return (0, report);
     }
     if arg == OsStr::new("demo-incidents") {
-        use aegis_policy::incident::{correlate, current_timeline, current_graph, Event, Signal, TimelineError, GraphError};
+        use aegis_policy::incident::{correlate, current_timeline, current_graph, current_clusters, Event, Signal, TimelineError, GraphError};
         let events = [
             Event { id: 1, asset: 1, seconds: 0, signal: Signal::IntegrityMismatch },
             Event { id: 2, asset: 1, seconds: 60, signal: Signal::PolicyDenied },
@@ -171,6 +171,18 @@ fn run(args: &[OsString]) -> (i32, String) {
                     return (1, "Synthetic evidence graph capacity check failed.\n".into());
                 }
                 report.push_str("Graph capacity exceeded: rejected, no partial graph.\n");
+                match (current_clusters(&events,1,60), current_clusters(&events,2,60),
+                    current_clusters(&events,3,60)) {
+                    (Ok(Some(a)),Ok(Some(b)),Ok(Some(c))) if a.clusters.len() == 1
+                        && a.clusters[0].event_ids == vec![1,2]
+                        && b.clusters.is_empty() && b.isolated_advisories == 1
+                        && c.normal_observations == 1 =>
+                        report.push_str("Synthetic review clusters: 1 connected group, 1 isolated advisory, 1 normal observation across fixture assets. Groups are not incidents or causal chains.\n"),
+                    _ => return (1, "Synthetic review cluster checks failed.\n".into()),
+                }
+                if current_clusters(&crowded,1,0) != Err(GraphError::EdgeLimit) {
+                    return (1, "Synthetic review cluster capacity check failed.\n".into());
+                }
                 return (0, report);
             }
             Err(_) => return (1, "Synthetic correlation unavailable.\n".into()),

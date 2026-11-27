@@ -97,7 +97,9 @@ fn incident_demo_reports_counts_and_limitations() {
                      "Unobserved asset: no evidence, not healthy.",
                      "Stale or future snapshot: rejected.",
                      "Synthetic evidence graph: 2 nodes, 1 co-occurrence edge; no causal inference.",
-                     "Graph capacity exceeded: rejected, no partial graph."] {
+                     "Graph capacity exceeded: rejected, no partial graph.",
+                     "Synthetic review clusters: 1 connected group, 1 isolated advisory, 1 normal observation",
+                     "Groups are not incidents or causal chains."] {
         assert!(stdout(&output).contains(expected));
     }
     assert!(output.stderr.is_empty());
