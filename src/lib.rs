@@ -8,6 +8,7 @@ pub mod response;
 pub mod mail_auth;
 pub mod recovery;
 pub mod nhi;
+pub mod gateway_session;
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Action { Read, Write, Export, Execute, ChangePolicy, Unknown }
 #[derive(Debug, PartialEq, Eq)]

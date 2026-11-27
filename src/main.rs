@@ -54,6 +54,31 @@ fn run(args: &[OsString]) -> (i32, String) {
             }
             if ledger.remaining() != 1 { return (1, report); }
         }
+        {
+            use aegis_policy::gateway_fixture::{Binding, Control, Grant, Verdict};
+            use aegis_policy::gateway_session::Session;
+            let a = Grant { id: [1;32], principal: [2;32], session: [3;32], resource: [4;32],
+                action: Action::Read, policy_version: 1, issued_at: 10, expires_at: 100 };
+            let b = Grant { id: [8;32], resource: [9;32], ..a };
+            let x = Binding { principal: a.principal, session: a.session, resource: a.resource,
+                action: a.action, payload_digest: [5;32], transaction: [6;32], policy_version: 1 };
+            let y = Binding { resource: b.resource, ..x };
+            let c = Control { policy_version: 1, stopped: false, revoked: false, now: 20 };
+            let Ok(mut s) = Session::new(&[(a, 2), (b, 2)], 2) else { return (1, report); };
+            report.push_str("Synthetic shared session budget; no real authorization.\n");
+            for (label, observed, expected) in [
+                ("session first grant", s.evaluate(a.id,x,c,None), Verdict::AcceptedFixtureOnly),
+                ("session cross-grant replay", s.evaluate(b.id,y,c,None), Verdict::Replay),
+                ("session second grant", s.evaluate(b.id,Binding { transaction: [7;32], ..y },c,None), Verdict::AcceptedFixtureOnly),
+                ("session shared budget", s.evaluate(a.id,Binding { transaction: [10;32], ..x },c,None), Verdict::BudgetExhausted),
+                ("session stop", s.evaluate(a.id,x,Control { stopped: true, ..c },None), Verdict::Stopped),
+                ("session stop across grants", s.evaluate(b.id,y,c,None), Verdict::Stopped),
+            ] {
+                report.push_str(&format!("{label}: {observed:?}\n"));
+                if observed != expected { return (1, report); }
+            }
+            if s.remaining() != 0 { return (1, report); }
+        }
         use aegis_policy::response::{plan, Proposal, Reservation, Role, Service, Snapshot, Verdict};
         let registry = [
             Service { id: 1, role: Role::Ordinary, impact: 2 },
