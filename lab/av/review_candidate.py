@@ -2,6 +2,7 @@
 """Offline review queue for retained declarations; never approves execution or distribution."""
 import hashlib
 import json
+import re
 import sys
 import unittest
 from collections import Counter
@@ -103,6 +104,41 @@ def retained_review_queue(raw):
         result["source_declaration_comparison"] = evidence
     return result
 
+# Narrow retained inventory profile, not a general PURL parser. Workspace
+# qualifiers are opaque evidence; never convert them to paths or fetch them.
+WORKSPACE_QUALIFIERS = {
+    "yara-x-fmt": "fmt", "yara-x": "lib", "yara-x-macros": "macros",
+    "yara-x-parser": "parser", "yara-x-proto": "proto",
+}
+
+def source_identity_scope(name, version, purl):
+    if not all(text_label(v) for v in (name, version, purl)):
+        return None
+    if (re.fullmatch(r"[A-Za-z0-9_-]+", name) is None
+            or re.fullmatch(r"[0-9A-Za-z.+-]+", version) is None):
+        return None
+    base = "pkg:cargo/" + name + "@" + version
+    if purl == base:
+        return "unqualified-cargo"
+    suffix = WORKSPACE_QUALIFIERS.get(name)
+    if (version == "1.24.0" and suffix is not None
+            and purl == base + "?download_url=file://..\\" + suffix):
+        return "workspace-qualified"
+    return None
+
+def review_batches(queue):
+    """Group exact declared expressions by source scope; no license choice.
+    Each row appears once. Keep separate package-level linkage/notice review.
+    """
+    groups = {}
+    for row in queue:
+        key = (row["source_identity_scope"], tuple(sorted(row["declared_licenses"])))
+        groups.setdefault(key, []).append(row["declared_purl"])
+    return [{"source_identity_scope": scope, "declared_licenses": list(licenses),
+             "component_count": len(purls), "declared_purls": sorted(purls),
+             "license_review": "not-performed", "linkage_review": "not-performed"}
+            for (scope, licenses), purls in sorted(groups.items())]
+
 def review_queue(raw):
     if type(raw) is not bytes or len(raw) > MAX_BYTES:
         return None
@@ -128,7 +164,7 @@ def review_queue(raw):
         if type(obj.get("top_level_components")) is not int or obj["top_level_components"] != len(rows):
             return None
         counts, flags = Counter(), Counter()
-        purls = set()
+        purls, identities = set(), set()
         queue = []
         for i, row in enumerate(rows):
             if type(row) is not dict or type(row.get("source_index")) is not int or row["source_index"] != i:
@@ -136,9 +172,11 @@ def review_queue(raw):
             if row.get("review_status") != "pending":
                 return None
             name, version, purl = (row.get(k) for k in ("name", "version", "declared_purl"))
-            if not all(text_label(v) for v in (name, version, purl)) or purl in purls:
+            scope = source_identity_scope(name, version, purl)
+            if scope is None or purl in purls or (name, version) in identities:
                 return None
             purls.add(purl)
+            identities.add((name, version))
             licenses = row.get("declared_licenses")
             if (type(licenses) is not list or not 1 <= len(licenses) <= 64
                     or not all(text_label(v) for v in licenses)
@@ -160,6 +198,7 @@ def review_queue(raw):
             flags.update(reasons)
             queue.append({"source_index": i, "name": name, "version": version,
                           "declared_purl": purl, "declared_licenses": licenses,
+                          "source_identity_scope": scope,
                           "review_reasons": reasons, "review_status": "pending"})
         declared = obj.get("declared_license_counts")
         if type(declared) is not dict or any(type(n) is not int or n <= 0 for n in declared.values()):
@@ -175,7 +214,10 @@ def review_queue(raw):
                 "declared_sbom_sha256": SBOM, "components": len(rows),
                 "license_groups": len(counts), "review_reason_counts": dict(sorted(flags.items())),
                 "license_review": "not-performed", "provenance_review": "not-performed",
-                "execution_approved": False, "queue": queue}
+                "execution_approved": False, "queue": queue,
+                "source_identity_scope_counts": dict(sorted(Counter(
+                    row["source_identity_scope"] for row in queue).items())),
+                "license_review_batches": review_batches(queue)}
     except (ValueError, TypeError, AttributeError, RecursionError):
         return None
 
@@ -302,6 +344,50 @@ class Fixtures(unittest.TestCase):
         obj = self.fixture()
         obj["components"][0]["source_index"] = False
         self.assertIsNone(self.run_obj(obj))
+    def test_source_identity_and_workspace_qualifiers(self):
+        self.assertEqual(source_identity_scope("fixture-a", "1", "pkg:cargo/fixture-a@1"),
+                         "unqualified-cargo")
+        local = "pkg:cargo/yara-x@1.24.0?download_url=file://..\\lib"
+        self.assertEqual(source_identity_scope("yara-x", "1.24.0", local),
+                         "workspace-qualified")
+        for wrong in ("pkg:pypi/yara-x@1.24.0", "pkg:cargo/yara-x@1.24.1",
+                      local + "&extra=1", local.replace("lib", "parser"),
+                      local.replace("file:", "https:"), "pkg:cargo/other@1.24.0"):
+            self.assertIsNone(source_identity_scope("yara-x", "1.24.0", wrong))
+        self.assertIsNone(source_identity_scope("yara-x", "1.24.1",
+                                               local.replace("1.24.0", "1.24.1")))
+        obj = self.fixture()
+        obj["components"][0]["declared_purl"] = "pkg:cargo/other@1"
+        self.assertIsNone(self.run_obj(obj))
+        obj = self.fixture()
+        obj["components"][0].update(name="yara-x", version="1.24.0", declared_purl=local)
+        obj["components"][1].update(name="yara-x", version="1.24.0",
+                                    declared_purl="pkg:cargo/yara-x@1.24.0")
+        self.assertIsNone(self.run_obj(obj))
+
+    def test_batches_partition_exact_declarations_without_clearance(self):
+        obj = self.fixture()
+        local = "pkg:cargo/yara-x@1.24.0?download_url=file://..\\lib"
+        obj["components"][1].update(name="yara-x", version="1.24.0",
+                                    declared_purl=local, declared_licenses=["expression:MIT"])
+        obj["declared_license_counts"] = {"expression:MIT": 2}
+        r = self.run_obj(obj)
+        self.assertEqual(r["source_identity_scope_counts"],
+                         {"unqualified-cargo": 1, "workspace-qualified": 1})
+        batches = r["license_review_batches"]
+        self.assertEqual(len(batches), 2)
+        self.assertEqual(sum(b["component_count"] for b in batches), 2)
+        self.assertEqual(sorted(p for b in batches for p in b["declared_purls"]),
+                         sorted(["pkg:cargo/fixture-a@1", local]))
+        self.assertTrue(all(b["license_review"] == b["linkage_review"] == "not-performed"
+                            for b in batches))
+        self.assertFalse(r["execution_approved"])
+        obj["components"][1].update(name="fixture-b", version="1",
+                                    declared_purl="pkg:cargo/fixture-b@1")
+        batches = self.run_obj(obj)["license_review_batches"]
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(batches[0]["component_count"], 2)
+
     def test_duplicate_json_and_size(self):
         self.assertIsNone(review_queue(b'{"schema":0,"schema":1}'))
         self.assertIsNone(review_queue(b'x' * (MAX_BYTES + 1)))
