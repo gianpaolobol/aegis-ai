@@ -102,7 +102,9 @@ fn incident_demo_reports_counts_and_limitations() {
                      "Synthetic evidence graph: 2 nodes, 1 co-occurrence edge; no causal inference.",
                      "Graph capacity exceeded: rejected, no partial graph.",
                      "Synthetic review clusters: 1 connected group, 1 isolated advisory, 1 normal observation",
-                     "Groups are not incidents or causal chains."] {
+                     "Groups are not incidents or causal chains.",
+                     "Synthetic event search: 1 of 2 scoped observations matches the filter.",
+                     "No matching event differs from an unobserved asset; neither establishes safety."] {
         assert!(stdout(&output).contains(expected));
     }
     assert!(output.stderr.is_empty());

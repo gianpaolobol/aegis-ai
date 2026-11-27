@@ -159,7 +159,7 @@ fn run(args: &[OsString]) -> (i32, String) {
         return (0, report);
     }
     if arg == OsStr::new("demo-incidents") {
-        use aegis_policy::incident::{correlate, current_timeline, current_graph, current_clusters, Event, Signal, TimelineError, GraphError};
+        use aegis_policy::incident::{correlate, current_timeline, current_graph, current_clusters, search_current, SearchQuery, Event, Signal, TimelineError, GraphError};
         let events = [
             Event { id: 1, asset: 1, seconds: 0, signal: Signal::IntegrityMismatch },
             Event { id: 2, asset: 1, seconds: 60, signal: Signal::PolicyDenied },
@@ -207,6 +207,20 @@ fn run(args: &[OsString]) -> (i32, String) {
                 }
                 if current_clusters(&crowded,1,0) != Err(GraphError::EdgeLimit) {
                     return (1, "Synthetic review cluster capacity check failed.\n".into());
+                }
+                let q = SearchQuery { asset: 1, from: 0, through: 60,
+                    signal: Some(Signal::PolicyDenied) };
+                match search_current(&events,q,60) {
+                    Ok(Some(result)) if result.scoped_observations == 2 &&
+                        result.matches.len() == 1 && result.matches[0].id == 2 =>
+                        report.push_str("Synthetic event search: 1 of 2 scoped observations matches the filter.\n"),
+                    _ => return (1, "Synthetic event search failed.\n".into()),
+                }
+                match (search_current(&events,SearchQuery { signal: Some(Signal::Normal), ..q },60),
+                    search_current(&events,SearchQuery { asset: 4, ..q },60)) {
+                    (Ok(Some(result)),Ok(None)) if result.matches.is_empty() =>
+                        report.push_str("No matching event differs from an unobserved asset; neither establishes safety.\n"),
+                    _ => return (1, "Synthetic empty search checks failed.\n".into()),
                 }
                 return (0, report);
             }

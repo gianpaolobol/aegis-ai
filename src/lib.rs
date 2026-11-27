@@ -1337,10 +1337,104 @@ pub mod incident {
         Ok(Some(ClusterSummary { clusters, isolated_advisories, normal_observations }))
     }
 
+
+    /// XDR-05: scoped, bounded search over the current synthetic snapshot.
+    /// No live telemetry, persistence, authorization or inference of safety.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SearchQuery {
+        pub asset: u32,
+        pub from: u64,
+        pub through: u64,
+        pub signal: Option<Signal>,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SearchError { InvalidWindow, InvalidTimeline(TimelineError) }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct SearchResult {
+        pub scoped_observations: usize,
+        pub matches: Vec<Event>,
+    }
+    /// Inclusive time bounds; no wildcard asset. The whole snapshot must pass
+    /// existing validation before any projection. None means asset unobserved;
+    /// Some with zero matches means only that the selected filter matched none.
+    /// At most MAX_EVENTS results, in chronological/event-ID order.
+    pub fn search_current(events: &[Event], query: SearchQuery, now: u64)
+        -> Result<Option<SearchResult>, SearchError> {
+        if query.from > query.through || query.through > now ||
+            now - query.from > SNAPSHOT_MAX_AGE {
+            return Err(SearchError::InvalidWindow);
+        }
+        let Some(timeline) = current_timeline(events, query.asset, now)
+            .map_err(SearchError::InvalidTimeline)? else { return Ok(None); };
+        let scoped_observations = timeline.events.len();
+        let matches = timeline.events.into_iter().filter(|e|
+            e.seconds >= query.from && e.seconds <= query.through &&
+            query.signal.is_none_or(|signal| e.signal == signal)).collect();
+        Ok(Some(SearchResult { scoped_observations, matches }))
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
         use Signal::*;
+        #[test]
+        fn search_is_scoped_inclusive_and_ordered() {
+            let a = [e(4,1,20,PolicyDenied), e(2,1,10,PolicyDenied),
+                e(1,1,10,Normal), e(3,2,10,PolicyDenied),
+                e(5,1,21,PolicyDenied), e(6,1,9,PolicyDenied)];
+            let q = SearchQuery { asset: 1, from: 10, through: 20, signal: Some(PolicyDenied) };
+            let result = search_current(&a,q,21).unwrap().unwrap();
+            assert_eq!(result.scoped_observations,5);
+            assert_eq!(result.matches.iter().map(|x| x.id).collect::<Vec<_>>(),vec![2,4]);
+            let mut b = a; b.reverse();
+            assert_eq!(search_current(&b,q,21),Ok(Some(result)));
+            let all = search_current(&a,SearchQuery { signal: None, ..q },21).unwrap().unwrap();
+            assert_eq!(all.matches.iter().map(|x| x.id).collect::<Vec<_>>(),vec![1,2,4]);
+        }
+        #[test]
+        fn search_distinguishes_empty_filter_from_unobserved_asset() {
+            let a = [e(1,1,10,Normal)];
+            let q = SearchQuery { asset: 1, from: 10, through: 10, signal: Some(PolicyDenied) };
+            let result = search_current(&a,q,10).unwrap().unwrap();
+            assert_eq!(result.scoped_observations,1);
+            assert!(result.matches.is_empty());
+            assert_eq!(search_current(&a,SearchQuery { asset: 2, ..q },10),Ok(None));
+            assert_eq!(search_current(&[],q,10),Ok(None));
+        }
+        #[test]
+        fn search_rejects_invalid_windows_and_full_snapshot() {
+            let q = SearchQuery { asset: 1, from: 0, through: 600, signal: None };
+            let a = [e(1,1,0,Normal),e(2,2,600,PolicyDenied)];
+            assert!(search_current(&a,q,600).is_ok());
+            assert_eq!(search_current(&a,q,601),Err(SearchError::InvalidWindow));
+            assert_eq!(search_current(&a,SearchQuery { from: 600, through: 599, ..q },600),
+                Err(SearchError::InvalidWindow));
+            assert_eq!(search_current(&a,q,599),Err(SearchError::InvalidWindow));
+            assert_eq!(search_current(&a,SearchQuery { asset: 0, ..q },600),
+                Err(SearchError::InvalidTimeline(TimelineError::InvalidAsset)));
+            let narrow = SearchQuery { from: 1, through: 599, ..q };
+            let bad = [a[0],e(2,2,601,Normal)];
+            assert_eq!(search_current(&bad,narrow,600),
+                Err(SearchError::InvalidTimeline(TimelineError::FutureEvent)));
+            assert_eq!(search_current(&a,narrow,601),
+                Err(SearchError::InvalidTimeline(TimelineError::StaleSnapshot)));
+            assert_eq!(search_current(&[a[0],a[0]],q,600),
+                Err(SearchError::InvalidTimeline(TimelineError::InvalidBatch(Error::DuplicateEvent))));
+        }
+        #[test]
+        fn search_returns_all_bounded_matches_without_truncation() {
+            let mut rows: Vec<_> = (1..=MAX_EVENTS as u32).rev()
+                .map(|id| e(id,1,u64::MAX,PolicyDenied)).collect();
+            let q = SearchQuery { asset: 1, from: u64::MAX, through: u64::MAX, signal: None };
+            let result = search_current(&rows,q,u64::MAX).unwrap().unwrap();
+            assert_eq!(result.matches.len(),MAX_EVENTS);
+            assert_eq!(result.matches.first().unwrap().id,1);
+            assert_eq!(result.matches.last().unwrap().id,MAX_EVENTS as u32);
+            rows.push(e(999,1,u64::MAX,Normal));
+            assert_eq!(search_current(&rows,q,u64::MAX),
+                Err(SearchError::InvalidTimeline(TimelineError::InvalidBatch(Error::TooManyEvents))));
+        }
+
         fn e(id: u32, asset: u32, seconds: u64, signal: Signal) -> Event {
             Event { id, asset, seconds, signal }
         }
