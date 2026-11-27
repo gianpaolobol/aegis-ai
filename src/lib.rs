@@ -56,7 +56,7 @@ pub mod alis {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Verdict {
         CandidateOnly, UnverifiedSource, WrongSchema, InvalidDigest,
-        Duplicate, SourceQuota, GroupQuota,
+        Duplicate, SourceQuota, GroupQuota, SessionCapacity,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,50 +79,76 @@ pub mod alis {
         pub group_cap: usize,
     }
 
-    /// Pure bounded batch classifier. All rejected records remain outside the
-    /// candidate set. Caller owns quarantine evidence and retention; this function
-    /// neither deletes nor retains payloads. Input order is explicit, first eligible
-    /// occurrence wins. Quotas reset per batch: never use as a production quota.
+    /// Pure bounded batch classifier. A fresh session preserves the original
+    /// per-batch semantics; use AdmissionSession for multiple fixture batches.
     pub fn rehearse(config: &Config, batch: &[Fixture]) -> Result<Vec<Verdict>, BatchError> {
-        if config.schema == 0 || config.sources.is_empty() ||
-            config.sources.len() > MAX_BATCH || config.source_cap == 0 ||
-            config.group_cap == 0 || config.source_cap > config.group_cap ||
-            config.group_cap > MAX_BATCH {
-            return Err(BatchError::InvalidConfiguration);
-        }
-        let mut registry = BTreeMap::new();
-        for &(source, group) in &config.sources {
-            if source == 0 || group == 0 || registry.insert(source, group).is_some() {
+        AdmissionSession::new(config)?.admit(batch)
+    }
+
+    /// One bounded, immutable-policy, in-memory synthetic admission session.
+    /// No authentication, persistence, training, or automatic quota reset.
+    /// A new session is not a production quota renewal or clearance.
+    pub struct AdmissionSession {
+        schema: u16,
+        registry: BTreeMap<u16, u16>,
+        source_cap: usize,
+        group_cap: usize,
+        seen: BTreeSet<[u8; 32]>,
+        source_counts: BTreeMap<u16, usize>,
+        group_counts: BTreeMap<u16, usize>,
+    }
+
+    impl AdmissionSession {
+        pub fn new(config: &Config) -> Result<Self, BatchError> {
+            if config.schema == 0 || config.sources.is_empty() ||
+                config.sources.len() > MAX_BATCH || config.source_cap == 0 ||
+                config.group_cap == 0 || config.source_cap > config.group_cap ||
+                config.group_cap > MAX_BATCH {
                 return Err(BatchError::InvalidConfiguration);
             }
-        }
-        if batch.len() > MAX_BATCH { return Err(BatchError::BatchTooLarge); }
-        let mut seen = BTreeSet::new();
-        let mut source_counts = BTreeMap::<u16, usize>::new();
-        let mut group_counts = BTreeMap::<u16, usize>::new();
-        let mut results = Vec::with_capacity(batch.len());
-        for item in batch {
-            let verdict = match registry.get(&item.source).copied() {
-                Some(group) if item.verified_by_mock => {
-                    if item.schema != config.schema { Verdict::WrongSchema }
-                    else if item.digest == [0; 32] { Verdict::InvalidDigest }
-                    else if seen.contains(&item.digest) { Verdict::Duplicate }
-                    else if source_counts.get(&item.source).copied().unwrap_or(0) >= config.source_cap {
-                        Verdict::SourceQuota
-                    } else if group_counts.get(&group).copied().unwrap_or(0) >= config.group_cap {
-                        Verdict::GroupQuota
-                    } else {
-                        seen.insert(item.digest);
-                        *source_counts.entry(item.source).or_default() += 1;
-                        *group_counts.entry(group).or_default() += 1;
-                        Verdict::CandidateOnly
-                    }
+            let mut registry = BTreeMap::new();
+            for &(source, group) in &config.sources {
+                if source == 0 || group == 0 || registry.insert(source, group).is_some() {
+                    return Err(BatchError::InvalidConfiguration);
                 }
-                _ => Verdict::UnverifiedSource,
-            };
-            results.push(verdict);
+            }
+            Ok(Self { schema: config.schema, registry, source_cap: config.source_cap,
+                group_cap: config.group_cap, seen: BTreeSet::new(),
+                source_counts: BTreeMap::new(), group_counts: BTreeMap::new() })
         }
-        Ok(results)
+
+        /// Rejected rows never consume quota. An oversized batch changes nothing.
+        /// Never evict admitted digests to make room for more candidates.
+        pub fn admit(&mut self, batch: &[Fixture]) -> Result<Vec<Verdict>, BatchError> {
+            if batch.len() > MAX_BATCH { return Err(BatchError::BatchTooLarge); }
+            let mut results = Vec::with_capacity(batch.len());
+            for item in batch {
+                let verdict = match self.registry.get(&item.source).copied() {
+                    Some(group) if item.verified_by_mock => {
+                        if item.schema != self.schema { Verdict::WrongSchema }
+                        else if item.digest == [0; 32] { Verdict::InvalidDigest }
+                        else if self.seen.contains(&item.digest) { Verdict::Duplicate }
+                        else if self.source_counts.get(&item.source).copied().unwrap_or(0) >= self.source_cap {
+                            Verdict::SourceQuota
+                        } else if self.group_counts.get(&group).copied().unwrap_or(0) >= self.group_cap {
+                            Verdict::GroupQuota
+                        } else if self.seen.len() >= MAX_BATCH {
+                            Verdict::SessionCapacity
+                        } else {
+                            self.seen.insert(item.digest);
+                            *self.source_counts.entry(item.source).or_default() += 1;
+                            *self.group_counts.entry(group).or_default() += 1;
+                            Verdict::CandidateOnly
+                        }
+                    }
+                    _ => Verdict::UnverifiedSource,
+                };
+                results.push(verdict);
+            }
+            Ok(results)
+        }
+
+        pub fn candidate_count(&self) -> usize { self.seen.len() }
     }
 
     #[cfg(test)]
@@ -185,6 +211,57 @@ pub mod alis {
             let r = rehearse(&config(), &vec![sample(1, 1); MAX_BATCH]).unwrap();
             assert_eq!(r.len(), MAX_BATCH);
             assert_eq!(r.iter().filter(|v| **v == Verdict::CandidateOnly).count(), 1);
+        }
+        #[test]
+        fn session_caps_and_duplicates_across_batches() {
+            let mut session = AdmissionSession::new(&config()).unwrap();
+            assert_eq!(session.admit(&[sample(1, 1), sample(1, 2)]),
+                Ok(vec![Verdict::CandidateOnly; 2]));
+            assert_eq!(session.admit(&[sample(2, 1), sample(1, 3), sample(2, 3)]),
+                Ok(vec![Verdict::Duplicate, Verdict::SourceQuota, Verdict::CandidateOnly]));
+            assert_eq!(session.admit(&[sample(2, 4), sample(3, 4)]),
+                Ok(vec![Verdict::GroupQuota, Verdict::CandidateOnly]));
+            assert_eq!(session.candidate_count(), 4);
+        }
+        #[test]
+        fn oversized_and_unverified_batches_do_not_consume_session_quota() {
+            let mut session = AdmissionSession::new(&config()).unwrap();
+            assert_eq!(session.admit(&vec![sample(1, 1); MAX_BATCH + 1]),
+                Err(BatchError::BatchTooLarge));
+            let mut wrong = sample(1, 1);
+            wrong.verified_by_mock = false;
+            assert_eq!(session.admit(&[wrong]), Ok(vec![Verdict::UnverifiedSource]));
+            assert_eq!(session.admit(&[]), Ok(vec![]));
+            assert_eq!(session.candidate_count(), 0);
+            assert_eq!(session.admit(&[sample(1, 1)]), Ok(vec![Verdict::CandidateOnly]));
+        }
+        #[test]
+        fn session_config_is_frozen_and_capacity_never_evicts() {
+            let mut c = Config { schema: 1, sources: vec![(1, 1), (2, 2)],
+                source_cap: MAX_BATCH, group_cap: MAX_BATCH };
+            let mut session = AdmissionSession::new(&c).unwrap();
+            c.schema = 2;
+            c.sources.clear();
+            let rows: Vec<_> = (1..=MAX_BATCH).map(|n| {
+                let mut row = sample(1, 1);
+                row.digest[..2].copy_from_slice(&(n as u16).to_le_bytes());
+                row
+            }).collect();
+            assert_eq!(session.admit(&rows), Ok(vec![Verdict::CandidateOnly; MAX_BATCH]));
+            assert_eq!(session.admit(&[sample(2, 9)]), Ok(vec![Verdict::SessionCapacity]));
+            assert_eq!(session.admit(&[rows[0]]), Ok(vec![Verdict::Duplicate]));
+            assert_eq!(session.candidate_count(), MAX_BATCH);
+        }
+        #[test]
+        fn split_batches_match_single_batch_for_same_order() {
+            let rows = [sample(1,1), sample(2,1), sample(1,2), sample(2,3),
+                sample(2,4), sample(3,4)];
+            for i in 0..=rows.len() {
+                let mut session = AdmissionSession::new(&config()).unwrap();
+                let mut result = session.admit(&rows[..i]).unwrap();
+                result.extend(session.admit(&rows[i..]).unwrap());
+                assert_eq!(Ok(result), rehearse(&config(), &rows));
+            }
         }
         #[test]
         fn deterministic_rehearsal_not_persistent_learning() {
