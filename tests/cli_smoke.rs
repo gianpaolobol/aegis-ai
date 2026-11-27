@@ -118,6 +118,8 @@ fn patch_demo_is_advisory_and_denies_extra_arguments() {
         "Synthetic healthy canary prompts human review: true",
         "Synthetic failed canary prompts rollback review: true",
         "Synthetic incomplete canary blocks expansion review: true",
+        "Synthetic distinct cohort prompts human review: true",
+        "Synthetic duplicate canary blocks expansion review: true",
         "No patch installation or safety established"] {
         assert!(stdout(&output).contains(expected));
     }

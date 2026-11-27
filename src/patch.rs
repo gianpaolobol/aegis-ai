@@ -257,3 +257,122 @@ mod rollout_tests {
         }
     }
 }
+
+/// Synthetic cohort review: a distinct planned fixture ID must account for
+/// each canary. No discovery, deployment, rollback or authenticated evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanaryOutcome { Healthy, Failed, Unknown }
+
+#[derive(Clone, Copy, Debug)]
+pub struct CanaryObservation {
+    pub id: u32,
+    pub rollout: Rollout,
+    pub observed_at: u64,
+    pub source: Evidence,
+    pub outcome: CanaryOutcome,
+}
+
+/// Counts alone cannot establish distinct membership. Validate the entire
+/// bounded snapshot before deriving counts; never treat unknown as healthy.
+/// A complete healthy fixture merely requests human review.
+pub fn review_cohort(plan: Rollout, planned: &[u32], rows: &[CanaryObservation],
+    now: u64, rollback_rehearsal: Evidence) -> RolloutAdvisory {
+    use RolloutAdvisory::*;
+    let initial = RolloutEvidence { rollout: plan, observed_at: now,
+        source: Evidence::ReviewedFixture, rollback_rehearsal,
+        checked: 0, healthy: 0, failed: 0 };
+    if review_rollout(plan, now, initial) == InvalidPlan ||
+        planned.len() != usize::from(plan.canary_count) ||
+        planned.len() > MAX_ROWS || now == 0 {
+        return InvalidPlan;
+    }
+    if rows.len() > planned.len() { return InvalidCounts; }
+    let mut expected = BTreeSet::new();
+    for &id in planned {
+        if id == 0 || !expected.insert(id) { return InvalidPlan; }
+    }
+    let mut seen = BTreeSet::new();
+    let mut healthy = 0u16;
+    let mut failed = 0u16;
+    let mut unavailable = false;
+    for row in rows {
+        if row.rollout != plan || !expected.contains(&row.id) {
+            return EvidenceMismatch;
+        }
+        if !seen.insert(row.id) { return InvalidCounts; }
+        if row.source != Evidence::ReviewedFixture || row.observed_at == 0 ||
+            !now.checked_sub(row.observed_at).is_some_and(|age| age <= 300) ||
+            row.outcome == CanaryOutcome::Unknown {
+            unavailable = true;
+            continue;
+        }
+        match row.outcome {
+            CanaryOutcome::Healthy => healthy += 1,
+            CanaryOutcome::Failed => failed += 1,
+            CanaryOutcome::Unknown => (),
+        }
+    }
+    if failed > 0 || rollback_rehearsal != Evidence::ReviewedFixture {
+        return RollbackReviewRequired;
+    }
+    if unavailable { return EvidenceUnavailable; }
+    review_rollout(plan, now, RolloutEvidence {
+        checked: healthy + failed, healthy, failed, ..initial
+    })
+}
+
+#[cfg(test)]
+mod cohort_tests {
+    use super::*;
+    const PLAN: Rollout = Rollout { from: ProductBuild { product: 1, build: 1 },
+        to: ProductBuild { product: 1, build: 2 }, artifact: 7, policy_version: 1, canary_count: 3 };
+    const R: Evidence = Evidence::ReviewedFixture;
+    fn row(id: u32) -> CanaryObservation {
+        CanaryObservation { id, rollout: PLAN, observed_at: 100, source: R,
+            outcome: CanaryOutcome::Healthy }
+    }
+    #[test]
+    fn distinct_complete_cohort_only_requests_review() {
+        use RolloutAdvisory::*;
+        let rows = [row(3), row(1), row(2)];
+        assert_eq!(review_cohort(PLAN, &[1,2,3], &rows, 400, R), ExpansionReviewOnly);
+        assert_eq!(review_cohort(PLAN, &[1,2,3], &rows[..2], 400, R), CanaryIncomplete);
+        assert_eq!(review_cohort(PLAN, &[1,2,3], &[], 400, R), CanaryIncomplete);
+        assert_eq!(review_cohort(PLAN, &[1,2,3], &rows, 401, R), EvidenceUnavailable);
+    }
+    #[test]
+    fn duplicate_unplanned_or_wrong_artifact_rejected() {
+        use RolloutAdvisory::*;
+        assert_eq!(review_cohort(PLAN, &[1,2,3], &[row(1),row(1),row(2)], 100, R), InvalidCounts);
+        assert_eq!(review_cohort(PLAN, &[1,1,3], &[], 100, R), InvalidPlan);
+        assert_eq!(review_cohort(PLAN, &[0,2,3], &[], 100, R), InvalidPlan);
+        assert_eq!(review_cohort(PLAN, &[1,2], &[], 100, R), InvalidPlan);
+        assert_eq!(review_cohort(PLAN, &[1,2,3], &[row(4)], 100, R), EvidenceMismatch);
+        assert_eq!(review_cohort(PLAN, &[1,2,3], &[CanaryObservation {
+            rollout: Rollout { artifact: 8, ..PLAN }, ..row(1) }], 100, R), EvidenceMismatch);
+    }
+    #[test]
+    fn unavailable_and_failed_evidence_never_positive() {
+        use RolloutAdvisory::*;
+        for bad in [CanaryObservation { observed_at: 0, ..row(1) },
+            CanaryObservation { observed_at: 101, ..row(1) },
+            CanaryObservation { source: Evidence::Unavailable, ..row(1) },
+            CanaryObservation { outcome: CanaryOutcome::Unknown, ..row(1) }] {
+            assert_eq!(review_cohort(PLAN, &[1,2,3], &[bad,row(2),row(3)], 100, R), EvidenceUnavailable);
+            let failed = CanaryObservation { outcome: CanaryOutcome::Failed, ..row(2) };
+            assert_eq!(review_cohort(PLAN, &[1,2,3], &[bad,failed], 100, R), RollbackReviewRequired);
+        }
+        assert_eq!(review_cohort(PLAN, &[1,2,3], &[row(1),row(2),row(3)], 100,
+            Evidence::Unavailable), RollbackReviewRequired);
+    }
+    #[test]
+    fn cohort_bounds_and_no_truncation() {
+        use RolloutAdvisory::*;
+        let plan = Rollout { canary_count: MAX_ROWS as u16, ..PLAN };
+        let ids: Vec<u32> = (1..=MAX_ROWS as u32).collect();
+        let mut rows: Vec<_> = ids.iter().map(|&id| CanaryObservation { rollout: plan, ..row(id) }).collect();
+        assert_eq!(review_cohort(plan, &ids, &rows, 100, R), ExpansionReviewOnly);
+        rows.push(rows[0]);
+        assert_eq!(review_cohort(plan, &ids, &rows, 100, R), InvalidCounts);
+    }
+}

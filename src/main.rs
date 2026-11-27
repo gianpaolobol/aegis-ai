@@ -189,7 +189,7 @@ fn run(args: &[OsString]) -> (i32, String) {
         }
     }
     if arg == OsStr::new("demo-patches") {
-        use aegis_policy::patch::{triage, review_rollout, Advisory, Applicability, Evidence, Finding, ProductBuild, Rollout, RolloutAdvisory, RolloutEvidence};
+        use aegis_policy::patch::{triage, review_rollout, review_cohort, CanaryObservation, CanaryOutcome, Advisory, Applicability, Evidence, Finding, ProductBuild, Rollout, RolloutAdvisory, RolloutEvidence};
         let p = ProductBuild { product: 1, build: 1 };
         let other = ProductBuild { product: 1, build: 2 };
         let findings = [
@@ -211,7 +211,13 @@ fn run(args: &[OsString]) -> (i32, String) {
                     == RolloutAdvisory::RollbackReviewRequired;
                 let partial = review_rollout(plan, 100, RolloutEvidence { checked: 2, healthy: 2, ..evidence })
                     == RolloutAdvisory::CanaryIncomplete;
-                return (0, format!("Synthetic patch priority; no real KEV catalog or CVE mapping.\nPriority review: {priority}\nOther review: {review}\nApplicability unknown: {unknown}\nSynthetic healthy canary prompts human review: {healthy}\nSynthetic failed canary prompts rollback review: {failure}\nSynthetic incomplete canary blocks expansion review: {partial}\nNo patch installation or safety established.\n"));
+                let row = |id| CanaryObservation { id, rollout: plan, observed_at: 100,
+                    source: reviewed, outcome: CanaryOutcome::Healthy };
+                let cohort = review_cohort(plan, &[1,2,3], &[row(1),row(2),row(3)], 100, reviewed)
+                    == RolloutAdvisory::ExpansionReviewOnly;
+                let duplicate = review_cohort(plan, &[1,2,3], &[row(1),row(1),row(2)], 100, reviewed)
+                    == RolloutAdvisory::InvalidCounts;
+                return (0, format!("Synthetic patch priority; no real KEV catalog or CVE mapping.\nPriority review: {priority}\nOther review: {review}\nApplicability unknown: {unknown}\nSynthetic healthy canary prompts human review: {healthy}\nSynthetic failed canary prompts rollback review: {failure}\nSynthetic incomplete canary blocks expansion review: {partial}\nSynthetic distinct cohort prompts human review: {cohort}\nSynthetic duplicate canary blocks expansion review: {duplicate}\nNo patch installation or safety established.\n"));
             }
             Err(_) => return (1, "Synthetic patch priority unavailable.\n".into()),
         }
