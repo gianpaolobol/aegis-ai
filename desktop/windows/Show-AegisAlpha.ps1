@@ -545,8 +545,12 @@ function Get-AegisVpnScope([scriptblock]$ReadProfiles) {
         if ($records.Count -gt 128) { return 'Inventory unavailable (limit exceeded).' }
         $connected=0; $disconnected=0; $statusUnknown=0
         $split=0; $noSplit=0; $splitUnknown=0; $pptp=0; $automatic=0; $other=0; $typeUnknown=0
+        $encNone=0; $encOptional=0; $encRequired=0; $encMaximum=0; $encUnknown=0
+        $rememberYes=0; $rememberNo=0; $rememberUnknown=0
+        $logonYes=0; $logonNo=0; $logonUnknown=0
         foreach ($record in $records) {
             $status = $null; $mode = $null; $tunnel = $null
+            $encryption = $null; $remember = $null; $logon = $null
             if ($null -ne $record) {
                 $prop = $record.PSObject.Properties['ConnectionStatus']
                 if ($null -ne $prop) { $status = $prop.Value }
@@ -554,6 +558,12 @@ function Get-AegisVpnScope([scriptblock]$ReadProfiles) {
                 if ($null -ne $prop) { $mode = $prop.Value }
                 $prop = $record.PSObject.Properties['TunnelType']
                 if ($null -ne $prop) { $tunnel = $prop.Value }
+                $prop = $record.PSObject.Properties['EncryptionLevel']
+                if ($null -ne $prop) { $encryption = $prop.Value }
+                $prop = $record.PSObject.Properties['RememberCredential']
+                if ($null -ne $prop) { $remember = $prop.Value }
+                $prop = $record.PSObject.Properties['UseWinlogonCredential']
+                if ($null -ne $prop) { $logon = $prop.Value }
             }
             if ($status -is [string] -or $status -is [System.Enum]) {
                 if ([string]$status -ceq 'Connected') { $connected++ }
@@ -569,11 +579,30 @@ function Get-AegisVpnScope([scriptblock]$ReadProfiles) {
                 elseif (@('Ikev2','Sstp','L2tp') -icontains [string]$tunnel) { $other++ }
                 else { $typeUnknown++ }
             } else { $typeUnknown++ }
+            # Configuration only, not negotiated protection or credential presence.
+            if ($encryption -is [string] -or $encryption -is [System.Enum]) {
+                switch -CaseSensitive -Exact ([string]$encryption) {
+                    'NoEncryption' { $encNone++ }
+                    'Optional' { $encOptional++ }
+                    'Required' { $encRequired++ }
+                    'Maximum' { $encMaximum++ }
+                    default { $encUnknown++ }
+                }
+            } else { $encUnknown++ }
+            if ($remember -is [bool]) {
+                if ($remember) { $rememberYes++ } else { $rememberNo++ }
+            } else { $rememberUnknown++ }
+            if ($logon -is [bool]) {
+                if ($logon) { $logonYes++ } else { $logonNo++ }
+            } else { $logonUnknown++ }
         }
         return (@("Provider profile rows: $($records.Count)",
             "Connection reported connected: $connected; disconnected: $disconnected; unknown: $statusUnknown",
             "Split tunneling configured: $split; disabled: $noSplit; unknown: $splitUnknown",
-            "Configured protocol PPTP: $pptp; Automatic: $automatic; other recognized: $other; unknown: $typeUnknown") -join [Environment]::NewLine)
+            "Configured protocol PPTP: $pptp; Automatic: $automatic; other recognized: $other; unknown: $typeUnknown",
+            "Configured encryption level NoEncryption: $encNone; Optional: $encOptional; Required: $encRequired; Maximum: $encMaximum; unknown: $encUnknown",
+            "Remember credential configured yes: $rememberYes; no: $rememberNo; unknown: $rememberUnknown",
+            "Use Windows logon credential configured yes: $logonYes; no: $logonNo; unknown: $logonUnknown") -join [Environment]::NewLine)
     } catch { return 'Inventory unavailable (provider failure).' }
 }
 function Get-AegisVpnReport([scriptblock]$ReadUser,[scriptblock]$ReadGlobal) {
@@ -582,7 +611,9 @@ function Get-AegisVpnReport([scriptblock]$ReadUser,[scriptblock]$ReadGlobal) {
         'Global phone book:', (Get-AegisVpnScope $ReadGlobal),
         'Counts are provider rows, not unique or verified tunnels.',
         'PPTP configuration merits review. Automatic does not identify the negotiated protocol.',
-        'No route, encryption, leak, kill switch or WireGuard assessment. Third-party VPNs may not appear.') -join [Environment]::NewLine)
+        'NoEncryption or Optional configuration merits review; Required or Maximum is not proof of negotiated encryption.',
+        'Credential flags describe profile settings only; no credential access or authentication-strength assessment.',
+        'No route, effective encryption, leak, kill switch or WireGuard assessment. Third-party VPNs may not appear.') -join [Environment]::NewLine)
 }
 function Test-AegisVpnReport {
     $report = Get-AegisVpnReport {
@@ -604,6 +635,25 @@ function Test-AegisVpnReport {
     if (-not $report.Contains('Inventory unavailable (provider failure).') -or -not $report.Contains('connected: 1; disconnected: 0; unknown: 0')) { throw 'VPN scopes not independent' }
     $report = Get-AegisVpnScope { [pscustomobject]@{}; [pscustomobject]@{ConnectionStatus=1;SplitTunneling=0;TunnelType='Unrecognized'} }
     if (-not $report.Contains('connected: 0; disconnected: 0; unknown: 2') -or -not $report.Contains('configured: 0; disabled: 0; unknown: 2') -or -not $report.Contains('other recognized: 0; unknown: 2')) { throw 'Malformed VPN records accepted' }
+    $report = Get-AegisVpnScope {
+        [pscustomobject]@{EncryptionLevel='NoEncryption';RememberCredential=$true;UseWinlogonCredential=$false}
+        [pscustomobject]@{EncryptionLevel='Optional';RememberCredential=$false;UseWinlogonCredential=$true}
+        [pscustomobject]@{EncryptionLevel='Required';RememberCredential=$false;UseWinlogonCredential=$false}
+        [pscustomobject]@{EncryptionLevel='Maximum';RememberCredential=$true;UseWinlogonCredential=$true}
+        [pscustomobject]@{EncryptionLevel=@('Required');RememberCredential=@($true);UseWinlogonCredential='True'}
+        [pscustomobject]@{EncryptionLevel='required';RememberCredential=1;UseWinlogonCredential=@($false)}
+        [pscustomobject]@{EncryptionLevel='SYNTHETIC-PRIVATE';RememberCredential='SYNTHETIC-PRIVATE'}
+        [pscustomobject]@{EncryptionLevel=3;UseWinlogonCredential=0}
+        [pscustomobject]@{}
+    }
+    foreach ($expected in @('NoEncryption: 1; Optional: 1; Required: 1; Maximum: 1; unknown: 5',
+        'Remember credential configured yes: 2; no: 2; unknown: 5',
+        'Use Windows logon credential configured yes: 2; no: 2; unknown: 5')) {
+        if (-not $report.Contains($expected)) { throw 'VPN security configuration fixture mismatch' }
+    }
+    if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'VPN security configuration disclosed raw values' }
+    $report = Get-AegisVpnScope { for ($i=0;$i -lt 128;$i++) { [pscustomobject]@{EncryptionLevel='Required'} } }
+    if (-not $report.Contains('Provider profile rows: 128') -or -not $report.Contains('Required: 128; Maximum: 0; unknown: 0')) { throw 'VPN exact boundary failed' }
     Write-Output 'PASS: minimized VPN profile synthetic fixtures'
 }
 
