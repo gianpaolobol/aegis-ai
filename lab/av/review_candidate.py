@@ -13,6 +13,17 @@ REPORT_SHA256 = "64a6fe87a2de29eb6787a01aca7e9e7f698a3a5284587f1507a6fe6a3e008a8
 REPORT = Path(__file__).resolve().parents[2] / "docs/evidence/yara-x-1.24.0-win-amd64-sbom-components.json"
 MAX_BYTES = 1024 * 1024
 
+# Dated, manually observed upstream package declarations, not verified artifacts.
+# No fetch at runtime; a changed package version needs a new evidence review.
+SOURCE_OBSERVATIONS = (
+    ("pkg:cargo/r-efi@6.0.0", "r-efi", "6.0.0",
+     "expression:MIT OR Apache-2.0 OR LGPL-2.1-or-later",
+     "https://docs.rs/crate/r-efi/6.0.0", "2026-11-27"),
+    ("pkg:cargo/unicode-ident@1.0.26", "unicode-ident", "1.0.26",
+     "expression:(MIT OR Apache-2.0) AND Unicode-3.0",
+     "https://docs.rs/crate/unicode-ident/latest/source/Cargo.toml.orig", "2026-11-27"),
+)
+
 def unique_object(pairs):
     out = {}
     for key, value in pairs:
@@ -33,12 +44,33 @@ def matches_report(raw, expected_sha256):
     return (type(raw) is bytes and 1 <= len(raw) <= MAX_BYTES
             and hashlib.sha256(raw).hexdigest() == expected_sha256)
 
+def reconcile_observations(queue, observations):
+    """Compare exact declarations, never infer linkage, notices or clearance."""
+    rows = {row["declared_purl"]: row for row in queue}
+    seen, matched = set(), []
+    for purl, name, version, expression, source, date in observations:
+        row = rows.get(purl)
+        if (purl in seen or row is None or row["name"] != name
+                or row["version"] != version or row["declared_licenses"] != [expression]):
+            return None
+        seen.add(purl)
+        matched.append({"declared_purl": purl, "source": source, "observed_date": date,
+                        "declaration_comparison": "exact-match",
+                        "linkage_review": "not-performed", "license_review": "not-performed"})
+    return {"observations": matched, "matched": len(matched),
+            "not_cross_checked": len(queue) - len(matched),
+            "execution_approved": False}
+
 def retained_review_queue(raw):
     if not matches_report(raw, REPORT_SHA256):
         return None
     result = review_queue(raw)
     if result is not None:
+        evidence = reconcile_observations(result["queue"], SOURCE_OBSERVATIONS)
+        if evidence is None:
+            return None
         result["retained_report_sha256"] = REPORT_SHA256
+        result["source_declaration_comparison"] = evidence
     return result
 
 def review_queue(raw):
@@ -163,6 +195,23 @@ class Fixtures(unittest.TestCase):
         self.assertEqual(review_queue(raw), review_queue(converted))
         self.assertTrue(matches_report(raw, expected))
         self.assertFalse(matches_report(converted, expected))
+
+    def test_source_observations_remain_advisory(self):
+        rows = self.run_obj(self.fixture())["queue"]
+        obs = ("pkg:cargo/fixture-a@1", "fixture-a", "1",
+               "expression:MIT", "https://example.invalid/fixture", "2026-11-27")
+        result = reconcile_observations(rows, [obs])
+        self.assertEqual((result["matched"], result["not_cross_checked"]), (1, 1))
+        self.assertFalse(result["execution_approved"])
+        self.assertEqual(result["observations"][0]["license_review"], "not-performed")
+        self.assertEqual(result["observations"][0]["linkage_review"], "not-performed")
+        self.assertIsNone(reconcile_observations(rows, [obs, obs]))
+        for index, value in ((0, "pkg:cargo/missing@1"), (1, "wrong"),
+                             (2, "2"), (3, "expression:Apache-2.0")):
+            changed = list(obs)
+            changed[index] = value
+            self.assertIsNone(reconcile_observations(rows, [changed]))
+        self.assertEqual(reconcile_observations(rows, [])["not_cross_checked"], 2)
 
     def test_unreviewed_scope_required(self):
         for field in ("dependency_linkage_review", "license_expression_validation",
