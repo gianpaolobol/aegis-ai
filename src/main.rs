@@ -134,7 +134,7 @@ fn run(args: &[OsString]) -> (i32, String) {
         return (0, report);
     }
     if arg == OsStr::new("demo-incidents") {
-        use aegis_policy::incident::{correlate, current_timeline, Event, Signal, TimelineError};
+        use aegis_policy::incident::{correlate, current_timeline, current_graph, Event, Signal, TimelineError, GraphError};
         let events = [
             Event { id: 1, asset: 1, seconds: 0, signal: Signal::IntegrityMismatch },
             Event { id: 2, asset: 1, seconds: 60, signal: Signal::PolicyDenied },
@@ -160,6 +160,17 @@ fn run(args: &[OsString]) -> (i32, String) {
                     return (1, "Synthetic timeline checks failed.\n".into());
                 }
                 report.push_str("Unobserved asset: no evidence, not healthy.\nStale or future snapshot: rejected.\n");
+                match current_graph(&events,1,60) {
+                    Ok(Some(g)) if g.nodes.len() == 2 && g.edges.len() == 1 =>
+                        report.push_str("Synthetic evidence graph: 2 nodes, 1 co-occurrence edge; no causal inference.\n"),
+                    _ => return (1, "Synthetic evidence graph unavailable.\n".into()),
+                }
+                let crowded: Vec<_> = (1..=49).map(|id| Event { id, asset: 1, seconds: 0,
+                    signal: if id <= 16 { Signal::IntegrityMismatch } else { Signal::PolicyDenied } }).collect();
+                if current_graph(&crowded,1,0) != Err(GraphError::EdgeLimit) {
+                    return (1, "Synthetic evidence graph capacity check failed.\n".into());
+                }
+                report.push_str("Graph capacity exceeded: rejected, no partial graph.\n");
                 return (0, report);
             }
             Err(_) => return (1, "Synthetic correlation unavailable.\n".into()),

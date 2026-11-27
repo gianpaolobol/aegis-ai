@@ -1162,6 +1162,42 @@ pub mod incident {
         Ok(Some(Timeline { events: scoped, review_evidence }))
     }
 
+
+    /// XDR-03: bounded synthetic evidence graph for one current asset.
+    /// Edges mean temporal co-occurrence only, not causality, direction of attack,
+    /// probability, authorization or an instruction to contain anything.
+    pub const MAX_GRAPH_EDGES: usize = 512;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum GraphError { InvalidTimeline(TimelineError), EdgeLimit }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct EvidenceGraph {
+        pub nodes: Vec<Event>,
+        pub edges: Vec<ReviewEvidence>,
+    }
+    /// Return every qualifying pair within the existing time window, ordered
+    /// by chronological node positions. Reject overflow, never silently truncate.
+    /// Timeline validation precedes projection; no cross-asset edges.
+    pub fn current_graph(events: &[Event], asset: u32, now: u64)
+        -> Result<Option<EvidenceGraph>, GraphError> {
+        let Some(timeline) = current_timeline(events, asset, now)
+            .map_err(GraphError::InvalidTimeline)? else { return Ok(None); };
+        let nodes = timeline.events;
+        let mut edges = Vec::new();
+        for (i, left) in nodes.iter().enumerate() {
+            if left.signal == Signal::Normal { continue; }
+            for right in &nodes[i+1..] {
+                let elapsed_seconds = right.seconds - left.seconds;
+                if elapsed_seconds > WINDOW_SECONDS { break; }
+                if right.signal == Signal::Normal || left.signal == right.signal { continue; }
+                if edges.len() == MAX_GRAPH_EDGES { return Err(GraphError::EdgeLimit); }
+                edges.push(ReviewEvidence { asset, first_event: left.id,
+                    second_event: right.id, first_signal: left.signal,
+                    second_signal: right.signal, elapsed_seconds });
+            }
+        }
+        Ok(Some(EvidenceGraph { nodes, edges }))
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1259,6 +1295,37 @@ pub mod incident {
             assert_eq!(current_timeline(&b,1,0),Err(TimelineError::InvalidBatch(Error::InvalidIdentifier)));
             let over: Vec<_> = (1..=MAX_EVENTS as u32+1).map(|id| e(id,1,0,Normal)).collect();
             assert_eq!(current_timeline(&over,1,0),Err(TimelineError::InvalidBatch(Error::TooManyEvents)));
+        }
+        #[test] fn graph_edges_are_ordered_scoped_and_noncausal() {
+            let a = [e(5,2,0,PolicyDenied),e(4,1,301,NativeProtectionDisabled),
+                e(3,1,300,PolicyDenied),e(2,1,0,Normal),e(1,1,0,IntegrityMismatch)];
+            let mut b = a; b.reverse();
+            let g = current_graph(&a,1,301).unwrap().unwrap();
+            assert_eq!(current_graph(&b,1,301).unwrap(),Some(g.clone()));
+            assert_eq!(g.nodes.iter().map(|n| n.id).collect::<Vec<_>>(),vec![1,2,3,4]);
+            assert_eq!(g.edges.iter().map(|p| (p.asset,p.first_event,p.second_event,p.elapsed_seconds))
+                .collect::<Vec<_>>(),vec![(1,1,3,300),(1,3,4,1)]);
+            assert_eq!(g.edges.first().copied(), current_timeline(&a,1,301).unwrap().unwrap().review_evidence);
+            assert!(current_graph(&a,2,301).unwrap().unwrap().edges.is_empty());
+            assert_eq!(current_graph(&a,3,301),Ok(None));
+        }
+        #[test] fn graph_rejects_invalid_evidence_before_projection() {
+            let a = [e(1,1,0,Normal),e(2,2,601,Normal)];
+            assert_eq!(current_graph(&a,1,600),Err(GraphError::InvalidTimeline(TimelineError::FutureEvent)));
+            assert_eq!(current_graph(&a,2,601),Err(GraphError::InvalidTimeline(TimelineError::StaleSnapshot)));
+            assert_eq!(current_graph(&[a[0],a[0]],1,0),
+                Err(GraphError::InvalidTimeline(TimelineError::InvalidBatch(Error::DuplicateEvent))));
+            assert_eq!(current_graph(&[],0,0),Err(GraphError::InvalidTimeline(TimelineError::InvalidAsset)));
+            assert_eq!(current_graph(&[],1,0),Ok(None));
+        }
+        #[test] fn graph_edge_capacity_never_returns_partial_result() {
+            let mut a: Vec<_> = (1..=48).map(|id| e(id,1,0,
+                if id <= 16 { IntegrityMismatch } else { PolicyDenied })).collect();
+            assert_eq!(current_graph(&a,1,0).unwrap().unwrap().edges.len(),MAX_GRAPH_EDGES);
+            a.push(e(49,1,0,PolicyDenied));
+            assert_eq!(current_graph(&a,1,0),Err(GraphError::EdgeLimit));
+            a.reverse();
+            assert_eq!(current_graph(&a,1,0),Err(GraphError::EdgeLimit));
         }
         #[test] fn bounded_batch() {
             let mut events: Vec<_> = (1..=MAX_EVENTS as u32).map(|id| e(id,1,0,PolicyDenied)).collect();

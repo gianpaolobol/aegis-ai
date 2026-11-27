@@ -95,7 +95,9 @@ fn incident_demo_reports_counts_and_limitations() {
                      "Correlation explanation only; no causal attribution.",
                      "Current fixture timeline (asset 1): 2 events; review evidence: present.",
                      "Unobserved asset: no evidence, not healthy.",
-                     "Stale or future snapshot: rejected."] {
+                     "Stale or future snapshot: rejected.",
+                     "Synthetic evidence graph: 2 nodes, 1 co-occurrence edge; no causal inference.",
+                     "Graph capacity exceeded: rejected, no partial graph."] {
         assert!(stdout(&output).contains(expected));
     }
     assert!(output.stderr.is_empty());
