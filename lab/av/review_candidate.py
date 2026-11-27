@@ -5,6 +5,7 @@ import json
 import re
 import sys
 import unittest
+import tomllib
 from collections import Counter
 from datetime import date as calendar_date
 from pathlib import Path
@@ -14,6 +15,9 @@ SBOM = "dac154f8c401cf5f6270c646c2f828a73bc38ed22629c0fc09d75b65ec030e23"
 REPORT_SHA256 = "64a6fe87a2de29eb6787a01aca7e9e7f698a3a5284587f1507a6fe6a3e008a83"
 REPORT = Path(__file__).resolve().parents[2] / "docs/evidence/yara-x-1.24.0-win-amd64-sbom-components.json"
 MAX_BYTES = 1024 * 1024
+MAX_MANIFEST_BATCH = 4 * 1024 * 1024
+MAX_MANIFEST_BYTES = 64 * 1024
+MAX_MANIFEST_ROWS = 310
 
 # Dated, manually observed upstream package declarations, not verified artifacts.
 # No fetch at runtime; a changed package version needs a new evidence review.
@@ -42,6 +46,12 @@ SOURCE_OBSERVATIONS = (
     ("pkg:cargo/bincode_derive@2.0.1", "bincode_derive", "2.0.1",
      "expression:MIT",
      "https://docs.rs/crate/bincode_derive/2.0.1/source/Cargo.toml", "2026-11-27"),
+    ("pkg:cargo/arbitrary@1.4.2", "arbitrary", "1.4.2",
+     "expression:MIT OR Apache-2.0",
+     "https://docs.rs/crate/arbitrary/1.4.2/source/Cargo.toml", "2026-11-27"),
+    ("pkg:cargo/core-foundation-sys@0.8.7", "core-foundation-sys", "0.8.7",
+     "expression:MIT OR Apache-2.0",
+     "https://docs.rs/crate/core-foundation-sys/0.8.7/source/Cargo.toml", "2026-11-27"),
 )
 
 def unique_object(pairs):
@@ -103,6 +113,57 @@ def reconcile_observations(queue, observations):
             "mutable_url_matches": scope_counts["mutable-url"],
             "pending_comparison_reason_counts": dict(sorted(pending.items())),
             "execution_approved": False}
+
+def compare_manifest_batch(queue, raw):
+    """Compare locally supplied TOML text; source labels are not authenticated.
+    Atomic advisory result: any invalid row rejects the entire batch.
+    No fetching, Cargo invocation, workspace resolution or file writes.
+    """
+    if type(raw) is not bytes or not 1 <= len(raw) <= MAX_MANIFEST_BATCH:
+        return None
+    try:
+        bundle = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object,
+                            parse_constant=reject_constant)
+        if type(bundle) is not list or not 1 <= len(bundle) <= MAX_MANIFEST_ROWS:
+            return None
+        rows = {row["declared_purl"]: row for row in queue}
+        seen, matched = set(), []
+        for item in bundle:
+            if type(item) is not dict or set(item) != {
+                    "declared_purl", "source", "observed_date", "manifest"}:
+                return None
+            purl, source, date, manifest = (item[k] for k in
+                ("declared_purl", "source", "observed_date", "manifest"))
+            if not all(text_label(v) for v in (purl, source, date)) or type(manifest) is not str:
+                return None
+            row = rows.get(purl)
+            if row is None or purl in seen or row["source_identity_scope"] != "unqualified-cargo":
+                return None
+            name, version = row["name"], row["version"]
+            if (observation_scope(name, version, source, date) != "versioned-url"
+                    or not source.endswith(("/source/Cargo.toml", "/source/Cargo.toml.orig"))):
+                return None
+            encoded = manifest.encode("utf-8")
+            if not 1 <= len(encoded) <= MAX_MANIFEST_BYTES:
+                return None
+            package = tomllib.loads(manifest).get("package")
+            if type(package) is not dict or package.get("name") != name or package.get("version") != version:
+                return None
+            license_value = package.get("license")
+            if (not text_label(license_value) or "license-file" in package
+                    or row["declared_licenses"] != ["expression:" + license_value]):
+                return None
+            seen.add(purl)
+            matched.append({"declared_purl": purl, "source": source, "observed_date": date,
+                            "manifest_text_sha256": hashlib.sha256(encoded).hexdigest(),
+                            "declaration_comparison": "exact-match",
+                            "source_authentication": "not-performed",
+                            "license_review": "not-performed", "linkage_review": "not-performed"})
+        return {"schema": "aegis-local-manifest-comparison-v1", "matched": len(matched),
+                "observations": sorted(matched, key=lambda row: row["declared_purl"]),
+                "source_authentication": "not-performed", "execution_approved": False}
+    except (ValueError, TypeError, AttributeError, RecursionError, OverflowError):
+        return None
 
 def retained_review_queue(raw):
     if not matches_report(raw, REPORT_SHA256):
@@ -448,6 +509,45 @@ class Fixtures(unittest.TestCase):
         self.assertEqual(sum(b["versioned_url_matches"] for b in exact_coverage), 1)
         self.assertEqual(sum(b["mutable_url_matches"] for b in exact_coverage), 0)
 
+    def test_local_manifest_batch(self):
+        rows = self.run_obj(self.fixture())["queue"]
+        a = {"declared_purl": "pkg:cargo/fixture-a@1",
+             "source": "https://docs.rs/crate/fixture-a/1/source/Cargo.toml",
+             "observed_date": "2026-11-27",
+             "manifest": '[package]\nname="fixture-a"\nversion="1"\nlicense="MIT"\n'}
+        b = dict(a, declared_purl="pkg:cargo/fixture-b@1",
+                 source="https://docs.rs/crate/fixture-b/1/source/Cargo.toml.orig",
+                 manifest='[package]\nname="fixture-b"\nversion="1"\nlicense="MIT OR LGPL-2.1-or-later"\n')
+        def compare(items):
+            return compare_manifest_batch(rows, json.dumps(items).encode())
+        result = compare([b, a])
+        self.assertEqual(result, compare([a, b]))
+        self.assertEqual(result["matched"], 2)
+        self.assertEqual(result["observations"][0]["manifest_text_sha256"],
+                         hashlib.sha256(a["manifest"].encode()).hexdigest())
+        self.assertFalse(result["execution_approved"])
+        self.assertEqual(result["source_authentication"], "not-performed")
+        for bad in (
+            dict(a, manifest=a["manifest"].replace('license="MIT"', 'license="Apache-2.0"')),
+            dict(a, manifest=a["manifest"].replace('version="1"', 'version="2"')),
+            dict(a, manifest=a["manifest"].replace('name="fixture-a"', 'name="wrong"')),
+            dict(a, manifest=a["manifest"].replace('license="MIT"', 'license.workspace=true')),
+            dict(a, manifest=a["manifest"] + 'license-file="LICENSE"\n'),
+            dict(a, manifest=a["manifest"] + 'license="MIT"\n'),
+            dict(a, manifest="x" * (MAX_MANIFEST_BYTES + 1)),
+            dict(a, source=a["source"].replace("/1/", "/latest/")),
+            dict(a, source="https://docs.rs/crate/fixture-a/1"),
+            dict(a, observed_date="2026-02-30"),
+            dict(a, declared_purl="pkg:cargo/unknown@1"),
+            dict(a, extra=True),
+        ):
+            self.assertIsNone(compare([b, bad]))
+        self.assertIsNone(compare([a, a]))
+        self.assertIsNone(compare([]))
+        self.assertIsNone(compare([a] * (MAX_MANIFEST_ROWS + 1)))
+        self.assertIsNone(compare_manifest_batch(rows, b"x" * (MAX_MANIFEST_BATCH + 1)))
+        self.assertIsNone(compare_manifest_batch(rows, b'[{"manifest":"a","manifest":"b"}]'))
+
     def test_duplicate_json_and_size(self):
         self.assertIsNone(review_queue(b'{"schema":0,"schema":1}'))
         self.assertIsNone(review_queue(b'x' * (MAX_BYTES + 1)))
@@ -464,6 +564,20 @@ class Fixtures(unittest.TestCase):
 def main():
     if sys.argv[1:] == ["--self-test"]:
         unittest.main(argv=[sys.argv[0]])
+    elif sys.argv[1:] == ["--compare-manifests"]:
+        try:
+            with REPORT.open("rb") as stream:
+                retained = retained_review_queue(stream.read(MAX_BYTES + 1))
+            result = (compare_manifest_batch(retained["queue"],
+                       sys.stdin.buffer.read(MAX_MANIFEST_BATCH + 1))
+                      if retained is not None else None)
+        except OSError:
+            result = None
+        if result is None:
+            print("Local manifest comparison unavailable or inconsistent.")
+            return 1
+        print(json.dumps(result, sort_keys=True, ensure_ascii=True))
+        return 0
     elif sys.argv[1:] == ["--review-queue"]:
         try:
             with REPORT.open("rb") as stream:
@@ -476,7 +590,7 @@ def main():
         print(json.dumps(result, sort_keys=True, ensure_ascii=True))
         return 0
     else:
-        print("Use --self-test or --review-queue.")
+        print("Use --self-test, --review-queue or --compare-manifests (JSON on stdin).")
         return 2
 
 if __name__ == "__main__":
