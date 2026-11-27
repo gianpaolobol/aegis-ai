@@ -166,6 +166,7 @@ fn recovery_demo_is_advisory_and_rejects_extra_arguments() {
     for expected in ["Copies: 3", "Failure domains: 3", "Known media: 2",
         "Complete fixture: FixtureCriteriaReported", "Missing isolated restore: ReviewRequired",
         "Restore objectives: FixtureObjectivesReported", "Late restore: ObjectivesMissed",
+        "Linked inventory exercise: LinkedFixtureReported", "Unlinked receipt: ReceiptNotLinked",
         "no backup inspection or restore performed", "Recovery capability not established"] {
         assert!(stdout(&output).contains(expected));
     }

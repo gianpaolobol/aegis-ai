@@ -41,6 +41,10 @@ pub struct Report {
 /// The isolated restore must refer to an actual backup with isolation reported,
 /// not to the original or a different copy. No unknown is positive evidence.
 pub fn assess(copies: &[CopyFixture], now: u64, max_restore_age: u64) -> Result<Report, Error> {
+    assess_inner(copies, now, max_restore_age, None)
+}
+fn assess_inner(copies: &[CopyFixture], now: u64, max_restore_age: u64,
+    required_restore: Option<u16>) -> Result<Report, Error> {
     if now == 0 || max_restore_age == 0 || max_restore_age > now {
         return Err(Error::InvalidScope);
     }
@@ -97,7 +101,8 @@ pub fn assess(copies: &[CopyFixture], now: u64, max_restore_age: u64) -> Result<
             b.failure_domain != a.failure_domain &&
             (a.medium != original.medium || b.medium != original.medium) &&
             (a.offsite == Evidence::ReportedYes || b.offsite == Evidence::ReportedYes) &&
-            [a,b].iter().any(|c| c.offline_or_immutable == Evidence::ReportedYes &&
+            [a,b].iter().any(|c| required_restore.is_none_or(|id| c.id == id) &&
+                c.offline_or_immutable == Evidence::ReportedYes &&
                 c.restore_verified_at.is_some_and(|at| now - at <= max_restore_age))));
     let verdict = if witness && encrypted && separate {
         Verdict::FixtureCriteriaReported
@@ -155,6 +160,37 @@ pub fn assess_objectives(plan: RestorePlan, receipt: Option<RestoreReceipt>,
         return ObjectivesMissed;
     }
     FixtureObjectivesReported
+}
+/// Combined advisory only: callers supply one synthetic dataset inventory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkedVerdict {
+    Objectives(ObjectiveVerdict),
+    ReceiptNotLinked,
+    InventoryReviewRequired,
+    LinkedFixtureReported,
+}
+/// The exercise receipt must match the actual isolated backup in the same
+/// 3-2-1 witness, including its reported restore completion time. Neither
+/// the inventory nor the clock or receipt is authenticated here.
+pub fn assess_linked_objectives(copies: &[CopyFixture], plan: RestorePlan,
+    receipt: Option<RestoreReceipt>, now: u64, max_restore_age: u64)
+    -> Result<LinkedVerdict, Error> {
+    // Validate every inventory entry even when the receipt is missing.
+    let report = assess_inner(copies, now, max_restore_age, Some(plan.copy))?;
+    let objectives = assess_objectives(plan, receipt, now);
+    if objectives != ObjectiveVerdict::FixtureObjectivesReported {
+        return Ok(LinkedVerdict::Objectives(objectives));
+    }
+    let Some(r) = receipt else { return Ok(LinkedVerdict::ReceiptNotLinked); };
+    if !copies.iter().any(|c| c.kind == Kind::Backup && c.id == r.copy &&
+        c.offline_or_immutable == Evidence::ReportedYes &&
+        c.restore_verified_at == Some(r.completed_at)) {
+        return Ok(LinkedVerdict::ReceiptNotLinked);
+    }
+    if report.verdict != Verdict::FixtureCriteriaReported {
+        return Ok(LinkedVerdict::InventoryReviewRequired);
+    }
+    Ok(LinkedVerdict::LinkedFixtureReported)
 }
 /// Fixed harmless scenario for CLI and regression tests.
 pub fn example() -> [CopyFixture; 3] {
@@ -282,6 +318,46 @@ mod tests {
         }
         assert_eq!(assess_objectives(RestorePlan { exercise: 0, ..p },Some(r),120),InvalidPlan);
         assert_eq!(assess_objectives(p,Some(r),99),InvalidPlan);
+    }
+    #[test] fn linked_restore_requires_exact_receipt_and_copy() {
+        use LinkedVerdict::*;
+        let (p,r) = objective_fixture();
+        let mut c = example();
+        c[2].restore_verified_at = Some(120);
+        assert_eq!(assess_linked_objectives(&c,p,Some(r),120,20),Ok(LinkedFixtureReported));
+        c[2].restore_verified_at = Some(119);
+        assert_eq!(assess_linked_objectives(&c,p,Some(r),120,20),Ok(ReceiptNotLinked));
+        c[2].restore_verified_at = Some(120);
+        let p = RestorePlan { copy: 1, ..p };
+        let r = RestoreReceipt { copy: 1, ..r };
+        assert_eq!(assess_linked_objectives(&c,p,Some(r),120,20),Ok(ReceiptNotLinked));
+    }
+    #[test] fn linked_restore_cannot_borrow_unrelated_witness() {
+        use LinkedVerdict::*;
+        let (p,r) = objective_fixture();
+        let mut c = example().to_vec();
+        c[2].restore_verified_at = Some(120);
+        let extra = CopyFixture { id: 4, failure_domain: 1, ..c[2] };
+        c.push(extra);
+        assert_eq!(assess(&c,120,20).unwrap().verdict,Verdict::FixtureCriteriaReported);
+        let p = RestorePlan { copy: 4, ..p };
+        let r = RestoreReceipt { copy: 4, ..r };
+        assert_eq!(assess_linked_objectives(&c,p,Some(r),120,20),Ok(InventoryReviewRequired));
+    }
+    #[test] fn linked_restore_preserves_negative_checks() {
+        use LinkedVerdict::*;
+        let (p,r) = objective_fixture();
+        let mut c = example();
+        c[2].restore_verified_at = Some(120);
+        assert_eq!(assess_linked_objectives(&c,p,None,120,20),
+            Ok(Objectives(ObjectiveVerdict::MissingOrMismatchedEvidence)));
+        assert_eq!(assess_linked_objectives(&c,p,Some(RestoreReceipt {
+            recovery_point: 89, ..r }),120,20),Ok(Objectives(ObjectiveVerdict::ObjectivesMissed)));
+        assert_eq!(assess_linked_objectives(&c,p,Some(r),141,20),Ok(InventoryReviewRequired));
+        c[1].encrypted = Evidence::Unknown;
+        assert_eq!(assess_linked_objectives(&c,p,Some(r),120,20),Ok(InventoryReviewRequired));
+        c[1].id = c[0].id;
+        assert_eq!(assess_linked_objectives(&c,p,None,120,20),Err(Error::InvalidInventory));
     }
     #[test] fn future_and_original_restore_rejected() {
         let mut c = example(); c[2].restore_verified_at = Some(101);
