@@ -1058,7 +1058,7 @@ pub mod incident {
     pub const WINDOW_SECONDS: u64 = 300;
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Signal { Normal, IntegrityMismatch, PolicyDenied, NativeProtectionDisabled }
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Event {
         pub id: u32,
         pub asset: u32,
@@ -1127,6 +1127,41 @@ pub mod incident {
             assets_with_advisories: advisory, assets_for_review: review_evidence.len(),
             review_evidence })
     }
+    /// XDR-02: scoped synthetic timeline, with a caller-supplied observation time.
+    /// The 600s snapshot limit is a demonstrator choice, not a security standard.
+    /// No live telemetry, authenticated clock, authorization or proof of safety.
+    pub const SNAPSHOT_MAX_AGE: u64 = 600;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TimelineError {
+        InvalidAsset, InvalidBatch(Error), FutureEvent, StaleSnapshot,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Timeline {
+        pub events: Vec<Event>,
+        pub review_evidence: Option<ReviewEvidence>,
+    }
+    /// Validate the entire bounded snapshot before returning any scoped data.
+    /// A stale or future event invalidates the snapshot, even for another asset.
+    /// None means not observed, never healthy. Returned events are chronological,
+    /// with stable event-ID tie breaking. This is a local synthetic view only.
+    pub fn current_timeline(events: &[Event], asset: u32, now: u64)
+        -> Result<Option<Timeline>, TimelineError> {
+        if asset == 0 { return Err(TimelineError::InvalidAsset); }
+        let summary = correlate(events).map_err(TimelineError::InvalidBatch)?;
+        // Stable error precedence even if the fixture input order changes.
+        if events.iter().any(|e| e.seconds > now) {
+            return Err(TimelineError::FutureEvent);
+        }
+        if events.iter().any(|e| now - e.seconds > SNAPSHOT_MAX_AGE) {
+            return Err(TimelineError::StaleSnapshot);
+        }
+        let mut scoped: Vec<_> = events.iter().copied().filter(|e| e.asset == asset).collect();
+        if scoped.is_empty() { return Ok(None); }
+        scoped.sort_unstable_by_key(|e| (e.seconds, e.id));
+        let review_evidence = summary.review_evidence.into_iter().find(|p| p.asset == asset);
+        Ok(Some(Timeline { events: scoped, review_evidence }))
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1194,6 +1229,36 @@ pub mod incident {
             ] {
                 assert!(correlate(&events).unwrap().review_evidence.is_empty());
             }
+        }
+        #[test] fn current_timeline_is_scoped_ordered_and_explainable() {
+            let a = [e(3,2,10,PolicyDenied), e(2,1,10,PolicyDenied),
+                e(1,1,10,IntegrityMismatch), e(4,1,11,Normal)];
+            let mut b = a; b.reverse();
+            let t = current_timeline(&a,1,20).unwrap().unwrap();
+            assert_eq!(current_timeline(&b,1,20).unwrap(), Some(t.clone()));
+            assert_eq!(t.events.iter().map(|x| x.id).collect::<Vec<_>>(), vec![1,2,4]);
+            assert_eq!(t.review_evidence.unwrap().second_event,2);
+            assert_eq!(current_timeline(&a,2,20).unwrap().unwrap().review_evidence,None);
+            assert_eq!(current_timeline(&a,3,20),Ok(None));
+            assert_eq!(current_timeline(&[],1,20),Ok(None));
+        }
+        #[test] fn timeline_age_boundaries_and_cross_asset_invalidity() {
+            let a = [e(1,1,10,Normal),e(2,2,0,Normal)];
+            assert!(current_timeline(&a,1,600).unwrap().is_some());
+            assert_eq!(current_timeline(&a,1,601),Err(TimelineError::StaleSnapshot));
+            let b = [e(1,1,0,Normal),e(2,2,u64::MAX,Normal)];
+            assert_eq!(current_timeline(&b,1,601),Err(TimelineError::FutureEvent));
+            assert_eq!(current_timeline(&[b[1],b[0]],1,601),Err(TimelineError::FutureEvent));
+            assert!(current_timeline(&[b[1]],2,u64::MAX).unwrap().is_some());
+        }
+        #[test] fn timeline_rejects_invalid_snapshot_before_projection() {
+            assert_eq!(current_timeline(&[],0,0),Err(TimelineError::InvalidAsset));
+            let a = [e(1,1,0,Normal),e(1,2,0,PolicyDenied)];
+            assert_eq!(current_timeline(&a,1,0),Err(TimelineError::InvalidBatch(Error::DuplicateEvent)));
+            let b = [e(1,1,0,Normal),e(2,0,0,Normal)];
+            assert_eq!(current_timeline(&b,1,0),Err(TimelineError::InvalidBatch(Error::InvalidIdentifier)));
+            let over: Vec<_> = (1..=MAX_EVENTS as u32+1).map(|id| e(id,1,0,Normal)).collect();
+            assert_eq!(current_timeline(&over,1,0),Err(TimelineError::InvalidBatch(Error::TooManyEvents)));
         }
         #[test] fn bounded_batch() {
             let mut events: Vec<_> = (1..=MAX_EVENTS as u32).map(|id| e(id,1,0,PolicyDenied)).collect();

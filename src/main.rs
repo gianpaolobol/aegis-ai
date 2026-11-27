@@ -134,7 +134,7 @@ fn run(args: &[OsString]) -> (i32, String) {
         return (0, report);
     }
     if arg == OsStr::new("demo-incidents") {
-        use aegis_policy::incident::{correlate, Event, Signal};
+        use aegis_policy::incident::{correlate, current_timeline, Event, Signal, TimelineError};
         let events = [
             Event { id: 1, asset: 1, seconds: 0, signal: Signal::IntegrityMismatch },
             Event { id: 2, asset: 1, seconds: 60, signal: Signal::PolicyDenied },
@@ -150,6 +150,16 @@ fn run(args: &[OsString]) -> (i32, String) {
                         p.asset, p.first_event, p.first_signal, p.second_event, p.second_signal, p.elapsed_seconds));
                 }
                 report.push_str("Correlation explanation only; no causal attribution.\n");
+                match current_timeline(&events, 1, 60) {
+                    Ok(Some(t)) => report.push_str(&format!("Current fixture timeline (asset 1): {} events; review evidence: {}.\n", t.events.len(), if t.review_evidence.is_some() { "present" } else { "none" })),
+                    _ => return (1, "Synthetic timeline unavailable.\n".into()),
+                }
+                if current_timeline(&events, 4, 60) != Ok(None) ||
+                    current_timeline(&events, 1, 601) != Err(TimelineError::StaleSnapshot) ||
+                    current_timeline(&events, 1, 59) != Err(TimelineError::FutureEvent) {
+                    return (1, "Synthetic timeline checks failed.\n".into());
+                }
+                report.push_str("Unobserved asset: no evidence, not healthy.\nStale or future snapshot: rejected.\n");
                 return (0, report);
             }
             Err(_) => return (1, "Synthetic correlation unavailable.\n".into()),

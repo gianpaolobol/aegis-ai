@@ -92,7 +92,10 @@ fn incident_demo_reports_counts_and_limitations() {
                      "Assets for review: 1", "not live telemetry or enforcement",
                      "No attack probability or safety established",
                      "Fixture asset 1: event 1 (IntegrityMismatch) + event 2 (PolicyDenied), 60 seconds apart.",
-                     "Correlation explanation only; no causal attribution."] {
+                     "Correlation explanation only; no causal attribution.",
+                     "Current fixture timeline (asset 1): 2 events; review evidence: present.",
+                     "Unobserved asset: no evidence, not healthy.",
+                     "Stale or future snapshot: rejected."] {
         assert!(stdout(&output).contains(expected));
     }
     assert!(output.stderr.is_empty());
