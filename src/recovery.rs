@@ -192,6 +192,169 @@ pub fn assess_linked_objectives(copies: &[CopyFixture], plan: RestorePlan,
     }
     Ok(LinkedVerdict::LinkedFixtureReported)
 }
+/// REC portfolio: a bounded synthetic coverage check over an explicit list
+/// of required dataset plans. Copy IDs are scoped to their dataset inventory.
+/// No authentication, backup access, restore, or production assurance.
+pub const MAX_DATASETS: usize = 32;
+
+#[derive(Clone, Copy, Debug)]
+pub struct DatasetExercise<'a> {
+    pub dataset: u16,
+    pub copies: &'a [CopyFixture],
+    pub receipt: Option<RestoreReceipt>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortfolioError {
+    InvalidScope,
+    InvalidRequiredPlans,
+    UnexpectedOrDuplicateDataset,
+    InvalidInventory { dataset: u16, error: Error },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DatasetVerdict { MissingInventory, Evaluated(LinkedVerdict) }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortfolioReport {
+    pub datasets: Vec<(u16, DatasetVerdict)>,
+    pub all_fixture_criteria_reported: bool,
+}
+
+/// Required plans come from the synthetic harness separately from submitted
+/// evidence. Omitted datasets cannot disappear from the result. Unexpected
+/// or duplicate evidence rejects the entire portfolio; malformed inventories
+/// are never silently skipped. Results are sorted by dataset ID.
+pub fn assess_portfolio(required: &[RestorePlan], exercises: &[DatasetExercise<'_>],
+    now: u64, max_restore_age: u64) -> Result<PortfolioReport, PortfolioError> {
+    use std::collections::BTreeMap;
+    if now == 0 || max_restore_age == 0 || max_restore_age > now {
+        return Err(PortfolioError::InvalidScope);
+    }
+    if required.is_empty() || required.len() > MAX_DATASETS ||
+        exercises.len() > MAX_DATASETS {
+        return Err(PortfolioError::InvalidRequiredPlans);
+    }
+    let mut plans = BTreeMap::new();
+    for &plan in required {
+        if assess_objectives(plan, None, now) == ObjectiveVerdict::InvalidPlan ||
+            plans.insert(plan.dataset, plan).is_some() {
+            return Err(PortfolioError::InvalidRequiredPlans);
+        }
+    }
+    let mut evidence = BTreeMap::new();
+    for exercise in exercises {
+        if !plans.contains_key(&exercise.dataset) ||
+            evidence.insert(exercise.dataset, exercise).is_some() {
+            return Err(PortfolioError::UnexpectedOrDuplicateDataset);
+        }
+    }
+    let mut datasets = Vec::with_capacity(plans.len());
+    for (id, plan) in plans {
+        let verdict = match evidence.get(&id) {
+            None => DatasetVerdict::MissingInventory,
+            Some(e) => DatasetVerdict::Evaluated(
+                assess_linked_objectives(e.copies, plan, e.receipt, now, max_restore_age)
+                    .map_err(|error| PortfolioError::InvalidInventory { dataset: id, error })?),
+        };
+        datasets.push((id, verdict));
+    }
+    let all_fixture_criteria_reported = datasets.iter().all(|(_, verdict)|
+        *verdict == DatasetVerdict::Evaluated(LinkedVerdict::LinkedFixtureReported));
+    Ok(PortfolioReport { datasets, all_fixture_criteria_reported })
+}
+
+#[cfg(test)]
+mod portfolio_tests {
+    use super::*;
+
+    fn fixture() -> ([CopyFixture; 3], RestorePlan, RestoreReceipt) {
+        let mut copies = example();
+        copies[2].restore_verified_at = Some(120);
+        let plan = RestorePlan { dataset: 1, copy: 3, exercise: 7, incident_at: 100,
+            max_data_loss: 10, max_downtime: 20 };
+        let receipt = RestoreReceipt { dataset: 1, copy: 3, exercise: 7,
+            recovery_point: 90, completed_at: 120, integrity: Evidence::ReportedYes,
+            functional_check: Evidence::ReportedYes };
+        (copies, plan, receipt)
+    }
+
+    #[test]
+    fn complete_portfolio_is_order_independent() {
+        let (c,p,r) = fixture();
+        let p2 = RestorePlan { dataset: 2, ..p };
+        let e1 = DatasetExercise { dataset: 1, copies: &c, receipt: Some(r) };
+        let e2 = DatasetExercise { dataset: 2, copies: &c,
+            receipt: Some(RestoreReceipt { dataset: 2, ..r }) };
+        let a = assess_portfolio(&[p,p2], &[e1,e2],120,20).unwrap();
+        let b = assess_portfolio(&[p2,p], &[e2,e1],120,20).unwrap();
+        assert_eq!(a,b);
+        assert!(a.all_fixture_criteria_reported);
+        assert_eq!(a.datasets.iter().map(|x| x.0).collect::<Vec<_>>(), vec![1,2]);
+    }
+
+    #[test]
+    fn missing_dataset_and_missing_receipt_are_distinct() {
+        let (c,p,r) = fixture();
+        let p2 = RestorePlan { dataset: 2, ..p };
+        let e = DatasetExercise { dataset: 1, copies: &c, receipt: Some(r) };
+        let result = assess_portfolio(&[p,p2], &[e],120,20).unwrap();
+        assert!(!result.all_fixture_criteria_reported);
+        assert_eq!(result.datasets[1], (2,DatasetVerdict::MissingInventory));
+        let e2 = DatasetExercise { dataset: 2, receipt: None, ..e };
+        let result = assess_portfolio(&[p,p2], &[e,e2],120,20).unwrap();
+        assert!(!result.all_fixture_criteria_reported);
+        assert_eq!(result.datasets[1].1, DatasetVerdict::Evaluated(
+            LinkedVerdict::Objectives(ObjectiveVerdict::MissingOrMismatchedEvidence)));
+    }
+
+    #[test]
+    fn receipt_cannot_cross_dataset_or_exercise() {
+        let (c,p,r) = fixture();
+        let p2 = RestorePlan { dataset: 2, ..p };
+        let e1 = DatasetExercise { dataset: 1, copies: &c, receipt: Some(r) };
+        for wrong in [r, RestoreReceipt { dataset: 2, exercise: 8, ..r }] {
+            let e2 = DatasetExercise { dataset: 2, receipt: Some(wrong), ..e1 };
+            let result = assess_portfolio(&[p,p2], &[e1,e2],120,20).unwrap();
+            assert!(!result.all_fixture_criteria_reported);
+            assert_eq!(result.datasets[1].1, DatasetVerdict::Evaluated(
+                LinkedVerdict::Objectives(ObjectiveVerdict::MissingOrMismatchedEvidence)));
+        }
+    }
+
+    #[test]
+    fn reject_duplicate_unexpected_invalid_and_oversize() {
+        let (c,p,r) = fixture();
+        let e = DatasetExercise { dataset: 1, copies: &c, receipt: Some(r) };
+        assert_eq!(assess_portfolio(&[p,p], &[e],120,20),
+            Err(PortfolioError::InvalidRequiredPlans));
+        assert_eq!(assess_portfolio(&[p], &[e,e],120,20),
+            Err(PortfolioError::UnexpectedOrDuplicateDataset));
+        assert_eq!(assess_portfolio(&[p], &[DatasetExercise { dataset: 2, ..e }],120,20),
+            Err(PortfolioError::UnexpectedOrDuplicateDataset));
+        assert_eq!(assess_portfolio(&[], &[],120,20),Err(PortfolioError::InvalidRequiredPlans));
+        assert_eq!(assess_portfolio(&[p;MAX_DATASETS+1], &[],120,20),
+            Err(PortfolioError::InvalidRequiredPlans));
+        assert_eq!(assess_portfolio(&[p], &[e;MAX_DATASETS+1],120,20),
+            Err(PortfolioError::InvalidRequiredPlans));
+        assert_eq!(assess_portfolio(&[p], &[],0,20),Err(PortfolioError::InvalidScope));
+        assert_eq!(assess_portfolio(&[RestorePlan { dataset: 0, ..p }], &[],120,20),
+            Err(PortfolioError::InvalidRequiredPlans));
+    }
+
+    #[test]
+    fn malformed_inventory_rejected_even_without_receipt() {
+        let (c,p,r) = fixture();
+        let p2 = RestorePlan { dataset: 2, ..p };
+        let mut bad = c;
+        bad[2].id = bad[1].id;
+        let e1 = DatasetExercise { dataset: 1, copies: &c, receipt: Some(r) };
+        let e2 = DatasetExercise { dataset: 2, copies: &bad, receipt: None };
+        assert_eq!(assess_portfolio(&[p,p2], &[e1,e2],120,20),
+            Err(PortfolioError::InvalidInventory { dataset: 2, error: Error::InvalidInventory }));
+    }
+}
+
 /// Fixed harmless scenario for CLI and regression tests.
 pub fn example() -> [CopyFixture; 3] {
     use Evidence::{ReportedYes as Yes, ReportedNo as No, Unknown};

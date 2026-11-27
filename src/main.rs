@@ -330,7 +330,8 @@ fn run(args: &[OsString]) -> (i32, String) {
     }
     if arg == OsStr::new("demo-recovery") {
         use aegis_policy::recovery::{assess, example, Verdict, assess_objectives,
-            RestorePlan, RestoreReceipt, Evidence, ObjectiveVerdict, assess_linked_objectives, LinkedVerdict};
+            RestorePlan, RestoreReceipt, Evidence, ObjectiveVerdict, assess_linked_objectives, LinkedVerdict,
+            assess_portfolio, DatasetExercise};
         let mut c = example();
         let complete = assess(&c, 100, 20);
         c[2].restore_verified_at = None;
@@ -346,6 +347,19 @@ fn run(args: &[OsString]) -> (i32, String) {
         let linked = assess_linked_objectives(&c, plan, Some(receipt), 120, 20);
         c[2].restore_verified_at = Some(119);
         let unlinked = assess_linked_objectives(&c, plan, Some(receipt), 120, 20);
+        c[2].restore_verified_at = Some(120);
+        let plan2 = RestorePlan { dataset: 2, ..plan };
+        let e1 = DatasetExercise { dataset: 1, copies: &c, receipt: Some(receipt) };
+        let e2 = DatasetExercise { dataset: 2, copies: &c,
+            receipt: Some(RestoreReceipt { dataset: 2, ..receipt }) };
+        let portfolio = assess_portfolio(&[plan,plan2], &[e1,e2],120,20);
+        let incomplete = assess_portfolio(&[plan,plan2], &[e1],120,20);
+        let (Ok(portfolio), Ok(incomplete)) = (portfolio,incomplete) else {
+            return (1, "Synthetic recovery portfolio unavailable.\n".into());
+        };
+        if !portfolio.all_fixture_criteria_reported || incomplete.all_fixture_criteria_reported {
+            return (1, "Unexpected synthetic recovery portfolio result.\n".into());
+        }
         if objectives != ObjectiveVerdict::FixtureObjectivesReported ||
             missed != ObjectiveVerdict::ObjectivesMissed ||
             linked != Ok(LinkedVerdict::LinkedFixtureReported) ||
@@ -355,9 +369,10 @@ fn run(args: &[OsString]) -> (i32, String) {
         match (complete, missing) {
             (Ok(a), Ok(b)) if a.verdict == Verdict::FixtureCriteriaReported &&
                 b.verdict == Verdict::ReviewRequired => return (0, format!(
-                    "Synthetic recovery readiness; no backup inspection or restore performed.\nCopies: {}\nFailure domains: {}\nKnown media: {}\nComplete fixture: {:?}\nMissing isolated restore: {:?}\nRestore objectives: {:?}\nLate restore: {:?}\nLinked inventory exercise: {:?}\nUnlinked receipt: {:?}\nRecovery capability not established.\n",
+                    "Synthetic recovery readiness; no backup inspection or restore performed.\nCopies: {}\nFailure domains: {}\nKnown media: {}\nComplete fixture: {:?}\nMissing isolated restore: {:?}\nRestore objectives: {:?}\nLate restore: {:?}\nLinked inventory exercise: {:?}\nUnlinked receipt: {:?}\nAll required dataset fixtures reported: {}\nMissing dataset coverage reported complete: {}\nRecovery capability not established.\n",
                     a.copies, a.failure_domains, a.known_media, a.verdict, b.verdict, objectives, missed,
-                    linked.unwrap(), unlinked.unwrap())),
+                    linked.unwrap(), unlinked.unwrap(), portfolio.all_fixture_criteria_reported,
+                    incomplete.all_fixture_criteria_reported)),
             _ => return (1, "Synthetic recovery assessment unavailable.\n".into()),
         }
     }
