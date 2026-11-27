@@ -156,6 +156,14 @@ class Fixtures(unittest.TestCase):
         oversized = b"x" * (MAX_BYTES + 1)
         self.assertFalse(matches_report(oversized, hashlib.sha256(oversized).hexdigest()))
 
+    def test_checkout_line_endings_are_not_normalized(self):
+        raw = (json.dumps(self.fixture(), indent=2) + "\n").encode("ascii")
+        converted = raw.replace(b"\n", b"\r\n")
+        expected = hashlib.sha256(raw).hexdigest()
+        self.assertEqual(review_queue(raw), review_queue(converted))
+        self.assertTrue(matches_report(raw, expected))
+        self.assertFalse(matches_report(converted, expected))
+
     def test_unreviewed_scope_required(self):
         for field in ("dependency_linkage_review", "license_expression_validation",
                       "purl_validation", "schema_validation"):
