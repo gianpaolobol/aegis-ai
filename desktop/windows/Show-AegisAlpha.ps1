@@ -956,6 +956,94 @@ function Test-AegisBootTrustReport {
     Write-Output 'PASS: boot trust snapshot synthetic fixtures'
 }
 
+
+# UAC policy snapshot: read only the fixed documented DWORDs, never modify policy.
+function Read-AegisUacPolicy {
+    $base = $null
+    $key = $null
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine,[Microsoft.Win32.RegistryView]::Registry64)
+        $key = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System',$false)
+        if ($null -eq $key) { return }
+        $values = @{}
+        foreach ($name in @('EnableLUA','PromptOnSecureDesktop','ConsentPromptBehaviorAdmin','ConsentPromptBehaviorUser','FilterAdministratorToken','EnableSecureUIAPaths')) {
+            try {
+                if ($key.GetValueKind($name) -eq [Microsoft.Win32.RegistryValueKind]::DWord) {
+                    $values[$name] = $key.GetValue($name,$null)
+                }
+            } catch { } # Missing, denied or unreadable: do not infer defaults.
+        }
+        [pscustomobject]$values
+    } finally {
+        if ($null -ne $key) { $key.Dispose() }
+        if ($null -ne $base) { $base.Dispose() }
+    }
+}
+function Get-AegisUacValue($Record,[string]$Name,[hashtable]$Labels) {
+    if ($null -eq $Record) { return 'Unknown' }
+    $p = $Record.PSObject.Properties[$Name]
+    if ($null -eq $p -or $p.Value -isnot [int32]) { return 'Unknown' }
+    if (-not $Labels.ContainsKey($p.Value)) { return 'Unknown' }
+    return $Labels[$p.Value]
+}
+function Get-AegisUacReport([scriptblock]$ReadPolicy) {
+    $record = $null
+    try {
+        $records = @(& $ReadPolicy | Select-Object -First 2)
+        if ($records.Count -eq 1) { $record = $records[0] }
+    } catch { $record = $null }
+    $binary = @{0='Reported disabled';1='Reported enabled'}
+    $lua = Get-AegisUacValue $record 'EnableLUA' $binary
+    $desktop = Get-AegisUacValue $record 'PromptOnSecureDesktop' $binary
+    $admin = Get-AegisUacValue $record 'ConsentPromptBehaviorAdmin' @{0='Reported no prompt';1='Reported credentials (secure desktop setting)';2='Reported consent (secure desktop setting)';3='Reported credentials';4='Reported consent';5='Reported consent for non-Windows binaries'}
+    $user = Get-AegisUacValue $record 'ConsentPromptBehaviorUser' @{0='Reported automatic denial';1='Reported credentials (secure desktop setting)';3='Reported credentials'}
+    $builtin = Get-AegisUacValue $record 'FilterAdministratorToken' $binary
+    $paths = Get-AegisUacValue $record 'EnableSecureUIAPaths' $binary
+    $review = 'Review configuration; no effective protection conclusion.'
+    if ($lua -eq 'Reported disabled') { $review = 'Review required: Admin Approval Mode disabled in registry.' }
+    elseif ($admin -eq 'Reported no prompt') { $review = 'Review required: administrator elevation configured without prompt.' }
+    elseif ($desktop -eq 'Reported disabled') { $review = 'Review required: secure desktop switch disabled in registry.' }
+    elseif ($paths -eq 'Reported disabled') { $review = 'Review required: secure UIAccess path restriction disabled in registry.' }
+    return (@('Windows UAC registry policy snapshot (read-only).',
+        "Admin Approval Mode : $lua",
+        "Secure desktop switch : $desktop",
+        "Administrator prompt policy : $admin",
+        "Standard user prompt policy : $user",
+        "Built-in administrator approval mode : $builtin",
+        "Secure UIAccess paths : $paths",
+        $review,
+        'Unknown includes absent, denied, unsupported or invalid values. Defaults are not inferred.',
+        'Registry configuration is not effective runtime policy, elevation proof or safety. No changes made.') -join [Environment]::NewLine)
+}
+function Test-AegisUacReport {
+    $good = { [pscustomobject]@{EnableLUA=1;PromptOnSecureDesktop=1;ConsentPromptBehaviorAdmin=5;ConsentPromptBehaviorUser=0;FilterAdministratorToken=0;EnableSecureUIAPaths=1;PrivateField='SYNTHETIC-PRIVATE'} }
+    $report = Get-AegisUacReport $good
+    foreach ($expected in @('Admin Approval Mode : Reported enabled','Secure desktop switch : Reported enabled','Administrator prompt policy : Reported consent for non-Windows binaries','Standard user prompt policy : Reported automatic denial','Built-in administrator approval mode : Reported disabled','Secure UIAccess paths : Reported enabled','no effective protection conclusion')) {
+        if (-not $report.Contains($expected)) { throw 'UAC fixture mismatch' }
+    }
+    if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'UAC privacy regression' }
+    foreach ($read in @({}, { throw 'SYNTHETIC-PRIVATE' }, { & $good; & $good }, { [pscustomobject]@{EnableLUA='1';PromptOnSecureDesktop=$true;ConsentPromptBehaviorAdmin=99;ConsentPromptBehaviorUser=2;FilterAdministratorToken=@(1);EnableSecureUIAPaths=-1} })) {
+        $report = Get-AegisUacReport $read
+        foreach ($label in @('Admin Approval Mode','Secure desktop switch','Administrator prompt policy','Standard user prompt policy','Built-in administrator approval mode','Secure UIAccess paths')) {
+            if (-not $report.Contains($label + ' : Unknown')) { throw 'Invalid UAC value accepted' }
+        }
+        if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'UAC error disclosure' }
+    }
+    foreach ($case in @(
+        @{Reader={ [pscustomobject]@{EnableLUA=0;ConsentPromptBehaviorAdmin=0;PromptOnSecureDesktop=0} };Expected='Admin Approval Mode disabled in registry'},
+        @{Reader={ [pscustomobject]@{EnableLUA=1;ConsentPromptBehaviorAdmin=0} };Expected='administrator elevation configured without prompt'},
+        @{Reader={ [pscustomobject]@{EnableLUA=1;PromptOnSecureDesktop=0} };Expected='secure desktop switch disabled in registry'},
+        @{Reader={ [pscustomobject]@{EnableLUA=1;EnableSecureUIAPaths=0} };Expected='secure UIAccess path restriction disabled in registry'}
+    )) {
+        if (-not (Get-AegisUacReport $case.Reader).Contains($case.Expected)) { throw 'UAC review condition missed' }
+    }
+    for ($i=0;$i -le 5;$i++) {
+        if ((Get-AegisUacValue ([pscustomobject]@{Value=$i}) 'Value' @{0='a';1='b';2='c';3='d';4='e';5='f'}) -eq 'Unknown') { throw 'UAC integer mapping failed' }
+    }
+    Write-Output 'PASS: UAC policy snapshot synthetic fixtures'
+}
+
+
 if ($SelfTest) {
     foreach ($command in (Get-AegisCommands)) {
         if (-not (Test-AegisCommand $command)) { throw 'Allowlist failure' }
@@ -966,6 +1054,7 @@ if ($SelfTest) {
     Test-AegisNativeReport
     Test-AegisDeviceGuardReport
     Test-AegisBootTrustReport
+    Test-AegisUacReport
     Test-AegisIntegrity
     Test-AegisDnsReport
     Test-AegisVpnReport
@@ -1052,6 +1141,7 @@ $native.Add_Click({
         } {
             CimCmdlets\Get-CimInstance -Namespace 'root\CIMV2\Security\MicrosoftTpm' -ClassName Win32_Tpm -Property IsEnabled_InitialValue,IsActivated_InitialValue -OperationTimeoutSec 5 -ErrorAction Stop -WarningAction SilentlyContinue
         })
+        $output.Text += [Environment]::NewLine + [Environment]::NewLine + (Get-AegisUacReport { Read-AegisUacPolicy })
     } catch { $output.Text = 'Native diagnostic unavailable; no changes made.' }
 })
 $form.Controls.Add($native)
