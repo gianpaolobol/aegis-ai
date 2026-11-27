@@ -330,9 +330,10 @@ function Get-AegisDnsReport([scriptblock]$ReadDns) {
         'Configured entries only; may include inactive interfaces.',
         'No resolver trust, encryption, filtering, VPN or reachability assessment.')
     try {
-        $records = @(& $ReadDns)
+        $records = @(& $ReadDns | Select-Object -First 257)
         if ($records.Count -eq 0 -or $records.Count -gt 256) { throw 'Unavailable inventory' }
         $configured = 0; $empty = 0; $unknown = 0; $loopback = 0; $other = 0
+        $ipv4 = 0; $ipv6 = 0; $linkLocal = 0
         foreach ($record in $records) {
             if ($null -eq $record) { $unknown++; continue }
             $property = $record.PSObject.Properties['ServerAddresses']
@@ -341,6 +342,7 @@ function Get-AegisDnsReport([scriptblock]$ReadDns) {
             if ($values -isnot [array] -or $values.Count -gt 32) { $unknown++; continue }
             if ($values.Count -eq 0) { $empty++; continue }
             $localCount = 0; $otherCount = 0; $valid = $true
+            $v4Count = 0; $v6Count = 0; $linkCount = 0
             foreach ($value in $values) {
                 $ip = $null
                 if ($value -isnot [string] -or $value.Length -gt 80 -or
@@ -356,15 +358,33 @@ function Get-AegisDnsReport([scriptblock]$ReadDns) {
                 # Reject noncanonical IPv4 shorthand and ambiguous leading zeroes.
                 if ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork -and
                     $value -notmatch ':' -and $ip.ToString() -cne $value) { $valid = $false; break }
+                # A configured unicast resolver entry must not be a multicast or limited broadcast destination.
+                # Directed broadcast depends on interface prefix and is not determined here.
+                if ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
+                    $octets = $ip.GetAddressBytes()
+                    if (($octets[0] -ge 224 -and $octets[0] -le 239) -or $ip.Equals([Net.IPAddress]::Broadcast)) {
+                        $valid = $false; break
+                    }
+                    $v4Count++
+                    if ($octets[0] -eq 169 -and $octets[1] -eq 254) { $linkCount++ }
+                } elseif ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6) {
+                    if ($ip.IsIPv6Multicast) { $valid = $false; break }
+                    $v6Count++
+                    if ($ip.IsIPv6LinkLocal) { $linkCount++ }
+                } else { $valid = $false; break }
                 if ([Net.IPAddress]::IsLoopback($ip)) { $localCount++ } else { $otherCount++ }
             }
             if (-not $valid) { $unknown++; continue }
             $configured++; $loopback += $localCount; $other += $otherCount
+            $ipv4 += $v4Count; $ipv6 += $v6Count; $linkLocal += $linkCount
         }
         $intro += @("Provider rows with addresses: $configured",
             "Provider rows with empty lists: $empty", "Unknown or malformed rows: $unknown",
             "Loopback address occurrences: $loopback", "Other address occurrences: $other",
-            'Empty lists do not prove DNS is absent. A loopback address does not prove local filtering.')
+            "IPv4 address occurrences (including mapped IPv4): $ipv4", "IPv6 address occurrences (excluding mapped IPv4): $ipv6",
+            "Link-local address occurrences (subset): $linkLocal",
+            'Empty lists do not prove DNS is absent. A loopback address does not prove local filtering.',
+            'Address classes are descriptive, not a security or resolver availability verdict.')
     } catch { $intro += 'DNS inventory unavailable.' }
     return ($intro -join [Environment]::NewLine)
 }
@@ -395,6 +415,27 @@ function Test-AegisDnsReport {
     }
     if (-not $report.Contains('Unknown or malformed rows: 7') -or -not $report.Contains('Provider rows with addresses: 0')) { throw 'Malformed DNS row accepted' }
     if (-not (Get-AegisDnsReport { for ($i=0;$i -lt 257;$i++) { [pscustomobject]@{ServerAddresses=@()} } }).Contains('DNS inventory unavailable.')) { throw 'DNS row limit failed' }
+    $report = Get-AegisDnsReport {
+        [pscustomobject]@{ServerAddresses=@('169.254.20.1','fe80::1%7','::ffff:169.254.20.2','192.0.2.1','2001:db8::1')}
+        [pscustomobject]@{ServerAddresses=@('192.0.2.2','224.0.0.1')}
+        [pscustomobject]@{ServerAddresses=@('ff02::1%7')}
+        [pscustomobject]@{ServerAddresses=@('255.255.255.255')}
+        [pscustomobject]@{ServerAddresses=@('::ffff:239.1.2.3')}
+        [pscustomobject]@{ServerAddresses=@('::ffff:255.255.255.255')}
+    }
+    foreach ($expected in @('Provider rows with addresses: 1','Unknown or malformed rows: 5',
+        'Loopback address occurrences: 0','Other address occurrences: 5',
+        'IPv4 address occurrences (including mapped IPv4): 3','IPv6 address occurrences (excluding mapped IPv4): 2',
+        'Link-local address occurrences (subset): 3')) {
+        if (-not $report.Contains($expected)) { throw 'DNS address-class fixture mismatch or partial row counted' }
+    }
+    foreach ($private in @('169.254.20','fe80::','192.0.2.','2001:db8','224.0.0.1','ff02::','255.255.255.255','239.1.2.3')) {
+        if ($report.Contains($private)) { throw 'DNS address-class diagnostic disclosed raw address' }
+    }
+    $report = Get-AegisDnsReport {
+        for ($i=0;$i -lt 256;$i++) { [pscustomobject]@{ServerAddresses=@('192.0.2.1')} }
+    }
+    if (-not $report.Contains('Provider rows with addresses: 256') -or -not $report.Contains('IPv4 address occurrences (including mapped IPv4): 256')) { throw 'DNS exact row limit regression' }
     Write-Output 'PASS: minimized DNS configuration synthetic fixtures'
 }
 
