@@ -249,3 +249,76 @@ mod confirmation_tests {
         }
     }
 }
+
+ 
+/// Bound a synthetic review batch before inspecting entries. This is not a
+/// durable replay ledger, authenticated queue, or payment authorization.
+pub const MAX_CONFIRMATION_BATCH: usize = 64;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReviewEntry {
+    pub request: CriticalRequest,
+    pub confirmation: Option<ConfirmationFixture>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchVerdict {
+    InvalidBatchSize, DuplicateRequest, NeedsReview, FixtureConfirmationsReported,
+}
+/// Reject duplicate logical request IDs even across revisions. Do not count a
+/// partially valid batch as a success. No state, side effects or real identities.
+pub fn assess_confirmation_batch(entries: &[ReviewEntry], now: u64) -> BatchVerdict {
+    use BatchVerdict::*;
+    if entries.is_empty() || entries.len() > MAX_CONFIRMATION_BATCH {
+        return InvalidBatchSize;
+    }
+    for (i, entry) in entries.iter().enumerate() {
+        if entries[..i].iter().any(|earlier| earlier.request.request_id == entry.request.request_id) {
+            return DuplicateRequest;
+        }
+    }
+    if entries.iter().any(|entry| assess_confirmation(entry.request, now, entry.confirmation)
+        != ConfirmationVerdict::FixtureConfirmationReported) {
+        return NeedsReview;
+    }
+    FixtureConfirmationsReported
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use BatchVerdict::*;
+    fn entry(id: u64) -> ReviewEntry {
+        let (r,c) = confirmation_example();
+        let request = CriticalRequest { request_id: id, ..r };
+        ReviewEntry { request, confirmation: Some(ConfirmationFixture { bound_request: request, ..c }) }
+    }
+    #[test] fn size_bounds_and_distinct_requests() {
+        assert_eq!(assess_confirmation_batch(&[], 120), InvalidBatchSize);
+        let mut entries: Vec<_> = (1..=MAX_CONFIRMATION_BATCH as u64).map(entry).collect();
+        assert_eq!(assess_confirmation_batch(&entries, 120), FixtureConfirmationsReported);
+        entries.push(entry(65));
+        assert_eq!(assess_confirmation_batch(&entries, 120), InvalidBatchSize);
+    }
+    #[test] fn duplicate_ids_across_revisions_and_order() {
+        let first = entry(1);
+        let revised = CriticalRequest { revision: 2, ..first.request };
+        let second = ReviewEntry { request: revised, confirmation: first.confirmation.map(|c|
+            ConfirmationFixture { bound_request: revised, ..c }) };
+        for entries in [[first, first], [first, second], [second, first]] {
+            assert_eq!(assess_confirmation_batch(&entries, 120), DuplicateRequest);
+        }
+        assert_eq!(assess_confirmation_batch(&[first, entry(2), first], 120), DuplicateRequest);
+    }
+    #[test] fn one_invalid_entry_blocks_whole_batch() {
+        let first = entry(1);
+        let second = entry(2);
+        for bad in [
+            ReviewEntry { confirmation: None, ..second },
+            ReviewEntry { confirmation: first.confirmation, ..second },
+            ReviewEntry { request: CriticalRequest { request_id: 0, ..second.request }, ..second },
+        ] {
+            assert_eq!(assess_confirmation_batch(&[first, bad], 120), NeedsReview);
+            assert_eq!(assess_confirmation_batch(&[bad, first], 120), NeedsReview);
+        }
+        assert_eq!(assess_confirmation_batch(&[first, second], 410), NeedsReview);
+    }
+}

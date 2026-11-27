@@ -222,6 +222,21 @@ fn run(args: &[OsString]) -> (i32, String) {
             if observed != expected { return (1, report); }
         }
         report.push_str("Confirmation metadata is synthetic; no payment authorization or contact verification.\n");
+        use aegis_policy::mail_auth::{assess_confirmation_batch, BatchVerdict, ReviewEntry};
+        let first = ReviewEntry { request, confirmation: Some(confirmation) };
+        let other = CriticalRequest { request_id: 2, ..request };
+        let second = ReviewEntry { request: other,
+            confirmation: Some(ConfirmationFixture { bound_request: other, ..confirmation }) };
+        for (label, batch, expected) in [
+            ("distinct review batch fixture", [first, second], BatchVerdict::FixtureConfirmationsReported),
+            ("duplicate review batch fixture", [first, first], BatchVerdict::DuplicateRequest),
+            ("incomplete review batch fixture", [first, ReviewEntry { confirmation: None, ..second }], BatchVerdict::NeedsReview),
+        ] {
+            let observed = assess_confirmation_batch(&batch, 120);
+            report.push_str(&format!("{label}: {observed:?}\n"));
+            if observed != expected { return (1, report); }
+        }
+        report.push_str("Batch checks are synthetic; no persistent replay protection.\n");
         return (0, report);
     }
     if arg == OsStr::new("demo-recovery") {

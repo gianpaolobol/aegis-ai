@@ -135,7 +135,11 @@ fn mail_auth_demo_is_advisory_and_rejects_extra_arguments() {
         "request-supplied channel fixture: NonIndependentChannel",
         "changed destination fixture: DifferentTransaction",
         "expired confirmation fixture: StaleOrInvalidTime",
-        "no payment authorization or contact verification"] {
+        "no payment authorization or contact verification",
+        "distinct review batch fixture: FixtureConfirmationsReported",
+        "duplicate review batch fixture: DuplicateRequest",
+        "incomplete review batch fixture: NeedsReview",
+        "no persistent replay protection"] {
         assert!(stdout(&output).contains(expected));
     }
     assert!(output.stderr.is_empty());
