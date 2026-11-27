@@ -5,6 +5,7 @@ import json
 import sys
 import unittest
 from collections import Counter
+from datetime import date as calendar_date
 from pathlib import Path
 
 WHEEL = "ce52bbf23683f47515bf493ee3d7c8346f3742c0dc5c654c389b8495b3dbfaca"
@@ -22,6 +23,12 @@ SOURCE_OBSERVATIONS = (
     ("pkg:cargo/unicode-ident@1.0.26", "unicode-ident", "1.0.26",
      "expression:(MIT OR Apache-2.0) AND Unicode-3.0",
      "https://docs.rs/crate/unicode-ident/latest/source/Cargo.toml.orig", "2026-11-27"),
+    ("pkg:cargo/rustix@1.1.5", "rustix", "1.1.5",
+     "expression:Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+     "https://docs.rs/crate/rustix/1.1.5/source/Cargo.toml", "2026-11-27"),
+    ("pkg:cargo/linux-raw-sys@0.12.1", "linux-raw-sys", "0.12.1",
+     "expression:Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+     "https://docs.rs/crate/linux-raw-sys/latest/source/Cargo.toml", "2026-11-27"),
 )
 
 def unique_object(pairs):
@@ -44,21 +51,44 @@ def matches_report(raw, expected_sha256):
     return (type(raw) is bytes and 1 <= len(raw) <= MAX_BYTES
             and hashlib.sha256(raw).hexdigest() == expected_sha256)
 
+def observation_scope(name, version, source, observed_date):
+    """Classify a manually reviewed URL; neither class establishes authenticity."""
+    if not all(text_label(v) for v in (name, version, source, observed_date)):
+        return None
+    try:
+        if calendar_date.fromisoformat(observed_date).isoformat() != observed_date:
+            return None
+    except ValueError:
+        return None
+    root = "https://docs.rs/crate/" + name + "/"
+    for segment, scope in ((version, "versioned-url"), ("latest", "mutable-url")):
+        if source in tuple(root + segment + suffix for suffix in
+                           ("", "/source/Cargo.toml", "/source/Cargo.toml.orig")):
+            return scope
+    return None
+
 def reconcile_observations(queue, observations):
     """Compare exact declarations, never infer linkage, notices or clearance."""
     rows = {row["declared_purl"]: row for row in queue}
     seen, matched = set(), []
     for purl, name, version, expression, source, date in observations:
         row = rows.get(purl)
-        if (purl in seen or row is None or row["name"] != name
+        scope = observation_scope(name, version, source, date)
+        if (scope is None or purl in seen or row is None or row["name"] != name
                 or row["version"] != version or row["declared_licenses"] != [expression]):
             return None
         seen.add(purl)
         matched.append({"declared_purl": purl, "source": source, "observed_date": date,
-                        "declaration_comparison": "exact-match",
+                        "declaration_comparison": "exact-match", "source_url_scope": scope,
                         "linkage_review": "not-performed", "license_review": "not-performed"})
+    scope_counts = Counter(row["source_url_scope"] for row in matched)
+    pending = Counter(reason for row in queue if row["declared_purl"] not in seen
+                      for reason in row["review_reasons"])
     return {"observations": matched, "matched": len(matched),
             "not_cross_checked": len(queue) - len(matched),
+            "versioned_url_matches": scope_counts["versioned-url"],
+            "mutable_url_matches": scope_counts["mutable-url"],
+            "pending_comparison_reason_counts": dict(sorted(pending.items())),
             "execution_approved": False}
 
 def retained_review_queue(raw):
@@ -199,7 +229,7 @@ class Fixtures(unittest.TestCase):
     def test_source_observations_remain_advisory(self):
         rows = self.run_obj(self.fixture())["queue"]
         obs = ("pkg:cargo/fixture-a@1", "fixture-a", "1",
-               "expression:MIT", "https://example.invalid/fixture", "2026-11-27")
+               "expression:MIT", "https://docs.rs/crate/fixture-a/1", "2026-11-27")
         result = reconcile_observations(rows, [obs])
         self.assertEqual((result["matched"], result["not_cross_checked"]), (1, 1))
         self.assertFalse(result["execution_approved"])
@@ -212,6 +242,29 @@ class Fixtures(unittest.TestCase):
             changed[index] = value
             self.assertIsNone(reconcile_observations(rows, [changed]))
         self.assertEqual(reconcile_observations(rows, [])["not_cross_checked"], 2)
+        self.assertEqual(result["versioned_url_matches"], 1)
+        self.assertEqual(result["mutable_url_matches"], 0)
+        self.assertEqual(result["pending_comparison_reason_counts"],
+                         {"LGPL-declaration": 1, "compound-expression": 1})
+
+    def test_source_scope_and_date(self):
+        rows = self.run_obj(self.fixture())["queue"]
+        obs = ("pkg:cargo/fixture-a@1", "fixture-a", "1", "expression:MIT",
+               "https://docs.rs/crate/fixture-a/latest/source/Cargo.toml", "2026-11-27")
+        result = reconcile_observations(rows, [obs])
+        self.assertEqual(result["mutable_url_matches"], 1)
+        self.assertEqual(result["versioned_url_matches"], 0)
+        self.assertFalse(result["execution_approved"])
+        for index, value in (
+            (4, "https://docs.rs/crate/fixture-a/2"),
+            (4, "https://docs.rs.evil.invalid/crate/fixture-a/1"),
+            (4, "https://docs.rs/crate/fixture-b/1"),
+            (4, "https://docs.rs/crate/fixture-a/1?redirect=1"),
+            (5, "2026-02-30"), (5, "20261127"), (5, ""),
+        ):
+            changed = list(obs)
+            changed[index] = value
+            self.assertIsNone(reconcile_observations(rows, [changed]))
 
     def test_unreviewed_scope_required(self):
         for field in ("dependency_linkage_review", "license_expression_validation",
