@@ -322,3 +322,92 @@ mod batch_tests {
         assert_eq!(assess_confirmation_batch(&[first, second], 410), NeedsReview);
     }
 }
+
+
+/// In-memory demonstration of logical request reuse across review batches.
+/// Not a durable ledger, identity proof, payment authorization or production
+/// replay boundary. Never evicts IDs to silently restore acceptance.
+pub const MAX_SESSION_REQUESTS: usize = 256;
+#[derive(Debug, Default)]
+pub struct FixtureReviewSession {
+    seen: std::collections::BTreeSet<u64>,
+    last_accepted_at: Option<u64>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionVerdict {
+    BatchRejected(BatchVerdict), PreviouslyReviewed, ClockRegression,
+    SessionCapacityReached, FixtureBatchRecorded,
+}
+impl FixtureReviewSession {
+    pub fn record(&mut self, entries: &[ReviewEntry], now: u64) -> SessionVerdict {
+        use SessionVerdict::*;
+        let result = assess_confirmation_batch(entries, now);
+        if result != BatchVerdict::FixtureConfirmationsReported {
+            return BatchRejected(result);
+        }
+        if self.last_accepted_at.is_some_and(|last| now < last) {
+            return ClockRegression;
+        }
+        if entries.iter().any(|entry| self.seen.contains(&entry.request.request_id)) {
+            return PreviouslyReviewed;
+        }
+        if entries.len() > MAX_SESSION_REQUESTS - self.seen.len() {
+            return SessionCapacityReached;
+        }
+        // Commit only after every check passes; failed batches change nothing.
+        self.seen.extend(entries.iter().map(|entry| entry.request.request_id));
+        self.last_accepted_at = Some(now);
+        FixtureBatchRecorded
+    }
+    pub fn recorded_count(&self) -> usize { self.seen.len() }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use SessionVerdict::*;
+    fn entry(id: u64) -> ReviewEntry {
+        let (r,c) = confirmation_example();
+        let request = CriticalRequest { request_id: id, ..r };
+        ReviewEntry { request, confirmation: Some(ConfirmationFixture { bound_request: request, ..c }) }
+    }
+    #[test] fn reuse_across_batches_including_revisions() {
+        let mut s = FixtureReviewSession::default();
+        let first = entry(1);
+        assert_eq!(s.record(&[first], 120), FixtureBatchRecorded);
+        let request = CriticalRequest { revision: 2, ..first.request };
+        let revised = ReviewEntry { request, confirmation: first.confirmation.map(|c|
+            ConfirmationFixture { bound_request: request, ..c }) };
+        assert_eq!(s.record(&[entry(2), revised], 121), PreviouslyReviewed);
+        assert_eq!(s.recorded_count(), 1);
+        assert_eq!(s.record(&[entry(2)], 121), FixtureBatchRecorded);
+        assert_eq!(s.recorded_count(), 2);
+    }
+    #[test] fn failures_do_not_reserve_ids_or_advance_clock() {
+        let mut s = FixtureReviewSession::default();
+        assert_eq!(s.record(&[entry(1)], 120), FixtureBatchRecorded);
+        let bad = ReviewEntry { confirmation: None, ..entry(3) };
+        assert_eq!(s.record(&[entry(2), bad], 200), BatchRejected(BatchVerdict::NeedsReview));
+        assert_eq!(s.record(&[entry(2)], 119), ClockRegression);
+        assert_eq!(s.record(&[entry(2), entry(2)], 121), BatchRejected(BatchVerdict::DuplicateRequest));
+        assert_eq!(s.recorded_count(), 1);
+        assert_eq!(s.record(&[entry(2), entry(3)], 121), FixtureBatchRecorded);
+        assert_eq!(s.recorded_count(), 3);
+    }
+    #[test] fn capacity_is_atomic_and_never_evicts() {
+        let mut s = FixtureReviewSession::default();
+        for start in [1, 65, 129] {
+            let batch: Vec<_> = (start..start+64).map(entry).collect();
+            assert_eq!(s.record(&batch, 120), FixtureBatchRecorded);
+        }
+        let last: Vec<_> = (193..256).map(entry).collect();
+        assert_eq!(s.record(&last, 120), FixtureBatchRecorded);
+        assert_eq!(s.recorded_count(), 255);
+        assert_eq!(s.record(&[entry(256), entry(257)], 120), SessionCapacityReached);
+        assert_eq!(s.recorded_count(), 255);
+        assert_eq!(s.record(&[entry(256)], 120), FixtureBatchRecorded);
+        assert_eq!(s.record(&[entry(257)], 120), SessionCapacityReached);
+        assert_eq!(s.record(&[entry(1)], 120), PreviouslyReviewed);
+        assert_eq!(s.recorded_count(), MAX_SESSION_REQUESTS);
+    }
+}

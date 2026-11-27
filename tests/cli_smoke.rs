@@ -139,6 +139,9 @@ fn mail_auth_demo_is_advisory_and_rejects_extra_arguments() {
         "distinct review batch fixture: FixtureConfirmationsReported",
         "duplicate review batch fixture: DuplicateRequest",
         "incomplete review batch fixture: NeedsReview",
+        "first session batch fixture: FixtureBatchRecorded",
+        "repeated session batch fixture: PreviouslyReviewed",
+        "Session history is volatile and synthetic",
         "no persistent replay protection"] {
         assert!(stdout(&output).contains(expected));
     }

@@ -237,6 +237,17 @@ fn run(args: &[OsString]) -> (i32, String) {
             if observed != expected { return (1, report); }
         }
         report.push_str("Batch checks are synthetic; no persistent replay protection.\n");
+        use aegis_policy::mail_auth::{FixtureReviewSession, SessionVerdict};
+        let mut session = FixtureReviewSession::default();
+        for (label, batch, expected) in [
+            ("first session batch fixture", [first, second], SessionVerdict::FixtureBatchRecorded),
+            ("repeated session batch fixture", [first, second], SessionVerdict::PreviouslyReviewed),
+        ] {
+            let observed = session.record(&batch, 120);
+            report.push_str(&format!("{label}: {observed:?}\n"));
+            if observed != expected || session.recorded_count() != 2 { return (1, report); }
+        }
+        report.push_str("Session history is volatile and synthetic; no persistent replay protection or payment authority.\n");
         return (0, report);
     }
     if arg == OsStr::new("demo-recovery") {
