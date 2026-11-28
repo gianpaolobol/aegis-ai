@@ -79,7 +79,7 @@ fn run(args: &[OsString]) -> (i32, String) {
             }
             if s.remaining() != 0 { return (1, report); }
         }
-        use aegis_policy::response::{plan, Proposal, Reservation, Role, Service, Snapshot, Verdict};
+        use aegis_policy::response::{plan, plan_batch, BatchVerdict, Proposal, Reservation, Role, Service, Snapshot, Verdict};
         let registry = [
             Service { id: 1, role: Role::Ordinary, impact: 2 },
             Service { id: 2, role: Role::Ordinary, impact: 3 },
@@ -99,6 +99,16 @@ fn run(args: &[OsString]) -> (i32, String) {
             ("expired unresolved reservation", plan(&registry, 5, snapshot, &[Reservation { service: 2, expires: 100 }], proposal), Verdict::RecoveryVerificationRequired),
             ("administration channel unavailable", plan(&registry, 5, Snapshot { administration_available: false, ..snapshot }, &[], proposal), Verdict::AdministrationUnavailable),
             ("kill switch", plan(&registry, 5, Snapshot { stopped: true, ..snapshot }, &[], proposal), Verdict::Stopped),
+        ] {
+            report.push_str(&format!("{label}: {observed:?}\n"));
+            if observed != expected { return (1, report); }
+        }
+        let batch = [proposal, Proposal { service: 2, ..proposal }];
+        for (label, observed, expected) in [
+            ("response batch within budget", plan_batch(&registry, 5, snapshot, &[], &batch),
+                BatchVerdict::DryRunBatchCandidateOnly),
+            ("response batch over budget", plan_batch(&registry, 4, snapshot, &[], &batch),
+                BatchVerdict::Rejected { service: 2, reason: Verdict::ImpactBudgetExceeded }),
         ] {
             report.push_str(&format!("{label}: {observed:?}\n"));
             if observed != expected { return (1, report); }

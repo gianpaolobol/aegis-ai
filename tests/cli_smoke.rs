@@ -46,6 +46,8 @@ fn synthetic_demos_have_expected_results() {
                      "scoped export: RequireApproval", "policy change: Deny",
                      "no containment or rollback performed", "bounded proposal: DryRunCandidateOnly",
                      "aggregate impact: ImpactBudgetExceeded", "recovery channel: ProtectedService",
+                     "response batch within budget: DryRunBatchCandidateOnly",
+                     "response batch over budget: Rejected { service: 2, reason: ImpactBudgetExceeded }",
                      "expired unresolved reservation: RecoveryVerificationRequired",
                      "administration channel unavailable: AdministrationUnavailable",
                      "kill switch: Stopped", "no credential access or authentication",
