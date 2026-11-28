@@ -1486,6 +1486,101 @@ function Test-AegisDefenderPreferenceReport {
     Write-Output 'PASS: Defender preference snapshot synthetic fixtures'
 }
 
+
+# [Codex] ADE-102: explicitly requested local Defender event metadata only.
+# No message/XML, record IDs, paths, users, remote sessions, export or writes.
+function Read-AegisDefenderEventIds {
+    $channel = 'Microsoft-Windows-Windows Defender/Operational'
+    $config = $null
+    $reader = $null
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        $config = [System.Diagnostics.Eventing.Reader.EventLogConfiguration]::new($channel)
+        if (-not $config.IsEnabled) { throw 'Event source unavailable.' }
+        $query = [System.Diagnostics.Eventing.Reader.EventLogQuery]::new(
+            $channel, [System.Diagnostics.Eventing.Reader.PathType]::LogName,
+            "*[System[Provider[@Name='Microsoft-Windows-Windows Defender'] and (EventID=1116 or EventID=1117 or EventID=1118 or EventID=1119 or EventID=5001 or EventID=5013) and TimeCreated[timediff(@SystemTime) >= 0 and timediff(@SystemTime) <= 86400000]]]")
+        $query.ReverseDirection = $true
+        $query.TolerateQueryErrors = $false
+        $reader = [System.Diagnostics.Eventing.Reader.EventLogReader]::new($query)
+        # One extra record distinguishes the bounded sample from exhaustion.
+        $reader.BatchSize = 16
+        for ($i=0; $i -lt 257; $i++) {
+            $remaining = 5000 - $clock.ElapsedMilliseconds
+            if ($remaining -le 0) { throw 'Event source unavailable.' }
+            $event = $reader.ReadEvent([TimeSpan]::FromMilliseconds($remaining))
+            if ($null -eq $event) { break }
+            try { [int]$event.Id } finally { $event.Dispose() }
+        }
+        if ($clock.ElapsedMilliseconds -gt 5000) { throw 'Event source unavailable.' }
+        foreach ($status in $reader.LogStatus) {
+            if ($status.StatusCode -ne 0) { throw 'Event source unavailable.' }
+        }
+    } finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+        if ($null -ne $config) { $config.Dispose() }
+    }
+}
+function Get-AegisDefenderEventReport([scriptblock]$ReadEvents) {
+    $heading = 'Defender operational event snapshot (local, read-only; last 24 hours).'
+    $limitation = 'Selected event records only; not unique threats, proof of remediation, current protection, or absence of compromise. Retention and coverage are not verified.'
+    $unavailable = @($heading,'Event counts : Unknown (source disabled, denied, invalid or unavailable).',$limitation) -join [Environment]::NewLine
+    $labels = [ordered]@{
+        '1116'='Detection records'
+        '1117'='Action records (not necessarily remediation)'
+        '1118'='Action failure records'
+        '1119'='Critical action failure records'
+        '5001'='Real-time protection disabled records'
+        '5013'='Tamper protection blocked change records'
+    }
+    $counts = @{}
+    foreach ($key in $labels.Keys) { $counts[$key] = 0 }
+    try {
+        $items = @(& $ReadEvents | Select-Object -First 257)
+        foreach ($item in $items) {
+            if ($item -isnot [int] -or -not $labels.Contains([string]$item)) { return $unavailable }
+        }
+        $limited = $items.Count -eq 257
+        for ($i=0; $i -lt [Math]::Min($items.Count,256); $i++) {
+            $key = [string]$items[$i]
+            $counts[$key]++
+        }
+        $lines = @($heading)
+        if ($limited) { $lines += 'Coverage : Limited to latest 256 selected records; additional records exist.' }
+        else { $lines += 'Coverage : Query exhausted; log retention and completeness unknown.' }
+        foreach ($key in $labels.Keys) { $lines += "$($labels[$key]) : $($counts[$key])" }
+        $lines += $limitation
+        $lines += 'No event messages, identities or paths read for display; no network, scan, containment or settings changes.'
+        return ($lines -join [Environment]::NewLine)
+    } catch { return $unavailable }
+}
+function Test-AegisDefenderEventReport {
+    $report = Get-AegisDefenderEventReport { 1116;1116;1117;1118;1119;5001;5013 }
+    foreach ($expected in @('Detection records : 2','Action records (not necessarily remediation) : 1',
+        'Action failure records : 1','Critical action failure records : 1','Real-time protection disabled records : 1',
+        'Tamper protection blocked change records : 1','Query exhausted','not unique threats')) {
+        if (-not $report.Contains($expected)) { throw 'Defender event aggregate fixture mismatch.' }
+    }
+    $empty = Get-AegisDefenderEventReport {}
+    if (-not $empty.Contains('Detection records : 0') -or -not $empty.Contains('completeness unknown')) {
+        throw 'Defender empty event query fixture mismatch.'
+    }
+    foreach ($bad in @({ throw 'SYNTHETIC-PRIVATE' },{ 1116;throw 'SYNTHETIC-PRIVATE' },
+        { '1116' },{ 9999 },{ $true },{ [pscustomobject]@{Id=1116;Message='SYNTHETIC-PRIVATE'} })) {
+        $report = Get-AegisDefenderEventReport $bad
+        if (-not $report.Contains('Event counts : Unknown') -or $report.Contains('SYNTHETIC-PRIVATE') -or
+            $report.Contains('Detection records :')) { throw 'Defender event failure/privacy regression.' }
+    }
+    $exact = Get-AegisDefenderEventReport { for ($j=0;$j -lt 256;$j++) { 1116 } }
+    if (-not $exact.Contains('Detection records : 256') -or -not $exact.Contains('Query exhausted')) {
+        throw 'Defender event exact bound regression.'
+    }
+    $limited = Get-AegisDefenderEventReport { for ($j=0;$j -lt 258;$j++) { 1116 } }
+    if (-not $limited.Contains('Detection records : 256') -or -not $limited.Contains('Limited to latest 256') -or
+        $limited.Contains('Query exhausted')) { throw 'Defender event sample bound regression.' }
+    Write-Output 'PASS: Defender event aggregate synthetic fixtures'
+}
+
 if ($SelfTest) {
     foreach ($command in (Get-AegisCommands)) {
         if (-not (Test-AegisCommand $command)) { throw 'Allowlist failure' }
@@ -1494,6 +1589,7 @@ if ($SelfTest) {
         if (Test-AegisCommand $command) { throw 'Unexpected command accepted' }
     }
     Test-AegisNativeReport
+    Test-AegisDefenderEventReport
     Test-AegisDefenderPreferenceReport
     Test-AegisAsrSummary
     Test-AegisDefenderCloudMode
@@ -1533,8 +1629,8 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 $form = New-Object Windows.Forms.Form
 $form.Text = 'AEGIS AI - Development Alpha'
-$form.Size = New-Object Drawing.Size(760,772)
-$form.MinimumSize = New-Object Drawing.Size(760,772)
+$form.Size = New-Object Drawing.Size(760,816)
+$form.MinimumSize = New-Object Drawing.Size(760,816)
 $form.StartPosition = 'CenterScreen'
 $banner = New-Object Windows.Forms.Label
 $banner.Location = New-Object Drawing.Point(18,14)
@@ -1542,7 +1638,7 @@ $banner.Size = New-Object Drawing.Size(700,62)
 $banner.Text = @('DEVELOPMENT ONLY - Active protection unavailable.', 'Keep native antivirus and firewall enabled. No scan, VPN or enforcement.', 'Run only from a trusted, reviewed development checkout.') -join [Environment]::NewLine
 $form.Controls.Add($banner)
 $output = New-Object Windows.Forms.TextBox
-$output.Location = New-Object Drawing.Point(18,462)
+$output.Location = New-Object Drawing.Point(18,506)
 $output.Size = New-Object Drawing.Size(705,230)
 $output.Multiline = $true
 $output.ReadOnly = $true
@@ -1810,6 +1906,15 @@ $recovery.Add_Click({
 })
 $form.Controls.Add($recovery)
 
+$eventSummary = New-Object Windows.Forms.Button
+$eventSummary.Location = New-Object Drawing.Point(18,460)
+$eventSummary.Size = New-Object Drawing.Size(340,36)
+$eventSummary.Text = 'Defender events (local, last 24h)'
+$eventSummary.Add_Click({
+    $output.Text = Get-AegisDefenderEventReport { Read-AegisDefenderEventIds }
+})
+$form.Controls.Add($eventSummary)
+
 
 try {
     if ($UiSmokeTest) {
@@ -1820,7 +1925,7 @@ try {
             'Verify local file integrity (16 MiB max)','Incident correlation (synthetic)',
             'Windows VPN profiles (read-only)','Suspicious link (offline advisory)',
             'Windows patch inventory (partial)','Invoice IBAN comparison (offline, IT)',
-            'Windows disk encryption (read-only)','Patch priority (synthetic)','Mail authentication (synthetic)','Backup recovery readiness (synthetic)')
+            'Windows disk encryption (read-only)','Patch priority (synthetic)','Mail authentication (synthetic)','Backup recovery readiness (synthetic)','Defender events (local, last 24h)')
         if ($buttons.Count -ne $labels.Count) { throw 'Unexpected GUI button count.' }
         foreach ($label in $labels) {
             if (@($buttons | Where-Object { $_.Text -ceq $label }).Count -ne 1) {
@@ -1842,7 +1947,7 @@ try {
         if ((Get-AegisCliReport 'scan') -cne 'Command rejected.') {
             throw 'Invalid command bridge regression.'
         }
-        Write-Output 'PASS: GUI constructed; sixteen controls, safety labels, eight CLI calls and denied command.'
+        Write-Output 'PASS: GUI constructed; seventeen controls, safety labels, eight CLI calls and denied command.'
     } else {
         [void]$form.ShowDialog()
     }

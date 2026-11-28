@@ -40,3 +40,5 @@ Segue la versione **1.1.0** (`LINEE_GUIDA.md`).
 - 2026-11-28 [Codex] ADE-100: CI ADE-099 verde; diagnostica in lettura configurazione cloud e invio campioni Defender, nuovi test in attesa di CI.
 
 - 2026-11-28 [Codex] ADE-101: CI ADE-100 verde; diagnostica SmartScreen Explorer/Edge in sola lettura, nuova CI da verificare.
+
+- 2026-11-28 [Codex] ADE-102: CI ADE-101 verde; riepilogo eventi Defender locali su richiesta, soli conteggi, nuovo collaudo CI in attesa.
