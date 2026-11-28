@@ -1247,6 +1247,91 @@ function Test-AegisAsrSummary {
     Write-Output 'PASS: ASR configuration aggregate synthetic fixtures'
 }
 
+# [Codex] ADE-100: provider-reported cloud/privacy configuration only.
+# No network check, sample submission, policy change or effective protection verdict.
+function Get-AegisDefenderCloudMode($Record,[string]$Name) {
+    if ($Name -cnotin @('MAPSReporting','SubmitSamplesConsent','DisableBlockAtFirstSeen')) { return 'Unknown' }
+    if ($null -eq $Record) { return 'Unknown' }
+    $property = $Record.PSObject.Properties[$Name]
+    if ($null -eq $property) { return 'Unknown' }
+    $value = $property.Value
+    if ($Name -ceq 'DisableBlockAtFirstSeen') {
+        if ($value -isnot [bool]) { return 'Unknown' }
+        if ($value) { return 'Configured disabled' }
+        return 'Configured not disabled'
+    }
+    if ($value -isnot [byte] -and $value -isnot [uint16] -and
+        $value -isnot [uint32] -and $value -isnot [int32]) { return 'Unknown' }
+    if ($Name -ceq 'MAPSReporting') {
+        switch ($value) {
+            0 { return 'Configured disabled' }
+            1 { return 'Reported basic membership' }
+            2 { return 'Reported advanced membership' }
+            default { return 'Unknown' }
+        }
+    }
+    switch ($value) {
+        0 { return 'Configured always prompt' }
+        1 { return 'Configured send safe samples' }
+        2 { return 'Configured never send samples' }
+        3 { return 'Configured send all samples' }
+        default { return 'Unknown' }
+    }
+}
+function Test-AegisDefenderCloudMode {
+    foreach ($case in @(
+        @{Name='MAPSReporting';Value=[byte]0;Expected='Configured disabled'},
+        @{Name='MAPSReporting';Value=[uint16]1;Expected='Reported basic membership'},
+        @{Name='MAPSReporting';Value=[uint32]2;Expected='Reported advanced membership'},
+        @{Name='SubmitSamplesConsent';Value=[byte]0;Expected='Configured always prompt'},
+        @{Name='SubmitSamplesConsent';Value=[uint16]1;Expected='Configured send safe samples'},
+        @{Name='SubmitSamplesConsent';Value=[uint32]2;Expected='Configured never send samples'},
+        @{Name='SubmitSamplesConsent';Value=[int32]3;Expected='Configured send all samples'},
+        @{Name='DisableBlockAtFirstSeen';Value=$true;Expected='Configured disabled'},
+        @{Name='DisableBlockAtFirstSeen';Value=$false;Expected='Configured not disabled'})) {
+        $fixture = [pscustomobject]@{}
+        $fixture | Add-Member -NotePropertyName $case.Name -NotePropertyValue $case.Value
+        if ((Get-AegisDefenderCloudMode $fixture $case.Name) -cne $case.Expected) {
+            throw 'Defender cloud configuration fixture mismatch'
+        }
+    }
+    foreach ($bad in @(@{Value='2'},@{Value=$true},@{Value=@(2)},@{Value=[double]2},
+        @{Value=[int32]-1},@{Value=[uint32]::MaxValue},@{Value=$null},@{Value=[int32]4})) {
+        $fixture = [pscustomobject]@{MAPSReporting=$bad.Value;SubmitSamplesConsent=$bad.Value}
+        foreach ($name in @('MAPSReporting','SubmitSamplesConsent')) {
+            if ((Get-AegisDefenderCloudMode $fixture $name) -cne 'Unknown') { throw 'Invalid cloud mode accepted' }
+        }
+    }
+    foreach ($bad in @(@{Value='False'},@{Value=0},@{Value=@($false)},@{Value=$null})) {
+        $fixture = [pscustomobject]@{DisableBlockAtFirstSeen=$bad.Value}
+        if ((Get-AegisDefenderCloudMode $fixture 'DisableBlockAtFirstSeen') -cne 'Unknown') {
+            throw 'Invalid block at first sight flag accepted'
+        }
+    }
+    $report = Get-AegisDefenderPreferenceReport {
+        [pscustomobject]@{MAPSReporting=[uint16]2;SubmitSamplesConsent=[uint16]3;
+            DisableBlockAtFirstSeen=$false;ExclusionPath='SYNTHETIC-PRIVATE'}
+    }
+    foreach ($line in @('Cloud protection membership : Reported advanced membership',
+        'Sample submission : Configured send all samples',
+        'Block at first sight flag : Configured not disabled','not proof of effective cloud protection')) {
+        if (-not $report.Contains($line)) { throw 'Cloud configuration report mismatch' }
+    }
+    if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'Cloud report privacy regression' }
+    foreach ($reader in @({}, { throw 'SYNTHETIC-PRIVATE' }, {
+        [pscustomobject]@{MAPSReporting=2;SubmitSamplesConsent=3;DisableBlockAtFirstSeen=$false}
+        [pscustomobject]@{MAPSReporting=2;SubmitSamplesConsent=3;DisableBlockAtFirstSeen=$false}
+    })) {
+        $report = Get-AegisDefenderPreferenceReport $reader
+        foreach ($line in @('Cloud protection membership : Unknown','Sample submission : Unknown',
+            'Block at first sight flag : Unknown')) {
+            if (-not $report.Contains($line)) { throw 'Unavailable cloud configuration accepted' }
+        }
+        if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'Cloud report exception disclosed' }
+    }
+    Write-Output 'PASS: Defender cloud and sample submission configuration synthetic fixtures'
+}
+
 function Get-AegisDefenderPreferenceReport([scriptblock]$ReadPreference) {
     $record = $null
     try {
@@ -1257,11 +1342,19 @@ function Get-AegisDefenderPreferenceReport([scriptblock]$ReadPreference) {
     $network = Get-AegisDefenderPreferenceMode $record 'EnableNetworkProtection'
     $folders = Get-AegisDefenderPreferenceMode $record 'EnableControlledFolderAccess'
     $asr = Get-AegisAsrSummary $record
+    $maps = Get-AegisDefenderCloudMode $record 'MAPSReporting'
+    $samples = Get-AegisDefenderCloudMode $record 'SubmitSamplesConsent'
+    $firstSight = Get-AegisDefenderCloudMode $record 'DisableBlockAtFirstSeen'
     return (@('Defender preference snapshot (read-only configuration, not enforcement).',
         "Potentially unwanted apps : $pua",
         "Network protection : $network",
         "Controlled folder access : $folders",
         "Attack surface reduction : $asr",
+        "Cloud protection membership : $maps",
+        "Sample submission : $samples",
+        "Block at first sight flag : $firstSight",
+        'These settings are not proof of effective cloud protection or actual transmission; other prerequisites apply.',
+        'AEGIS only reads these settings; no cloud request or sample submission is initiated.',
         'ASR counts are configured modes only; no rule coverage, exclusions or enforcement verified.',
         'Audit-only and disk-sector-only modes are not full blocking.',
         'Actual protection depends on OS support, active Defender mode and other prerequisites.',
@@ -1326,6 +1419,7 @@ if ($SelfTest) {
     Test-AegisNativeReport
     Test-AegisDefenderPreferenceReport
     Test-AegisAsrSummary
+    Test-AegisDefenderCloudMode
     Test-AegisDeviceGuardReport
     Test-AegisBootTrustReport
     Test-AegisUacReport
@@ -1410,7 +1504,7 @@ $native.Add_Click({
         }
         $output.Text += [Environment]::NewLine + [Environment]::NewLine + (Get-AegisDefenderPreferenceReport {
             Defender\Get-MpPreference -ErrorAction Stop -WarningAction SilentlyContinue |
-                Select-Object -Property PUAProtection,EnableNetworkProtection,EnableControlledFolderAccess,AttackSurfaceReductionRules_Ids,AttackSurfaceReductionRules_Actions -First 2
+                Select-Object -Property PUAProtection,EnableNetworkProtection,EnableControlledFolderAccess,AttackSurfaceReductionRules_Ids,AttackSurfaceReductionRules_Actions,MAPSReporting,SubmitSamplesConsent,DisableBlockAtFirstSeen -First 2
         })
         $output.Text += [Environment]::NewLine + [Environment]::NewLine + (Get-AegisDeviceGuardReport {
             CimCmdlets\Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -Property VirtualizationBasedSecurityStatus,SecurityServicesConfigured,SecurityServicesRunning,CodeIntegrityPolicyEnforcementStatus,UsermodeCodeIntegrityPolicyEnforcementStatus -OperationTimeoutSec 5 -ErrorAction Stop -WarningAction SilentlyContinue

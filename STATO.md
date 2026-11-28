@@ -36,3 +36,5 @@ Segue la versione **1.1.0** (`LINEE_GUIDA.md`).
 - 2026-11-28 [Codex] ADE-098: CI ADE-097 verde; validatore offline di coerenza dei verbali Windows client, installazione reale ancora non verificata.
 
 - 2026-11-28 [Codex] ADE-099: CI ADE-098 verde; confronto offline SHA-256 dei byte del pacchetto e delle sette evidenze, senza attestare installazione o autenticità.
+
+- 2026-11-28 [Codex] ADE-100: CI ADE-099 verde; diagnostica in lettura configurazione cloud e invio campioni Defender, nuovi test in attesa di CI.
