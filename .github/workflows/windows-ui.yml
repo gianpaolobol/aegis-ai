@@ -45,12 +45,21 @@ jobs:
           python -I lab/av/verify_wheel.py --self-test
           if ($LASTEXITCODE -ne 0) { throw 'Wheel preflight regression failed' }
 
-      - name: Reconcile offline AV dependency review queue
+      - name: Run offline AV dependency review queue regressions
         shell: powershell
         run: |
           python -I lab/av/review_candidate.py --self-test
-          python -I lab/av/crate_manifest.py --self-test
           if ($LASTEXITCODE -ne 0) { throw 'AV review queue regression failed' }
+
+      - name: Run offline Cargo archive comparison regressions
+        shell: powershell
+        run: |
+          python -I lab/av/crate_manifest.py --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'Cargo archive regression failed' }
+
+      - name: Reconcile retained offline AV dependency review queue
+        shell: powershell
+        run: |
           python -I lab/av/review_candidate.py --review-queue
           if ($LASTEXITCODE -ne 0) { throw 'Retained AV evidence inconsistent' }
 

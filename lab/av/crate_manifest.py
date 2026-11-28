@@ -1,5 +1,7 @@
 # Copyright 2026 Gian Paolo Franceschini. See LICENSE.
 """Offline Cargo archive declaration comparison; never execution or clearance."""
+import base64
+import binascii
 import gzip
 import hashlib
 import io
@@ -18,6 +20,9 @@ MAX_ARCHIVE = 8 * 1024 * 1024
 MAX_EXPANDED = 16 * 1024 * 1024
 MAX_ENTRIES = 4096
 MAX_MANIFEST = 64 * 1024
+MAX_BATCH_BYTES = 16 * 1024 * 1024
+MAX_BATCH_ARCHIVES = 32
+MAX_BATCH_COMPRESSED = 12 * 1024 * 1024
 
 
 def compare(row, raw, expected_sha256, observed_date):
@@ -85,6 +90,63 @@ def compare(row, raw, expected_sha256, observed_date):
         return None
 
 
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('duplicate key')
+        result[key] = value
+    return result
+
+
+def compare_batch(queue, raw):
+    """Atomic advisory comparison of supplied archives, never evidence promotion.
+    JSON stdin only; no paths, network, extraction, subprocess or new trust.
+    Bound input, row count, per-archive and cumulative compressed bytes.
+    """
+    if type(raw) is not bytes or not 1 <= len(raw) <= MAX_BATCH_BYTES:
+        return None
+    try:
+        items = json.loads(raw.decode('utf-8'), object_pairs_hook=_unique_object)
+        if type(items) is not list or not 1 <= len(items) <= MAX_BATCH_ARCHIVES:
+            return None
+        rows = {row['declared_purl']: row for row in queue}
+        if len(rows) != len(queue):
+            return None
+        seen, matched, total = set(), [], 0
+        for item in items:
+            if type(item) is not dict or set(item) != {
+                    'declared_purl', 'archive_sha256', 'observed_date', 'archive_base64'}:
+                return None
+            purl, digest, observed, encoded = (item[k] for k in
+                ('declared_purl', 'archive_sha256', 'observed_date', 'archive_base64'))
+            if not all(type(v) is str for v in (purl, digest, observed, encoded)):
+                return None
+            if (not 1 <= len(purl) <= 512 or len(digest) != 64 or len(observed) != 10
+                    or not 1 <= len(encoded) <= 4 * ((MAX_ARCHIVE + 2) // 3)
+                    or purl in seen or purl not in rows):
+                return None
+            archive = base64.b64decode(encoded, validate=True)
+            if not 1 <= len(archive) <= MAX_ARCHIVE:
+                return None
+            total += len(archive)
+            if total > MAX_BATCH_COMPRESSED:
+                return None
+            result = compare(rows[purl], archive, digest, observed)
+            if result is None:
+                return None
+            matched.append(result)
+            seen.add(purl)
+        return {'schema': 'aegis-local-crate-batch-v1', 'matched': len(matched),
+                'observations': sorted(matched, key=lambda row: row['declared_purl']),
+                'checksum_origin': 'caller-supplied', 'source_authentication': 'not-performed',
+                'license_review': 'not-performed', 'linkage_review': 'not-performed',
+                'execution_approved': False}
+    except (ValueError, TypeError, KeyError, AttributeError, RecursionError,
+            OverflowError, binascii.Error):
+        return None
+
+
 class Fixtures(unittest.TestCase):
     row = {'name': 'fixture', 'version': '1.0.0', 'declared_purl': 'pkg:cargo/fixture@1.0.0',
            'source_identity_scope': 'unqualified-cargo', 'declared_licenses': ['expression:MIT']}
@@ -146,18 +208,69 @@ class Fixtures(unittest.TestCase):
         self.assertIsNone(self.check(b'x' * (MAX_ARCHIVE + 1)))
 
 
+    def batch_fixture(self):
+        second = dict(self.row, name='fixture-two', declared_purl='pkg:cargo/fixture-two@1.0.0')
+        def item(row):
+            name = row['name']
+            path = name + '-1.0.0/Cargo.toml'
+            manifest = self.manifest.replace(b'fixture', name.encode('ascii'))
+            archive = self.archive([(path, manifest, tarfile.REGTYPE)])
+            return {'declared_purl': row['declared_purl'],
+                    'archive_sha256': hashlib.sha256(archive).hexdigest(),
+                    'observed_date': '2026-11-28',
+                    'archive_base64': base64.b64encode(archive).decode('ascii')}
+        return [self.row, second], item(self.row), item(second)
+
+    def test_batch_stable_and_advisory(self):
+        queue, a, b = self.batch_fixture()
+        def check(items):
+            return compare_batch(queue, json.dumps(items).encode())
+        result = check([b, a])
+        self.assertEqual(result, check([a, b]))
+        self.assertEqual(result['matched'], 2)
+        self.assertFalse(result['execution_approved'])
+        self.assertEqual(result['license_review'], 'not-performed')
+        self.assertTrue(all(not x['execution_approved'] for x in result['observations']))
+
+    def test_batch_atomic_rejection(self):
+        queue, a, b = self.batch_fixture()
+        for bad in (a, dict(b, archive_sha256='0' * 64),
+                    dict(b, archive_base64='!'), dict(b, observed_date='2026-02-30'),
+                    dict(b, declared_purl='pkg:cargo/unknown@1.0.0'),
+                    dict(b, observed_date=None), dict(b, extra=True)):
+            self.assertIsNone(compare_batch(queue, json.dumps([a, bad]).encode()))
+        self.assertIsNone(compare_batch(queue, b'[{"declared_purl":"a","declared_purl":"b"}]'))
+        self.assertIsNone(compare_batch(queue + [self.row], json.dumps([a]).encode()))
+
+    def test_batch_limits(self):
+        queue, a, b = self.batch_fixture()
+        self.assertIsNone(compare_batch(queue, b'[]'))
+        self.assertIsNone(compare_batch(queue, json.dumps([a] * (MAX_BATCH_ARCHIVES + 1)).encode()))
+        self.assertIsNone(compare_batch(queue, b'x' * (MAX_BATCH_BYTES + 1)))
+        from unittest.mock import patch
+        with patch(__name__ + '.MAX_BATCH_COMPRESSED', len(base64.b64decode(a['archive_base64']))):
+            self.assertIsNotNone(compare_batch(queue, json.dumps([a]).encode()))
+            self.assertIsNone(compare_batch(queue, json.dumps([a, b]).encode()))
+
+
 def main():
     if sys.argv[1:] == ['--self-test']:
         unittest.main(argv=[sys.argv[0]])
-    if len(sys.argv) != 5 or sys.argv[1] != '--compare':
-        print('Use --self-test or --compare PURL SHA256 DATE (.crate bytes on stdin).')
+    batch = sys.argv[1:] == ['--compare-batch']
+    if not batch and (len(sys.argv) != 5 or sys.argv[1] != '--compare'):
+        print('Use --self-test, --compare PURL SHA256 DATE (.crate bytes on stdin), or --compare-batch (JSON stdin).')
         return 2
     try:
         helper = runpy.run_path(str(Path(__file__).with_name('review_candidate.py')))
         with helper['REPORT'].open('rb') as stream:
             queue = helper['retained_review_queue'](stream.read(helper['MAX_BYTES'] + 1))
-        rows = [] if queue is None else [r for r in queue['queue'] if r['declared_purl'] == sys.argv[2]]
-        result = compare(rows[0], sys.stdin.buffer.read(MAX_ARCHIVE + 1), sys.argv[3], sys.argv[4]) if len(rows) == 1 else None
+        if queue is None:
+            result = None
+        elif batch:
+            result = compare_batch(queue['queue'], sys.stdin.buffer.read(MAX_BATCH_BYTES + 1))
+        else:
+            rows = [r for r in queue['queue'] if r['declared_purl'] == sys.argv[2]]
+            result = compare(rows[0], sys.stdin.buffer.read(MAX_ARCHIVE + 1), sys.argv[3], sys.argv[4]) if len(rows) == 1 else None
     except (OSError, ValueError, KeyError):
         result = None
     if result is None:
