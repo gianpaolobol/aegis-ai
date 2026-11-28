@@ -50,3 +50,5 @@ Segue la versione **1.1.0** (`LINEE_GUIDA.md`).
 - 2026-11-28 [Codex] ADE-105: collegamento della correlazione AV/EDR ai dati nativi in sola lettura nell'interfaccia Windows; fixture di regressione aggiunte, esecuzione PowerShell ancora da verificare; V0.2 in sviluppo.
 
 - 2026-11-28 [Codex] ADE-106: lotto V0.3 indipendente, correlazione offline firewall/DNS/VPN con otto test sintetici locali; nessuna protezione di rete effettiva o integrazione UI ancora verificata.
+
+- 2026-11-28 [Codex] ADE-107: lotto V0.4 indipendente, controllo strutturale URL offline con 10 test sintetici locali; nessuna verifica reputazione, autorizzazione navigazione o integrazione browser; V0.2/V0.3 in consolidamento.

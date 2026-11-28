@@ -92,3 +92,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Endpoint fusion regressions failed' }
           python -I lab/windows/network_posture.py
           if ($LASTEXITCODE -ne 0) { throw 'Network posture regressions failed' }
+
+          python -I lab/windows/url_advisory.py
+          if ($LASTEXITCODE -ne 0) { throw 'URL advisory regressions failed' }
