@@ -1044,6 +1044,83 @@ function Test-AegisUacReport {
 }
 
 
+
+# SmartScreen: fixed machine policy DWORDs only; no browser/profile access.
+function Read-AegisSmartScreenPolicy([ValidateSet('Shell','Edge')][string]$Scope) {
+    $base = $null
+    $key = $null
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine,[Microsoft.Win32.RegistryView]::Registry64)
+        if ($Scope -eq 'Shell') {
+            $key = $base.OpenSubKey('SOFTWARE\Policies\Microsoft\Windows\System',$false)
+            $names = @('EnableSmartScreen')
+        } else {
+            $key = $base.OpenSubKey('SOFTWARE\Policies\Microsoft\Edge',$false)
+            $names = @('SmartScreenEnabled','PreventSmartScreenPromptOverride','PreventSmartScreenPromptOverrideForFiles')
+        }
+        if ($null -eq $key) { return }
+        $values = @{}
+        foreach ($name in $names) {
+            try {
+                if ($key.GetValueKind($name) -eq [Microsoft.Win32.RegistryValueKind]::DWord) {
+                    $values[$name] = $key.GetValue($name,$null)
+                }
+            } catch { } # Unknown; do not infer defaults or log registry errors.
+        }
+        [pscustomobject]$values
+    } finally {
+        if ($null -ne $key) { $key.Dispose() }
+        if ($null -ne $base) { $base.Dispose() }
+    }
+}
+function Get-AegisSmartScreenRecord([scriptblock]$Reader) {
+    try {
+        $records = @(& $Reader | Select-Object -First 2)
+        if ($records.Count -eq 1) { return $records[0] }
+    } catch { }
+}
+function Get-AegisSmartScreenReport([scriptblock]$ReadShell,[scriptblock]$ReadEdge) {
+    $shellRecord = Get-AegisSmartScreenRecord $ReadShell
+    $edgeRecord = Get-AegisSmartScreenRecord $ReadEdge
+    $switches = @{0='Configured disabled';1='Configured enabled'}
+    $overrides = @{0='Configured not prevented';1='Configured prevented'}
+    $shell = Get-AegisUacValue $shellRecord 'EnableSmartScreen' $switches
+    $edge = Get-AegisUacValue $edgeRecord 'SmartScreenEnabled' $switches
+    $sites = Get-AegisUacValue $edgeRecord 'PreventSmartScreenPromptOverride' $overrides
+    $files = Get-AegisUacValue $edgeRecord 'PreventSmartScreenPromptOverrideForFiles' $overrides
+    return (@('SmartScreen machine registry policy snapshot (read-only).',
+        "File Explorer app reputation : $shell",
+        "Edge SmartScreen : $edge",
+        "Edge site warning bypass : $sites",
+        "Edge download warning bypass : $files",
+        'Unknown includes absent, denied, unsupported or invalid values; defaults are not inferred.',
+        'Machine policy only; user, recommended, MDM and effective browser settings are not evaluated.',
+        'Edge policy applicability depends on supported version and managed environment.',
+        'No effective protection or URL/file reputation conclusion. No network calls or changes made.') -join [Environment]::NewLine)
+}
+function Test-AegisSmartScreenReport {
+    $report = Get-AegisSmartScreenReport { [pscustomobject]@{EnableSmartScreen=1} } { [pscustomobject]@{SmartScreenEnabled=0;PreventSmartScreenPromptOverride=1;PreventSmartScreenPromptOverrideForFiles=0;Extra='SYNTHETIC-PRIVATE'} }
+    foreach ($expected in @('File Explorer app reputation : Configured enabled','Edge SmartScreen : Configured disabled','Edge site warning bypass : Configured prevented','Edge download warning bypass : Configured not prevented','No effective protection')) {
+        if (-not $report.Contains($expected)) { throw 'SmartScreen positive fixture mismatch' }
+    }
+    if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'SmartScreen privacy regression' }
+    $report = Get-AegisSmartScreenReport { [pscustomobject]@{EnableSmartScreen=0} } { [pscustomobject]@{SmartScreenEnabled=1;PreventSmartScreenPromptOverride=0;PreventSmartScreenPromptOverrideForFiles=1} }
+    foreach ($expected in @('File Explorer app reputation : Configured disabled','Edge SmartScreen : Configured enabled','Edge site warning bypass : Configured not prevented','Edge download warning bypass : Configured prevented')) {
+        if (-not $report.Contains($expected)) { throw 'SmartScreen alternate fixture mismatch' }
+    }
+    foreach ($bad in @({}, { throw 'SYNTHETIC-PRIVATE' }, { [pscustomobject]@{EnableSmartScreen=1;SmartScreenEnabled=1}; [pscustomobject]@{EnableSmartScreen=0;SmartScreenEnabled=0} }, { [pscustomobject]@{EnableSmartScreen='1';SmartScreenEnabled=$true;PreventSmartScreenPromptOverride=@(1);PreventSmartScreenPromptOverrideForFiles=2} })) {
+        $report = Get-AegisSmartScreenReport $bad $bad
+        foreach ($label in @('File Explorer app reputation','Edge SmartScreen','Edge site warning bypass','Edge download warning bypass')) {
+            if (-not $report.Contains($label + ' : Unknown')) { throw 'Invalid SmartScreen evidence accepted' }
+        }
+        if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'SmartScreen error disclosure' }
+    }
+    $report = Get-AegisSmartScreenReport { throw 'SYNTHETIC-PRIVATE' } { [pscustomobject]@{SmartScreenEnabled=1} }
+    if (-not $report.Contains('File Explorer app reputation : Unknown') -or -not $report.Contains('Edge SmartScreen : Configured enabled') -or -not $report.Contains('Edge site warning bypass : Unknown')) { throw 'SmartScreen partial evidence regression' }
+    if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'SmartScreen error disclosure' }
+    Write-Output 'PASS: SmartScreen policy snapshot synthetic fixtures'
+}
+
 # SMB signing registry configuration only. No shares, connections, probes or policy changes.
 function Read-AegisSmbSigning([ValidateSet('Client','Server')][string]$Side) {
     $base = $null
@@ -1423,6 +1500,7 @@ if ($SelfTest) {
     Test-AegisDeviceGuardReport
     Test-AegisBootTrustReport
     Test-AegisUacReport
+    Test-AegisSmartScreenReport
     Test-AegisSmbSigningReport
     Test-AegisIntegrity
     Test-AegisDnsReport
@@ -1515,6 +1593,7 @@ $native.Add_Click({
             CimCmdlets\Get-CimInstance -Namespace 'root\CIMV2\Security\MicrosoftTpm' -ClassName Win32_Tpm -Property IsEnabled_InitialValue,IsActivated_InitialValue -OperationTimeoutSec 5 -ErrorAction Stop -WarningAction SilentlyContinue
         })
         $output.Text += [Environment]::NewLine + [Environment]::NewLine + (Get-AegisUacReport { Read-AegisUacPolicy })
+        $output.Text += [Environment]::NewLine + [Environment]::NewLine + (Get-AegisSmartScreenReport { Read-AegisSmartScreenPolicy 'Shell' } { Read-AegisSmartScreenPolicy 'Edge' })
         $output.Text += [Environment]::NewLine + [Environment]::NewLine + (Get-AegisSmbSigningReport { Read-AegisSmbSigning 'Client' } { Read-AegisSmbSigning 'Server' })
     } catch { $output.Text = 'Native diagnostic unavailable; no changes made.' }
 })
