@@ -1,0 +1,615 @@
+# Copyright 2026 Gian Paolo Franceschini. See LICENSE.
+"""Offline review queue for retained declarations; never approves execution or distribution."""
+import hashlib
+import json
+import re
+import sys
+import unittest
+import tomllib
+from collections import Counter
+from datetime import date as calendar_date
+from pathlib import Path
+
+WHEEL = "ce52bbf23683f47515bf493ee3d7c8346f3742c0dc5c654c389b8495b3dbfaca"
+SBOM = "dac154f8c401cf5f6270c646c2f828a73bc38ed22629c0fc09d75b65ec030e23"
+REPORT_SHA256 = "64a6fe87a2de29eb6787a01aca7e9e7f698a3a5284587f1507a6fe6a3e008a83"
+REPORT = Path(__file__).resolve().parents[2] / "docs/evidence/yara-x-1.24.0-win-amd64-sbom-components.json"
+MAX_BYTES = 1024 * 1024
+MAX_MANIFEST_BATCH = 4 * 1024 * 1024
+MAX_MANIFEST_BYTES = 64 * 1024
+MAX_MANIFEST_ROWS = 310
+
+# Dated, manually observed upstream package declarations, not verified artifacts.
+# No fetch at runtime; a changed package version needs a new evidence review.
+SOURCE_OBSERVATIONS = (
+    ("pkg:cargo/r-efi@6.0.0", "r-efi", "6.0.0",
+     "expression:MIT OR Apache-2.0 OR LGPL-2.1-or-later",
+     "https://docs.rs/crate/r-efi/6.0.0", "2026-11-27"),
+    ("pkg:cargo/unicode-ident@1.0.26", "unicode-ident", "1.0.26",
+     "expression:(MIT OR Apache-2.0) AND Unicode-3.0",
+     "https://docs.rs/crate/unicode-ident/latest/source/Cargo.toml.orig", "2026-11-27"),
+    ("pkg:cargo/rustix@1.1.5", "rustix", "1.1.5",
+     "expression:Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+     "https://docs.rs/crate/rustix/1.1.5/source/Cargo.toml", "2026-11-27"),
+    ("pkg:cargo/linux-raw-sys@0.12.1", "linux-raw-sys", "0.12.1",
+     "expression:Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+     "https://docs.rs/crate/linux-raw-sys/latest/source/Cargo.toml", "2026-11-27"),
+    ("pkg:cargo/allocator-api2@0.2.21", "allocator-api2", "0.2.21",
+     "expression:MIT OR Apache-2.0",
+     "https://docs.rs/crate/allocator-api2/0.2.21/source/Cargo.toml", "2026-11-27"),
+    ("pkg:cargo/base64ct@1.8.3", "base64ct", "1.8.3",
+     "expression:Apache-2.0 OR MIT",
+     "https://docs.rs/crate/base64ct/1.8.3/source/Cargo.toml", "2026-11-27"),
+    ("pkg:cargo/bincode@2.0.1", "bincode", "2.0.1",
+     "expression:MIT",
+     "https://docs.rs/crate/bincode/2.0.1/source/Cargo.toml", "2026-11-27"),
+    ("pkg:cargo/bincode_derive@2.0.1", "bincode_derive", "2.0.1",
+     "expression:MIT",
+     "https://docs.rs/crate/bincode_derive/2.0.1/source/Cargo.toml", "2026-11-27"),
+    ("pkg:cargo/arbitrary@1.4.2", "arbitrary", "1.4.2",
+     "expression:MIT OR Apache-2.0",
+     "https://docs.rs/crate/arbitrary/1.4.2/source/Cargo.toml", "2026-11-27"),
+    ("pkg:cargo/core-foundation-sys@0.8.7", "core-foundation-sys", "0.8.7",
+     "expression:MIT OR Apache-2.0",
+     "https://docs.rs/crate/core-foundation-sys/0.8.7/source/Cargo.toml", "2026-11-27"),
+    ("pkg:cargo/thiserror@1.0.69", "thiserror", "1.0.69",
+     "expression:MIT OR Apache-2.0",
+     "https://docs.rs/crate/thiserror/1.0.69/source/Cargo.toml", "2026-11-28"),
+    ("pkg:cargo/sha2@0.10.9", "sha2", "0.10.9",
+     "expression:MIT OR Apache-2.0",
+     "https://docs.rs/crate/sha2/0.10.9/source/Cargo.toml", "2026-11-28"),
+    ("pkg:cargo/adler2@2.0.1", "adler2", "2.0.1",
+     "expression:0BSD OR MIT OR Apache-2.0",
+     "https://docs.rs/crate/adler2/latest/source/Cargo.toml.orig", "2026-11-28"),
+    ("pkg:cargo/hex@0.4.3", "hex", "0.4.3",
+     "expression:MIT OR Apache-2.0",
+     "https://docs.rs/crate/hex/latest/source/Cargo.toml", "2026-11-28"),
+    ("pkg:cargo/block-buffer@0.12.1", "block-buffer", "0.12.1",
+     "expression:MIT OR Apache-2.0",
+     "https://docs.rs/crate/block-buffer/latest/source/Cargo.toml", "2026-11-28"),
+    ("pkg:cargo/cpufeatures@0.3.1", "cpufeatures", "0.3.1",
+     "expression:MIT OR Apache-2.0",
+     "https://docs.rs/crate/cpufeatures/latest/source/Cargo.toml", "2026-11-28"),
+)
+
+def unique_object(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("duplicate key")
+        out[key] = value
+    return out
+
+def reject_constant(_):
+    raise ValueError("invalid constant")
+
+def text_label(value):
+    return (type(value) is str and 0 < len(value) <= 512
+            and bool(value.strip()) and all(32 <= ord(c) <= 126 for c in value))
+
+def matches_report(raw, expected_sha256):
+    """Exact retained bytes only; not upstream provenance or license clearance."""
+    return (type(raw) is bytes and 1 <= len(raw) <= MAX_BYTES
+            and hashlib.sha256(raw).hexdigest() == expected_sha256)
+
+def observation_scope(name, version, source, observed_date):
+    """Classify a manually reviewed URL; neither class establishes authenticity."""
+    if not all(text_label(v) for v in (name, version, source, observed_date)):
+        return None
+    try:
+        if calendar_date.fromisoformat(observed_date).isoformat() != observed_date:
+            return None
+    except ValueError:
+        return None
+    root = "https://docs.rs/crate/" + name + "/"
+    for segment, scope in ((version, "versioned-url"), ("latest", "mutable-url")):
+        if source in tuple(root + segment + suffix for suffix in
+                           ("", "/source/Cargo.toml", "/source/Cargo.toml.orig")):
+            return scope
+    return None
+
+def reconcile_observations(queue, observations):
+    """Compare exact declarations, never infer linkage, notices or clearance."""
+    rows = {row["declared_purl"]: row for row in queue}
+    seen, matched = set(), []
+    for purl, name, version, expression, source, date in observations:
+        row = rows.get(purl)
+        scope = observation_scope(name, version, source, date)
+        if (scope is None or purl in seen or row is None or row["name"] != name
+                or row["version"] != version or row["declared_licenses"] != [expression]):
+            return None
+        seen.add(purl)
+        matched.append({"declared_purl": purl, "source": source, "observed_date": date,
+                        "declaration_comparison": "exact-match", "source_url_scope": scope,
+                        "linkage_review": "not-performed", "license_review": "not-performed"})
+    scope_counts = Counter(row["source_url_scope"] for row in matched)
+    pending = Counter(reason for row in queue if row["declared_purl"] not in seen
+                      for reason in row["review_reasons"])
+    return {"observations": matched, "matched": len(matched),
+            "not_cross_checked": len(queue) - len(matched),
+            "versioned_url_matches": scope_counts["versioned-url"],
+            "mutable_url_matches": scope_counts["mutable-url"],
+            "pending_comparison_reason_counts": dict(sorted(pending.items())),
+            "execution_approved": False}
+
+def compare_manifest_batch(queue, raw):
+    """Compare locally supplied TOML text; source labels are not authenticated.
+    Atomic advisory result: any invalid row rejects the entire batch.
+    No fetching, Cargo invocation, workspace resolution or file writes.
+    """
+    if type(raw) is not bytes or not 1 <= len(raw) <= MAX_MANIFEST_BATCH:
+        return None
+    try:
+        bundle = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object,
+                            parse_constant=reject_constant)
+        if type(bundle) is not list or not 1 <= len(bundle) <= MAX_MANIFEST_ROWS:
+            return None
+        rows = {row["declared_purl"]: row for row in queue}
+        seen, matched = set(), []
+        for item in bundle:
+            if type(item) is not dict or set(item) != {
+                    "declared_purl", "source", "observed_date", "manifest"}:
+                return None
+            purl, source, date, manifest = (item[k] for k in
+                ("declared_purl", "source", "observed_date", "manifest"))
+            if not all(text_label(v) for v in (purl, source, date)) or type(manifest) is not str:
+                return None
+            row = rows.get(purl)
+            if row is None or purl in seen or row["source_identity_scope"] != "unqualified-cargo":
+                return None
+            name, version = row["name"], row["version"]
+            if (observation_scope(name, version, source, date) != "versioned-url"
+                    or not source.endswith(("/source/Cargo.toml", "/source/Cargo.toml.orig"))):
+                return None
+            encoded = manifest.encode("utf-8")
+            if not 1 <= len(encoded) <= MAX_MANIFEST_BYTES:
+                return None
+            package = tomllib.loads(manifest).get("package")
+            if type(package) is not dict or package.get("name") != name or package.get("version") != version:
+                return None
+            license_value = package.get("license")
+            if (not text_label(license_value) or "license-file" in package
+                    or row["declared_licenses"] != ["expression:" + license_value]):
+                return None
+            seen.add(purl)
+            matched.append({"declared_purl": purl, "source": source, "observed_date": date,
+                            "manifest_text_sha256": hashlib.sha256(encoded).hexdigest(),
+                            "declaration_comparison": "exact-match",
+                            "source_authentication": "not-performed",
+                            "license_review": "not-performed", "linkage_review": "not-performed"})
+        return {"schema": "aegis-local-manifest-comparison-v1", "matched": len(matched),
+                "observations": sorted(matched, key=lambda row: row["declared_purl"]),
+                "source_authentication": "not-performed", "execution_approved": False}
+    except (ValueError, TypeError, AttributeError, RecursionError, OverflowError):
+        return None
+
+def retained_review_queue(raw):
+    if not matches_report(raw, REPORT_SHA256):
+        return None
+    result = review_queue(raw)
+    if result is not None:
+        evidence = reconcile_observations(result["queue"], SOURCE_OBSERVATIONS)
+        if evidence is None:
+            return None
+        result["retained_report_sha256"] = REPORT_SHA256
+        result["source_declaration_comparison"] = evidence
+        result["batch_comparison_coverage"] = batch_comparison_coverage(
+            result["license_review_batches"], evidence["observations"])
+    return result
+
+# Narrow retained inventory profile, not a general PURL parser. Workspace
+# qualifiers are opaque evidence; never convert them to paths or fetch them.
+WORKSPACE_QUALIFIERS = {
+    "yara-x-fmt": "fmt", "yara-x": "lib", "yara-x-macros": "macros",
+    "yara-x-parser": "parser", "yara-x-proto": "proto",
+}
+
+def source_identity_scope(name, version, purl):
+    if not all(text_label(v) for v in (name, version, purl)):
+        return None
+    if (re.fullmatch(r"[A-Za-z0-9_-]+", name) is None
+            or re.fullmatch(r"[0-9A-Za-z.+-]+", version) is None):
+        return None
+    base = "pkg:cargo/" + name + "@" + version
+    if purl == base:
+        return "unqualified-cargo"
+    suffix = WORKSPACE_QUALIFIERS.get(name)
+    if (version == "1.24.0" and suffix is not None
+            and purl == base + "?download_url=file://..\\" + suffix):
+        return "workspace-qualified"
+    return None
+
+def review_batches(queue):
+    """Group exact declared expressions by source scope; no license choice.
+    Each row appears once. Keep separate package-level linkage/notice review.
+    """
+    groups = {}
+    for row in queue:
+        key = (row["source_identity_scope"], tuple(sorted(row["declared_licenses"])))
+        groups.setdefault(key, []).append(row["declared_purl"])
+    return [{"source_identity_scope": scope, "declared_licenses": list(licenses),
+             "component_count": len(purls), "declared_purls": sorted(purls),
+             "license_review": "not-performed", "linkage_review": "not-performed"}
+            for (scope, licenses), purls in sorted(groups.items())]
+
+def batch_comparison_coverage(batches, observations):
+    """Prioritize incomplete batches without treating comparison as clearance."""
+    scopes = {row["declared_purl"]: row["source_url_scope"] for row in observations}
+    output = []
+    for batch in batches:
+        purls = batch["declared_purls"]
+        versioned = sum(scopes.get(p) == "versioned-url" for p in purls)
+        mutable = sum(scopes.get(p) == "mutable-url" for p in purls)
+        output.append({
+            "source_identity_scope": batch["source_identity_scope"],
+            "declared_licenses": batch["declared_licenses"],
+            "component_count": len(purls),
+            "versioned_url_matches": versioned,
+            "mutable_url_matches": mutable,
+            "not_cross_checked": len(purls) - versioned - mutable,
+            "pending_declared_purls": [p for p in purls if p not in scopes],
+            "license_review": "not-performed",
+            "linkage_review": "not-performed",
+            "execution_approved": False,
+        })
+    return output
+
+def review_queue(raw):
+    if type(raw) is not bytes or len(raw) > MAX_BYTES:
+        return None
+    try:
+        obj = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object,
+                         parse_constant=reject_constant)
+        if (type(obj) is not dict or obj.get("schema") != "aegis-sbom-component-evidence-v1"
+                or obj.get("sbom_sha256") != SBOM or obj.get("coverage") != "top-level-only"
+                or obj.get("execution_approved") is not False
+                or obj.get("license_review") != "not-performed"
+                or obj.get("provenance_review") != "not-performed"
+                or any(obj.get(field) != "not-performed" for field in (
+                    "dependency_linkage_review", "license_expression_validation",
+                    "purl_validation", "schema_validation"))
+                or type(obj.get("components_with_nested_entries")) is not int
+                or obj["components_with_nested_entries"] != 0):
+            return None
+        if obj.get("source", {}).get("wheel_sha256") != WHEEL:
+            return None
+        rows = obj.get("components")
+        if type(rows) is not list or not 1 <= len(rows) <= 4096:
+            return None
+        if type(obj.get("top_level_components")) is not int or obj["top_level_components"] != len(rows):
+            return None
+        counts, flags = Counter(), Counter()
+        purls, identities = set(), set()
+        queue = []
+        for i, row in enumerate(rows):
+            if type(row) is not dict or type(row.get("source_index")) is not int or row["source_index"] != i:
+                return None
+            if row.get("review_status") != "pending":
+                return None
+            name, version, purl = (row.get(k) for k in ("name", "version", "declared_purl"))
+            scope = source_identity_scope(name, version, purl)
+            if scope is None or purl in purls or (name, version) in identities:
+                return None
+            purls.add(purl)
+            identities.add((name, version))
+            licenses = row.get("declared_licenses")
+            if (type(licenses) is not list or not 1 <= len(licenses) <= 64
+                    or not all(text_label(v) for v in licenses)
+                    or len(set(licenses)) != len(licenses)):
+                return None
+            counts.update(licenses)
+            labels = " ".join(licenses)
+            reasons = []
+            if "LGPL-" in labels:
+                reasons.append("LGPL-declaration")
+            if "Unicode-" in labels:
+                reasons.append("Unicode-notice")
+            if " WITH " in labels:
+                reasons.append("exception")
+            if " OR " in labels or " AND " in labels:
+                reasons.append("compound-expression")
+            if not reasons:
+                reasons.append("ordinary-notice-review")
+            flags.update(reasons)
+            queue.append({"source_index": i, "name": name, "version": version,
+                          "declared_purl": purl, "declared_licenses": licenses,
+                          "source_identity_scope": scope,
+                          "review_reasons": reasons, "review_status": "pending"})
+        declared = obj.get("declared_license_counts")
+        if type(declared) is not dict or any(type(n) is not int or n <= 0 for n in declared.values()):
+            return None
+        if dict(counts) != declared:
+            return None
+        for field in ("missing_declared_license", "missing_purl", "missing_version", "repeated_exact_purl_groups"):
+            if type(obj.get(field)) is not int or obj[field] != 0:
+                return None
+        queue.sort(key=lambda r: (not any(x in r["review_reasons"] for x in
+                     ("LGPL-declaration", "Unicode-notice", "exception")), r["source_index"]))
+        return {"schema": "aegis-review-queue-v1", "wheel_sha256": WHEEL,
+                "declared_sbom_sha256": SBOM, "components": len(rows),
+                "license_groups": len(counts), "review_reason_counts": dict(sorted(flags.items())),
+                "license_review": "not-performed", "provenance_review": "not-performed",
+                "execution_approved": False, "queue": queue,
+                "source_identity_scope_counts": dict(sorted(Counter(
+                    row["source_identity_scope"] for row in queue).items())),
+                "license_review_batches": review_batches(queue)}
+    except (ValueError, TypeError, AttributeError, RecursionError):
+        return None
+
+class Fixtures(unittest.TestCase):
+    def fixture(self):
+        return {"schema":"aegis-sbom-component-evidence-v1", "sbom_sha256":SBOM,
+                "coverage":"top-level-only", "execution_approved":False,
+                "license_review":"not-performed", "provenance_review":"not-performed",
+                "dependency_linkage_review":"not-performed",
+                "license_expression_validation":"not-performed",
+                "purl_validation":"not-performed", "schema_validation":"not-performed",
+                "components_with_nested_entries":0,
+                "source":{"wheel_sha256":WHEEL}, "top_level_components":2,
+                "missing_declared_license":0,"missing_purl":0,"missing_version":0,
+                "repeated_exact_purl_groups":0,
+                "declared_license_counts":{"expression:MIT":1,"expression:MIT OR LGPL-2.1-or-later":1},
+                "components":[{"source_index":0,"name":"fixture-a","version":"1",
+                    "declared_purl":"pkg:cargo/fixture-a@1","declared_licenses":["expression:MIT"],
+                    "review_status":"pending"},{"source_index":1,"name":"fixture-b","version":"1",
+                    "declared_purl":"pkg:cargo/fixture-b@1","declared_licenses":["expression:MIT OR LGPL-2.1-or-later"],
+                    "review_status":"pending"}]}
+    def run_obj(self, obj):
+        return review_queue(json.dumps(obj).encode())
+    def test_priority_and_no_approval(self):
+        r = self.run_obj(self.fixture())
+        self.assertEqual(r["components"], 2)
+        self.assertEqual(r["queue"][0]["name"], "fixture-b")
+        self.assertFalse(r["execution_approved"])
+        self.assertEqual(r["license_review"], "not-performed")
+    def test_retained_bytes_gate(self):
+        # No actual wheel or external data: the parser and exact-byte gate are separate.
+        raw = json.dumps(self.fixture()).encode()
+        expected = hashlib.sha256(raw).hexdigest()
+        self.assertTrue(matches_report(raw, expected))
+        self.assertFalse(matches_report(raw + b" ", expected))
+        self.assertIsNotNone(review_queue(raw + b" "))
+        self.assertIsNone(retained_review_queue(raw))
+        self.assertIsNone(retained_review_queue(raw + b" "))
+        self.assertFalse(matches_report(b"", hashlib.sha256(b"").hexdigest()))
+        oversized = b"x" * (MAX_BYTES + 1)
+        self.assertFalse(matches_report(oversized, hashlib.sha256(oversized).hexdigest()))
+
+    def test_checkout_line_endings_are_not_normalized(self):
+        raw = (json.dumps(self.fixture(), indent=2) + "\n").encode("ascii")
+        converted = raw.replace(b"\n", b"\r\n")
+        expected = hashlib.sha256(raw).hexdigest()
+        self.assertEqual(review_queue(raw), review_queue(converted))
+        self.assertTrue(matches_report(raw, expected))
+        self.assertFalse(matches_report(converted, expected))
+
+    def test_source_observations_remain_advisory(self):
+        rows = self.run_obj(self.fixture())["queue"]
+        obs = ("pkg:cargo/fixture-a@1", "fixture-a", "1",
+               "expression:MIT", "https://docs.rs/crate/fixture-a/1", "2026-11-27")
+        result = reconcile_observations(rows, [obs])
+        self.assertEqual((result["matched"], result["not_cross_checked"]), (1, 1))
+        self.assertFalse(result["execution_approved"])
+        self.assertEqual(result["observations"][0]["license_review"], "not-performed")
+        self.assertEqual(result["observations"][0]["linkage_review"], "not-performed")
+        self.assertIsNone(reconcile_observations(rows, [obs, obs]))
+        for index, value in ((0, "pkg:cargo/missing@1"), (1, "wrong"),
+                             (2, "2"), (3, "expression:Apache-2.0")):
+            changed = list(obs)
+            changed[index] = value
+            self.assertIsNone(reconcile_observations(rows, [changed]))
+        self.assertEqual(reconcile_observations(rows, [])["not_cross_checked"], 2)
+        self.assertEqual(result["versioned_url_matches"], 1)
+        self.assertEqual(result["mutable_url_matches"], 0)
+        self.assertEqual(result["pending_comparison_reason_counts"],
+                         {"LGPL-declaration": 1, "compound-expression": 1})
+
+    def test_source_scope_and_date(self):
+        rows = self.run_obj(self.fixture())["queue"]
+        obs = ("pkg:cargo/fixture-a@1", "fixture-a", "1", "expression:MIT",
+               "https://docs.rs/crate/fixture-a/latest/source/Cargo.toml", "2026-11-27")
+        result = reconcile_observations(rows, [obs])
+        self.assertEqual(result["mutable_url_matches"], 1)
+        self.assertEqual(result["versioned_url_matches"], 0)
+        self.assertFalse(result["execution_approved"])
+        for index, value in (
+            (4, "https://docs.rs/crate/fixture-a/2"),
+            (4, "https://docs.rs.evil.invalid/crate/fixture-a/1"),
+            (4, "https://docs.rs/crate/fixture-b/1"),
+            (4, "https://docs.rs/crate/fixture-a/1?redirect=1"),
+            (5, "2026-02-30"), (5, "20261127"), (5, ""),
+        ):
+            changed = list(obs)
+            changed[index] = value
+            self.assertIsNone(reconcile_observations(rows, [changed]))
+
+    def test_unreviewed_scope_required(self):
+        for field in ("dependency_linkage_review", "license_expression_validation",
+                      "purl_validation", "schema_validation"):
+            for value in ("passed", None):
+                obj = self.fixture()
+                obj[field] = value
+                self.assertIsNone(self.run_obj(obj))
+        for value in (True, 1, None):
+            obj = self.fixture()
+            obj["components_with_nested_entries"] = value
+            self.assertIsNone(self.run_obj(obj))
+
+    def test_wrong_binding(self):
+        for field in ("sbom_sha256","source"):
+            obj = self.fixture()
+            obj[field] = {}
+            self.assertIsNone(self.run_obj(obj))
+    def test_inconsistent_counts(self):
+        for field in ("top_level_components","declared_license_counts","missing_purl"):
+            obj = self.fixture()
+            obj[field] = True
+            self.assertIsNone(self.run_obj(obj))
+    def test_false_clearance(self):
+        obj = self.fixture()
+        obj["execution_approved"] = True
+        self.assertIsNone(self.run_obj(obj))
+        obj = self.fixture()
+        obj["components"][0]["review_status"] = "approved"
+        self.assertIsNone(self.run_obj(obj))
+    def test_duplicate_or_wrong_index(self):
+        obj = self.fixture()
+        obj["components"][1]["declared_purl"] = obj["components"][0]["declared_purl"]
+        self.assertIsNone(self.run_obj(obj))
+        obj = self.fixture()
+        obj["components"][0]["source_index"] = False
+        self.assertIsNone(self.run_obj(obj))
+    def test_source_identity_and_workspace_qualifiers(self):
+        self.assertEqual(source_identity_scope("fixture-a", "1", "pkg:cargo/fixture-a@1"),
+                         "unqualified-cargo")
+        local = "pkg:cargo/yara-x@1.24.0?download_url=file://..\\lib"
+        self.assertEqual(source_identity_scope("yara-x", "1.24.0", local),
+                         "workspace-qualified")
+        for wrong in ("pkg:pypi/yara-x@1.24.0", "pkg:cargo/yara-x@1.24.1",
+                      local + "&extra=1", local.replace("lib", "parser"),
+                      local.replace("file:", "https:"), "pkg:cargo/other@1.24.0"):
+            self.assertIsNone(source_identity_scope("yara-x", "1.24.0", wrong))
+        self.assertIsNone(source_identity_scope("yara-x", "1.24.1",
+                                               local.replace("1.24.0", "1.24.1")))
+        obj = self.fixture()
+        obj["components"][0]["declared_purl"] = "pkg:cargo/other@1"
+        self.assertIsNone(self.run_obj(obj))
+        obj = self.fixture()
+        obj["components"][0].update(name="yara-x", version="1.24.0", declared_purl=local)
+        obj["components"][1].update(name="yara-x", version="1.24.0",
+                                    declared_purl="pkg:cargo/yara-x@1.24.0")
+        self.assertIsNone(self.run_obj(obj))
+
+    def test_batches_partition_exact_declarations_without_clearance(self):
+        obj = self.fixture()
+        local = "pkg:cargo/yara-x@1.24.0?download_url=file://..\\lib"
+        obj["components"][1].update(name="yara-x", version="1.24.0",
+                                    declared_purl=local, declared_licenses=["expression:MIT"])
+        obj["declared_license_counts"] = {"expression:MIT": 2}
+        r = self.run_obj(obj)
+        self.assertEqual(r["source_identity_scope_counts"],
+                         {"unqualified-cargo": 1, "workspace-qualified": 1})
+        batches = r["license_review_batches"]
+        self.assertEqual(len(batches), 2)
+        self.assertEqual(sum(b["component_count"] for b in batches), 2)
+        self.assertEqual(sorted(p for b in batches for p in b["declared_purls"]),
+                         sorted(["pkg:cargo/fixture-a@1", local]))
+        self.assertTrue(all(b["license_review"] == b["linkage_review"] == "not-performed"
+                            for b in batches))
+        self.assertFalse(r["execution_approved"])
+        obj["components"][1].update(name="fixture-b", version="1",
+                                    declared_purl="pkg:cargo/fixture-b@1")
+        batches = self.run_obj(obj)["license_review_batches"]
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(batches[0]["component_count"], 2)
+
+    def test_batch_comparison_coverage_remains_advisory(self):
+        result = self.run_obj(self.fixture())
+        rows = result["queue"]
+        observation = ("pkg:cargo/fixture-a@1", "fixture-a", "1",
+                       "expression:MIT", "https://docs.rs/crate/fixture-a/latest", "2026-11-27")
+        evidence = reconcile_observations(rows, [observation])
+        coverage = batch_comparison_coverage(result["license_review_batches"], evidence["observations"])
+        self.assertEqual(sum(b["component_count"] for b in coverage), 2)
+        self.assertEqual(sum(b["mutable_url_matches"] for b in coverage), 1)
+        self.assertEqual(sum(b["versioned_url_matches"] for b in coverage), 0)
+        self.assertEqual(sum(b["not_cross_checked"] for b in coverage), 1)
+        self.assertEqual([p for b in coverage for p in b["pending_declared_purls"]],
+                         ["pkg:cargo/fixture-b@1"])
+        self.assertTrue(all(not b["execution_approved"] and b["license_review"] == "not-performed"
+                            and b["linkage_review"] == "not-performed" for b in coverage))
+        empty = batch_comparison_coverage(result["license_review_batches"], [])
+        self.assertEqual(sum(b["not_cross_checked"] for b in empty), 2)
+        changed = list(observation)
+        changed[4] = "https://docs.rs/crate/fixture-a/1"
+        exact = reconcile_observations(rows, [changed])
+        exact_coverage = batch_comparison_coverage(result["license_review_batches"], exact["observations"])
+        self.assertEqual(sum(b["versioned_url_matches"] for b in exact_coverage), 1)
+        self.assertEqual(sum(b["mutable_url_matches"] for b in exact_coverage), 0)
+
+    def test_local_manifest_batch(self):
+        rows = self.run_obj(self.fixture())["queue"]
+        a = {"declared_purl": "pkg:cargo/fixture-a@1",
+             "source": "https://docs.rs/crate/fixture-a/1/source/Cargo.toml",
+             "observed_date": "2026-11-27",
+             "manifest": '[package]\nname="fixture-a"\nversion="1"\nlicense="MIT"\n'}
+        b = dict(a, declared_purl="pkg:cargo/fixture-b@1",
+                 source="https://docs.rs/crate/fixture-b/1/source/Cargo.toml.orig",
+                 manifest='[package]\nname="fixture-b"\nversion="1"\nlicense="MIT OR LGPL-2.1-or-later"\n')
+        def compare(items):
+            return compare_manifest_batch(rows, json.dumps(items).encode())
+        result = compare([b, a])
+        self.assertEqual(result, compare([a, b]))
+        self.assertEqual(result["matched"], 2)
+        self.assertEqual(result["observations"][0]["manifest_text_sha256"],
+                         hashlib.sha256(a["manifest"].encode()).hexdigest())
+        self.assertFalse(result["execution_approved"])
+        self.assertEqual(result["source_authentication"], "not-performed")
+        for bad in (
+            dict(a, manifest=a["manifest"].replace('license="MIT"', 'license="Apache-2.0"')),
+            dict(a, manifest=a["manifest"].replace('version="1"', 'version="2"')),
+            dict(a, manifest=a["manifest"].replace('name="fixture-a"', 'name="wrong"')),
+            dict(a, manifest=a["manifest"].replace('license="MIT"', 'license.workspace=true')),
+            dict(a, manifest=a["manifest"] + 'license-file="LICENSE"\n'),
+            dict(a, manifest=a["manifest"] + 'license="MIT"\n'),
+            dict(a, manifest="x" * (MAX_MANIFEST_BYTES + 1)),
+            dict(a, source=a["source"].replace("/1/", "/latest/")),
+            dict(a, source="https://docs.rs/crate/fixture-a/1"),
+            dict(a, observed_date="2026-02-30"),
+            dict(a, declared_purl="pkg:cargo/unknown@1"),
+            dict(a, extra=True),
+        ):
+            self.assertIsNone(compare([b, bad]))
+        self.assertIsNone(compare([a, a]))
+        self.assertIsNone(compare([]))
+        self.assertIsNone(compare([a] * (MAX_MANIFEST_ROWS + 1)))
+        self.assertIsNone(compare_manifest_batch(rows, b"x" * (MAX_MANIFEST_BATCH + 1)))
+        self.assertIsNone(compare_manifest_batch(rows, b'[{"manifest":"a","manifest":"b"}]'))
+
+    def test_duplicate_json_and_size(self):
+        self.assertIsNone(review_queue(b'{"schema":0,"schema":1}'))
+        self.assertIsNone(review_queue(b'x' * (MAX_BYTES + 1)))
+    def test_invalid_license(self):
+        obj = self.fixture()
+        obj["components"][0]["declared_licenses"] = ["expression:MIT","expression:MIT"]
+        self.assertIsNone(self.run_obj(obj))
+    def test_untrusted_labels(self):
+        obj = self.fixture()
+        obj["components"][0]["name"] = "fixture\\n"
+        obj["components"][0]["name"] += chr(10)
+        self.assertIsNone(self.run_obj(obj))
+
+def main():
+    if sys.argv[1:] == ["--self-test"]:
+        unittest.main(argv=[sys.argv[0]])
+    elif sys.argv[1:] == ["--compare-manifests"]:
+        try:
+            with REPORT.open("rb") as stream:
+                retained = retained_review_queue(stream.read(MAX_BYTES + 1))
+            result = (compare_manifest_batch(retained["queue"],
+                       sys.stdin.buffer.read(MAX_MANIFEST_BATCH + 1))
+                      if retained is not None else None)
+        except OSError:
+            result = None
+        if result is None:
+            print("Local manifest comparison unavailable or inconsistent.")
+            return 1
+        print(json.dumps(result, sort_keys=True, ensure_ascii=True))
+        return 0
+    elif sys.argv[1:] == ["--review-queue"]:
+        try:
+            with REPORT.open("rb") as stream:
+                result = retained_review_queue(stream.read(MAX_BYTES + 1))
+        except OSError:
+            result = None
+        if result is None:
+            print("Review queue unavailable or inconsistent.")
+            return 1
+        print(json.dumps(result, sort_keys=True, ensure_ascii=True))
+        return 0
+    else:
+        print("Use --self-test, --review-queue or --compare-manifests (JSON on stdin).")
+        return 2
+
+if __name__ == "__main__":
+    sys.exit(main())

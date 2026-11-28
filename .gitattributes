@@ -1,0 +1,2 @@
+# Preserve exact bytes for the pinned retained evidence; never normalize at verification.
+docs/evidence/yara-x-1.24.0-win-amd64-sbom-components.json -text

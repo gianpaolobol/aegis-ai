@@ -1,0 +1,318 @@
+# Copyright 2026 Gian Paolo Franceschini. See LICENSE.
+"""Bounded offline PyPI provenance preflight, NOT cryptographic verification."""
+import base64
+import binascii
+import hashlib
+import json
+import sys
+import unittest
+from pathlib import Path
+
+FILENAME = "yara_x-1.24.0-cp39-abi3-win_amd64.whl"
+DIGEST = "ce52bbf23683f47515bf493ee3d7c8346f3742c0dc5c654c389b8495b3dbfaca"
+REPO = "VirusTotal/yara-x"
+WORKFLOW = "release.yaml"
+PREDICATE = "https://docs.pypi.org/attestations/publish/v1"
+STATEMENT = "https://in-toto.io/Statement/v1"
+MAX_BYTES = 1024 * 1024
+MAX_STATEMENT = 16384
+
+def unique(pairs):
+    out = {}
+    for k, v in pairs:
+        if k in out:
+            raise ValueError("duplicate")
+        out[k] = v
+    return out
+
+def bad_constant(_):
+    raise ValueError("invalid JSON constant")
+
+def parse(raw):
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=unique,
+                      parse_constant=bad_constant)
+
+def one_version(obj):
+    return type(obj) is dict and type(obj.get("version")) is int and obj["version"] == 1
+
+def b64(value, limit):
+    if type(value) is not str or not 1 <= len(value) <= 4 * ((limit + 2) // 3):
+        raise ValueError("invalid encoded field")
+    data = base64.b64decode(value, validate=True)
+    if not 1 <= len(data) <= limit or base64.b64encode(data).decode("ascii") != value:
+        raise ValueError("invalid field size")
+    return data
+
+def uint_text(value):
+    if (type(value) is not str or not 1 <= len(value) <= 19
+            or not value.isascii() or not value.isdecimal()
+            or (len(value) > 1 and value[0] == "0")):
+        raise ValueError("invalid integer field")
+    number = int(value)
+    if number > 2**63 - 1:
+        raise ValueError("integer out of range")
+    return number
+
+def expected_path_length(index, size):
+    """Structural sibling count for a binary Merkle tree, RFC 9162 §2.1.3.1.
+    No hashes are computed or trusted. Inputs are bounded uint_text values.
+    """
+    if not 0 <= index < size:
+        raise ValueError("invalid tree coordinates")
+    count = 0
+    while size > 1:
+        split = 1 << ((size - 1).bit_length() - 1)
+        if index < split:
+            size = split
+        else:
+            index -= split
+            size -= split
+        count += 1
+    return count
+
+def transparency_shape(entry):
+    """Check a narrow Rekor v1 envelope shape, never its authenticity."""
+    if type(entry) is not dict or entry["kindVersion"] != {"kind": "dsse", "version": "0.0.1"}:
+        return False
+    if len(b64(entry["logId"]["keyId"], 32)) != 32:
+        return False
+    uint_text(entry["logIndex"])
+    if uint_text(entry["integratedTime"]) == 0:
+        return False
+    b64(entry["canonicalizedBody"], 65536)
+    b64(entry["inclusionPromise"]["signedEntryTimestamp"], 4096)
+    proof = entry["inclusionProof"]
+    tree_index = uint_text(proof["logIndex"])
+    tree_size = uint_text(proof["treeSize"])
+    if tree_index >= tree_size:
+        return False
+    if len(b64(proof["rootHash"], 32)) != 32:
+        return False
+    hashes = proof["hashes"]
+    if (type(hashes) is not list or len(hashes) > 64
+            or len(hashes) != expected_path_length(tree_index, tree_size)):
+        return False
+    if any(len(b64(item, 32)) != 32 for item in hashes):
+        return False
+    checkpoint = proof["checkpoint"]["envelope"]
+    return type(checkpoint) is str and 1 <= len(checkpoint) <= 16384 and bool(checkpoint.strip())
+
+def preflight(raw):
+    """Only exact structural/declared subject binding; signatures remain unverified.
+    Narrow single-publisher/single-publish-attestation profile. A different valid
+    profile requires review, not a silent fallback. Never emits raw input.
+    """
+    if type(raw) is not bytes or not 1 <= len(raw) <= MAX_BYTES:
+        return None
+    try:
+        obj = parse(raw)
+        if not one_version(obj):
+            return None
+        bundles = obj.get("attestation_bundles")
+        if type(bundles) is not list or len(bundles) != 1:
+            return None
+        bundle = bundles[0]
+        pub = bundle["publisher"]
+        if (pub["kind"] != "GitHub" or pub["repository"] != REPO
+                or pub["workflow"] != WORKFLOW):
+            return None
+        attestations = bundle["attestations"]
+        if type(attestations) is not list or len(attestations) != 1:
+            return None
+        att = attestations[0]
+        if not one_version(att):
+            return None
+        env = att["envelope"]
+        b64(env["signature"], 4096)
+        statement = parse(b64(env["statement"], MAX_STATEMENT))
+        if (type(statement) is not dict or statement.get("_type") != STATEMENT
+                or statement.get("predicateType") != PREDICATE
+                or (statement.get("predicate") is not None and statement["predicate"] != {})
+                or statement.get("subject") != [{"name": FILENAME,
+                                                   "digest": {"sha256": DIGEST}}]):
+            return None
+        material = att["verification_material"]
+        b64(material["certificate"], 16384)
+        entries = material["transparency_entries"]
+        if type(entries) is not list or not 1 <= len(entries) <= 8:
+            return None
+        if not all(transparency_shape(entry) for entry in entries):
+            return None
+        # Global log index and inclusion-proof tree index are different
+        # coordinates; do not equate them. Reject repeated log observations.
+        keys = [(entry["logId"]["keyId"], entry["logIndex"]) for entry in entries]
+        if len(set(keys)) != len(keys):
+            return None
+        return {"schema": "aegis-provenance-preflight-v1",
+                "provenance_sha256": hashlib.sha256(raw).hexdigest(),
+                "declared_subject_sha256": DIGEST,
+                "declared_publisher": REPO, "declared_workflow": WORKFLOW,
+                "structural_preflight": "matched",
+                "cryptographic_verification": "not-performed",
+                "certificate_identity_verification": "not-performed",
+                "license_review": "not-performed", "execution_approved": False}
+    except (ValueError, TypeError, KeyError, IndexError, AttributeError,
+            UnicodeError, binascii.Error, RecursionError):
+        return None
+
+class Fixtures(unittest.TestCase):
+    def fixture(self):
+        enc = lambda b: base64.b64encode(b).decode("ascii")
+        st = {"_type": STATEMENT, "predicateType": PREDICATE,
+              "subject": [{"name": FILENAME, "digest": {"sha256": DIGEST}}],
+              "predicate": None}
+        digest = enc(b"x" * 32)
+        entry = {"kindVersion": {"kind": "dsse", "version": "0.0.1"},
+                 "logId": {"keyId": digest}, "logIndex": "3",
+                 "integratedTime": "100", "canonicalizedBody": enc(b"fake body"),
+                 "inclusionPromise": {"signedEntryTimestamp": enc(b"fake timestamp")},
+                 "inclusionProof": {"logIndex": "0", "treeSize": "2",
+                                    "rootHash": digest, "hashes": [digest],
+                                    "checkpoint": {"envelope": "synthetic checkpoint"}}}
+        return {"version": 1, "attestation_bundles": [{
+            "publisher": {"kind": "GitHub", "repository": REPO, "workflow": WORKFLOW},
+            "attestations": [{"version": 1, "envelope": {
+                "signature": enc(b"fake signature"), "statement": enc(json.dumps(st).encode())},
+                "verification_material": {"certificate": enc(b"fake certificate"),
+                                           "transparency_entries": [entry]}}]}]}
+    def run_obj(self, obj):
+        return preflight(json.dumps(obj).encode())
+    def att(self, obj):
+        return obj["attestation_bundles"][0]["attestations"][0]
+    def test_structural_match_is_never_approval(self):
+        r = self.run_obj(self.fixture())
+        self.assertEqual(r["structural_preflight"], "matched")
+        self.assertEqual(r["cryptographic_verification"], "not-performed")
+        self.assertFalse(r["execution_approved"])
+    def test_wrong_publisher(self):
+        for field in ("kind", "repository", "workflow"):
+            obj = self.fixture()
+            obj["attestation_bundles"][0]["publisher"][field] = "wrong"
+            self.assertIsNone(self.run_obj(obj))
+    def test_wrong_statement(self):
+        for field in ("_type", "predicateType", "subject"):
+            obj = self.fixture()
+            env = self.att(obj)["envelope"]
+            st = parse(base64.b64decode(env["statement"]))
+            st[field] = "wrong"
+            env["statement"] = base64.b64encode(json.dumps(st).encode()).decode()
+            self.assertIsNone(self.run_obj(obj))
+        for field in ("name", "digest"):
+            obj = self.fixture()
+            env = self.att(obj)["envelope"]
+            st = parse(base64.b64decode(env["statement"]))
+            st["subject"][0][field] = "wrong"
+            env["statement"] = base64.b64encode(json.dumps(st).encode()).decode()
+            self.assertIsNone(self.run_obj(obj))
+    def test_ambiguous_bundles_and_attestations(self):
+        obj = self.fixture()
+        obj["attestation_bundles"] *= 2
+        self.assertIsNone(self.run_obj(obj))
+        obj = self.fixture()
+        obj["attestation_bundles"][0]["attestations"] *= 2
+        self.assertIsNone(self.run_obj(obj))
+    def test_invalid_encoding_and_material(self):
+        for field in ("signature", "statement"):
+            obj = self.fixture()
+            self.att(obj)["envelope"][field] = "!"
+            self.assertIsNone(self.run_obj(obj))
+        for field in ("certificate", "transparency_entries"):
+            obj = self.fixture()
+            self.att(obj)["verification_material"][field] = []
+            self.assertIsNone(self.run_obj(obj))
+    def test_bad_version_and_duplicate_keys(self):
+        for version in (True, 2, "1"):
+            obj = self.fixture()
+            obj["version"] = version
+            self.assertIsNone(self.run_obj(obj))
+        self.assertIsNone(preflight(b'{"version":1,"version":1}'))
+        self.assertIsNone(preflight(b'{"version":NaN}'))
+    def test_publish_predicate_profile(self):
+        for predicate in ({}, None, {"unexpected": True}, [], False, "x"):
+            obj = self.fixture()
+            env = self.att(obj)["envelope"]
+            st = parse(base64.b64decode(env["statement"]))
+            st["predicate"] = predicate
+            env["statement"] = base64.b64encode(json.dumps(st).encode()).decode()
+            result = self.run_obj(obj)
+            if predicate is None or predicate == {}:
+                self.assertIsNotNone(result)
+                self.assertFalse(result["execution_approved"])
+            else:
+                self.assertIsNone(result)
+    def test_noncanonical_base64(self):
+        obj = self.fixture()
+        self.att(obj)["envelope"]["signature"] = "Zh=="
+        self.assertIsNone(self.run_obj(obj))
+    def test_transparency_required_fields(self):
+        for field in ("kindVersion", "logId", "logIndex", "integratedTime",
+                      "canonicalizedBody", "inclusionPromise", "inclusionProof"):
+            obj = self.fixture()
+            del self.att(obj)["verification_material"]["transparency_entries"][0][field]
+            self.assertIsNone(self.run_obj(obj))
+    def test_transparency_proof_bounds(self):
+        for field, value in (("treeSize", "0"), ("logIndex", "-1"),
+                             ("rootHash", "eA=="), ("hashes", ["eA=="]),
+                             ("hashes", ["eA=="] * 65), ("checkpoint", {"envelope": " "}),
+                             ("treeSize", "9" * 20), ("logIndex", "01")):
+            obj = self.fixture()
+            self.att(obj)["verification_material"]["transparency_entries"][0]["inclusionProof"][field] = value
+            self.assertIsNone(self.run_obj(obj))
+    def test_merkle_path_cardinality(self):
+        for size, counts in ((1, [0]), (2, [1, 1]), (3, [2, 2, 1]),
+                             (5, [3, 3, 3, 3, 1]), (8, [3] * 8)):
+            for index, count in enumerate(counts):
+                self.assertEqual(expected_path_length(index, size), count)
+                for supplied in range(0, 5):
+                    obj = self.fixture()
+                    proof = self.att(obj)["verification_material"]["transparency_entries"][0]["inclusionProof"]
+                    proof["logIndex"], proof["treeSize"] = str(index), str(size)
+                    proof["hashes"] = [proof["rootHash"]] * supplied
+                    result = self.run_obj(obj)
+                    if supplied == count:
+                        self.assertIsNotNone(result)
+                        self.assertFalse(result["execution_approved"])
+                    else:
+                        self.assertIsNone(result)
+        self.assertEqual(expected_path_length(0, 2**63 - 1), 63)
+        with self.assertRaises(ValueError):
+            expected_path_length(1, 1)
+
+    def test_duplicate_log_observation(self):
+        obj = self.fixture()
+        entries = self.att(obj)["verification_material"]["transparency_entries"]
+        entries.append(dict(entries[0]))
+        self.assertIsNone(self.run_obj(obj))
+        # Distinct global index remains structurally admissible, not verified.
+        entries[1]["logIndex"] = "4"
+        self.assertIsNotNone(self.run_obj(obj))
+
+    def test_bounds_and_shapes(self):
+        for raw in (b"", b"x" * (MAX_BYTES + 1), b"[]", b"null", b"\xff"):
+            self.assertIsNone(preflight(raw))
+        obj = self.fixture()
+        self.att(obj)["verification_material"]["transparency_entries"] = [{}]
+        self.assertIsNone(self.run_obj(obj))
+        obj = self.fixture()
+        self.att(obj)["envelope"]["statement"] = base64.b64encode(
+            b"x" * (MAX_STATEMENT + 1)).decode()
+        self.assertIsNone(self.run_obj(obj))
+
+def main():
+    if sys.argv[1:] == ["--self-test"]:
+        unittest.main(argv=[sys.argv[0]])
+    if len(sys.argv) == 3 and sys.argv[1] == "--inspect":
+        try:
+            with Path(sys.argv[2]).open("rb") as stream:
+                result = preflight(stream.read(MAX_BYTES + 1))
+        except OSError:
+            result = None
+        if result is None:
+            print("Provenance structural preflight unavailable or unexpected.")
+            return 1
+        print(json.dumps(result, sort_keys=True, ensure_ascii=True))
+        return 0
+    return 2
+
+if __name__ == "__main__":
+    sys.exit(main())

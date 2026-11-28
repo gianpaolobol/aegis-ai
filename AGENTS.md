@@ -12,3 +12,17 @@ Questo repository fa parte della piattaforma di Gian Paolo Franceschini.
 4. **Aggiorna `STATO.md`** nella stessa pull request del lavoro.
 5. **Deroghe** alle linee guida: solo Gian, in una sezione `## [Gian] Deroghe alle linee guida` di questo file.
 <!-- fine-protocollo-comune -->
+
+## [Codex] Protocollo di sviluppo difensivo AEGIS — 2026-11-28
+
+# Development protocol
+Copyright 2026 Gian Paolo Franceschini. See LICENSE.
+For each iteration: inspect main, open PRs and CI; define scope, acceptance and threat model; review plan; implement on branch; run negative and regression tests; review independently when possible; record actual evidence and limitations; merge only after verified checks and review. Never report simulated agents as independent reviewers. No production deployment, personal-device changes, offensive activity or real malware. Use synthetic fixtures and isolated authorized environments. No secrets in this public repository. Preserve third-party licenses and original proprietary rights. Track docs/MASTER_PLAN.md, docs/DEVELOPMENT_PROGRESS.md and docs/COMPETITIVE_MATRIX.md. Stop release if a critical/high known issue remains or platform claims lack evidence.
+
+## [Codex] Build finali — 2026-11-28
+
+Decisione esplicita del titolare del 28/11/2026: completare lotti funzionali, test locali gratuiti e revisione prima del congelamento del candidato (SHA, lockfile, backup, evidenze e gate). Solo dopo verificare quota gratuita effettiva e autorizzazioni; una build finale per piattaforma/candidato, riuso degli artefatti identici, nessun costo o duplicazione. Eccezioni native indispensabili motivate e autorizzate, senza alternativa locale. Checkpoint di sviluppo con [skip ci] per i workflow push/pull_request; non equivale a superare i gate. Nessun merge/rilascio fino a verifiche esatte, collaudo fisico e gate store ove applicabili. Non modificare la copia sincronizzata di LINEE_GUIDA.md.
+
+## [Codex] Rettifica: progressione delle milestone — 2026-11-28
+
+Decisione del titolare: V0.1 Alpha approvata provvisoriamente come milestone di sviluppo, non come validazione tecnica o distribuzione. Passare alla V0.2 e seguire la sequenza in docs/MASTER_PLAN.md; i gate della V0.1 restano obbligatori per la distribuzione, non per i lotti indipendenti. Build finali, niente spese, nessun cambiamento delle policy di sicurezza.

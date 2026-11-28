@@ -1,0 +1,38 @@
+# Copyright 2026 Gian Paolo Franceschini. See LICENSE.
+# Explicitly dispatched public-source evidence acquisition; not a fixture test.
+name: AV candidate acquisition (no execution)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  acquire:
+    if: github.repository == 'gianpaolobol/aegis-ai' && github.ref == 'refs/heads/dev/ade-bootstrap-002'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Acquire fixed public wheel and check bytes without execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          tmp="$(mktemp -d)"
+          trap 'rm -rf -- "$tmp"' EXIT
+          candidate="$tmp/yara_x-1.24.0-cp39-abi3-win_amd64.whl"
+          # No redirects, no pip, no import, no secrets, no artifact upload.
+          curl --disable --proto '=https' --connect-timeout 10 --max-time 60 --max-filesize 16777216 --fail --silent --show-error --output "$candidate" 'https://files.pythonhosted.org/packages/8c/52/6381a0e38246dfd81965b5f24c34dcd20bf7bb73dc5795183cf746a8c305/yara_x-1.24.0-cp39-abi3-win_amd64.whl'
+          python -I lab/av/verify_wheel.py --inspect "$candidate"
+          python -I lab/av/verify_wheel.py --inventory "$candidate"
+          python -I lab/av/verify_wheel.py --self-test
+          python -I lab/av/verify_wheel.py --sbom-components "$candidate" > "$tmp/components.json"
+          python -I -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); rows=d.pop("components"); print("AEGIS_SBOM_SUMMARY "+json.dumps(d,sort_keys=True,ensure_ascii=True)); [print("AEGIS_SBOM_ROW "+json.dumps(row,sort_keys=True,ensure_ascii=True)) for row in rows]' "$tmp/components.json"
+          # Public registry evidence, no signature verification or native execution.
+          curl --disable --proto '=https' --connect-timeout 10 --max-time 30 --max-filesize 1048576 --fail --silent --show-error --header 'Accept: application/vnd.pypi.integrity.v1+json' --output "$tmp/provenance.json" 'https://pypi.org/integrity/yara-x/1.24.0/yara_x-1.24.0-cp39-abi3-win_amd64.whl/provenance'
+          python -I lab/av/provenance_preflight.py --inspect "$tmp/provenance.json"
+          echo 'Acquired and inventoried only; no execution, independent attestation or licensing approval.'
+          rm -rf -- "$tmp"
+          test ! -e "$tmp"
+          trap - EXIT
