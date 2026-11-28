@@ -1044,6 +1044,92 @@ function Test-AegisUacReport {
 }
 
 
+# SMB signing registry configuration only. No shares, connections, probes or policy changes.
+function Read-AegisSmbSigning([ValidateSet('Client','Server')][string]$Side) {
+    $base = $null
+    $key = $null
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine,[Microsoft.Win32.RegistryView]::Registry64)
+        $path = if ($Side -ceq 'Client') { 'SYSTEM\CurrentControlSet\Services\LanManWorkstation\Parameters' }
+                elseif ($Side -ceq 'Server') { 'SYSTEM\CurrentControlSet\Services\LanManServer\Parameters' }
+                else { return }
+        $key = $base.OpenSubKey($path,$false)
+        if ($null -eq $key) { return }
+        if ($key.GetValueKind('RequireSecuritySignature') -ne [Microsoft.Win32.RegistryValueKind]::DWord) { return }
+        $value = $key.GetValue('RequireSecuritySignature',$null)
+        [pscustomobject]@{RequireSecuritySignature=$value}
+    } catch { } # Missing, denied or unreadable evidence stays unknown.
+    finally {
+        if ($null -ne $key) { $key.Dispose() }
+        if ($null -ne $base) { $base.Dispose() }
+    }
+}
+function Get-AegisSmbSigningState([scriptblock]$ReadSide) {
+    try {
+        $rows = @(& $ReadSide | Select-Object -First 2)
+        if ($rows.Count -ne 1 -or $null -eq $rows[0]) { return 'Unknown' }
+        $p = $rows[0].PSObject.Properties['RequireSecuritySignature']
+        if ($null -eq $p -or $p.Value -isnot [int32]) { return 'Unknown' }
+        if ($p.Value -eq 1) { return 'Reported required' }
+        if ($p.Value -eq 0) { return 'Reported not required' }
+    } catch { }
+    return 'Unknown'
+}
+function Get-AegisSmbSigningReport([scriptblock]$ReadClient,[scriptblock]$ReadServer) {
+    $client = Get-AegisSmbSigningState $ReadClient
+    $server = Get-AegisSmbSigningState $ReadServer
+    $review = 'Both local settings report required; no effective protection conclusion.'
+    if ($client -eq 'Reported not required' -or $server -eq 'Reported not required') {
+        $review = 'Review required: at least one local setting does not require signing.'
+    } elseif ($client -eq 'Unknown' -or $server -eq 'Unknown') {
+        $review = 'Incomplete evidence; review configuration.'
+    }
+    return (@('Windows SMB signing registry snapshot (read-only).',
+        "Client signing requirement : $client",
+        "Server signing requirement : $server",
+        $review,
+        'Unknown includes absent, denied, unsupported or invalid values; defaults are not inferred.',
+        'This does not establish active session signing, SMB encryption, protocol version or peer security. No changes made.') -join [Environment]::NewLine)
+}
+function Test-AegisSmbSigningReport {
+    $required = { [pscustomobject]@{RequireSecuritySignature=1;PrivateField='SYNTHETIC-PRIVATE'} }
+    $optional = { [pscustomobject]@{RequireSecuritySignature=0} }
+    $report = Get-AegisSmbSigningReport $required $required
+    foreach ($expected in @('Client signing requirement : Reported required','Server signing requirement : Reported required','no effective protection conclusion')) {
+        if (-not $report.Contains($expected)) { throw 'SMB signing positive fixture mismatch' }
+    }
+    if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'SMB signing privacy regression' }
+    foreach ($case in @(
+        @{Client=$optional;Server=$required;Expected='Client signing requirement : Reported not required'},
+        @{Client=$required;Server=$optional;Expected='Server signing requirement : Reported not required'},
+        @{Client=$optional;Server=$optional;Expected='Server signing requirement : Reported not required'},
+        @{Client=$optional;Server={};Expected='Server signing requirement : Unknown'}
+    )) {
+        $report = Get-AegisSmbSigningReport $case.Client $case.Server
+        if (-not $report.Contains($case.Expected) -or -not $report.Contains('Review required:')) { throw 'SMB signing review condition missed' }
+    }
+    foreach ($bad in @({}, { throw 'SYNTHETIC-PRIVATE' }, { & $required; & $required },
+        { [pscustomobject]@{} }, { [pscustomobject]@{RequireSecuritySignature='1'} },
+        { [pscustomobject]@{RequireSecuritySignature=$true} }, { [pscustomobject]@{RequireSecuritySignature=@(1)} },
+        { [pscustomobject]@{RequireSecuritySignature=[int64]1} }, { [pscustomobject]@{RequireSecuritySignature=2} },
+        { [pscustomobject]@{RequireSecuritySignature=-1} })) {
+        $report = Get-AegisSmbSigningReport $bad $required
+        if (-not $report.Contains('Client signing requirement : Unknown') -or
+            -not $report.Contains('Server signing requirement : Reported required') -or
+            -not $report.Contains('Incomplete evidence') -or $report.Contains('SYNTHETIC-PRIVATE')) {
+            throw 'SMB signing invalid or unavailable evidence accepted'
+        }
+        $report = Get-AegisSmbSigningReport $required $bad
+        if (-not $report.Contains('Client signing requirement : Reported required') -or
+            -not $report.Contains('Server signing requirement : Unknown') -or
+            -not $report.Contains('Incomplete evidence') -or $report.Contains('SYNTHETIC-PRIVATE')) {
+            throw 'SMB signing asymmetric evidence regression'
+        }
+    }
+    Write-Output 'PASS: SMB signing registry snapshot synthetic fixtures'
+}
+
+
 if ($SelfTest) {
     foreach ($command in (Get-AegisCommands)) {
         if (-not (Test-AegisCommand $command)) { throw 'Allowlist failure' }
@@ -1055,6 +1141,7 @@ if ($SelfTest) {
     Test-AegisDeviceGuardReport
     Test-AegisBootTrustReport
     Test-AegisUacReport
+    Test-AegisSmbSigningReport
     Test-AegisIntegrity
     Test-AegisDnsReport
     Test-AegisVpnReport
@@ -1142,6 +1229,7 @@ $native.Add_Click({
             CimCmdlets\Get-CimInstance -Namespace 'root\CIMV2\Security\MicrosoftTpm' -ClassName Win32_Tpm -Property IsEnabled_InitialValue,IsActivated_InitialValue -OperationTimeoutSec 5 -ErrorAction Stop -WarningAction SilentlyContinue
         })
         $output.Text += [Environment]::NewLine + [Environment]::NewLine + (Get-AegisUacReport { Read-AegisUacPolicy })
+        $output.Text += [Environment]::NewLine + [Environment]::NewLine + (Get-AegisSmbSigningReport { Read-AegisSmbSigning 'Client' } { Read-AegisSmbSigning 'Server' })
     } catch { $output.Text = 'Native diagnostic unavailable; no changes made.' }
 })
 $form.Controls.Add($native)
