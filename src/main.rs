@@ -119,6 +119,20 @@ fn run(args: &[OsString]) -> (i32, String) {
             }
             _ => return (1, "Synthetic workload identity assessment unavailable.\n".into()),
         }
+        use aegis_policy::nhi::{assess_coverage, CoverageStatus};
+        let limits = Limits { max_observation_age: 10, max_lifetime: 30 };
+        match assess_coverage(&[1, 2], &[identity], 100, limits) {
+            Ok(r) if !r.all_fixture_criteria_reported &&
+                r.rows.len() == 2 && r.rows[1].id == 2 &&
+                r.rows[1].status == CoverageStatus::MissingObservation =>
+                report.push_str("Required identity coverage: fixture 2 missing; criteria incomplete.\n"),
+            _ => return (1, report),
+        }
+        match assess_coverage(&[1], &[identity], 100, limits) {
+            Ok(r) if r.all_fixture_criteria_reported =>
+                report.push_str("Required identity coverage: all fixture criteria reported, not verified.\n"),
+            _ => return (1, report),
+        }
         use aegis_policy::nhi::{assess_rotation, Rotation, RotationReview};
         let rotation = Rotation { workload: 1, previous: 2, successor: 3, issued: 80,
             successor_check: Some(85), previous_revocation: Some(90), observed: 95,

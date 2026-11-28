@@ -59,6 +59,8 @@ fn synthetic_demos_have_expected_results() {
                      "Revoked fixture: Revoked, Expired",
                      "Unknown scope: ScopeReview, RevocationUnknown",
                      "no credential rotation or revocation performed",
+                     "Required identity coverage: fixture 2 missing; criteria incomplete.",
+                     "Required identity coverage: all fixture criteria reported, not verified.",
                      "rotation handoff: FixtureReviewOnly",
                      "rotation without continuity: ContinuityUnknown",
                      "rotation overlap: OverlapExceeded"] {

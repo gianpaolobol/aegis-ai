@@ -210,3 +210,121 @@ mod rotation_tests {
         assert_eq!(assess_rotation(R, 100, 0, 10), RotationReview::InvalidPlan);
     }
 }
+
+
+/// Explicit coverage against an independently supplied required fixture set.
+/// A complete report is not proof that all real identities were inventoried.
+/// No discovery, authorization, credentials, persistence or system actions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CoverageStatus {
+    MissingObservation,
+    Observed(Vec<Advisory>),
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoverageRow {
+    pub id: u32,
+    pub status: CoverageStatus,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoverageReport {
+    pub rows: Vec<CoverageRow>,
+    pub all_fixture_criteria_reported: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoverageError {
+    EmptyRequired,
+    UnexpectedIdentity,
+    Inventory(Error),
+}
+/// Validate the entire snapshot before returning a report. Expected identities
+/// cannot be inferred from observations; missing rows are not healthy rows.
+pub fn assess_coverage(required: &[u32], observed: &[Identity], now: u64, limits: Limits)
+    -> Result<CoverageReport, CoverageError>
+{
+    use CoverageError::*;
+    if required.is_empty() { return Err(EmptyRequired); }
+    if required.len() > MAX_IDENTITIES || observed.len() > MAX_IDENTITIES {
+        return Err(Inventory(Error::LimitExceeded));
+    }
+    let mut expected = BTreeSet::new();
+    for &id in required {
+        if id == 0 { return Err(Inventory(Error::InvalidIdentifier)); }
+        if !expected.insert(id) { return Err(Inventory(Error::Duplicate)); }
+    }
+    let assessments = assess(observed, now, limits).map_err(Inventory)?;
+    let mut by_id = std::collections::BTreeMap::new();
+    for (row, advisory) in observed.iter().zip(assessments) {
+        if !expected.contains(&row.id) { return Err(UnexpectedIdentity); }
+        by_id.insert(row.id, advisory);
+    }
+    let rows: Vec<_> = expected.into_iter().map(|id| CoverageRow {
+        id,
+        status: match by_id.remove(&id) {
+            Some(a) => CoverageStatus::Observed(a),
+            None => CoverageStatus::MissingObservation,
+        },
+    }).collect();
+    let all_fixture_criteria_reported = rows.iter().all(|row| match &row.status {
+        CoverageStatus::Observed(a) => a.as_slice() == [Advisory::FixtureCriteriaReported],
+        CoverageStatus::MissingObservation => false,
+    });
+    Ok(CoverageReport { rows, all_fixture_criteria_reported })
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    const LIMITS: Limits = Limits { max_observation_age: 10, max_lifetime: 30 };
+    const ROW: Identity = Identity { id: 1, owner_assigned: Reported::Yes,
+        scoped: Reported::Yes, reviewed_fixture: true, observed_at: 95,
+        issued_at: Some(90), expires_at: Some(120), revocation: Revocation::NotRevoked };
+    #[test]
+    fn coverage_is_complete_only_for_all_required_healthy_fixtures() {
+        let second = Identity { id: 2, ..ROW };
+        let report = assess_coverage(&[2,1], &[second,ROW], 100, LIMITS).unwrap();
+        assert!(report.all_fixture_criteria_reported);
+        assert_eq!(report, assess_coverage(&[1,2], &[ROW,second], 100, LIMITS).unwrap());
+        assert_eq!(report.rows.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1,2]);
+    }
+    #[test]
+    fn missing_and_untrusted_rows_do_not_clear_inventory() {
+        let report = assess_coverage(&[1,2,3], &[ROW,
+            Identity { id: 2, reviewed_fixture: false, ..ROW }], 100, LIMITS).unwrap();
+        assert!(!report.all_fixture_criteria_reported);
+        assert_eq!(report.rows[1].status, CoverageStatus::Observed(vec![Advisory::UnverifiedEvidence]));
+        assert_eq!(report.rows[2].status, CoverageStatus::MissingObservation);
+        let empty = assess_coverage(&[1], &[], 100, LIMITS).unwrap();
+        assert!(!empty.all_fixture_criteria_reported);
+        assert_eq!(empty.rows[0].status, CoverageStatus::MissingObservation);
+    }
+    #[test]
+    fn rejects_invalid_required_and_observed_snapshots() {
+        use CoverageError::*;
+        assert_eq!(assess_coverage(&[], &[], 100, LIMITS), Err(EmptyRequired));
+        assert_eq!(assess_coverage(&[0], &[], 100, LIMITS), Err(Inventory(Error::InvalidIdentifier)));
+        assert_eq!(assess_coverage(&[1,1], &[], 100, LIMITS), Err(Inventory(Error::Duplicate)));
+        assert_eq!(assess_coverage(&[1], &[ROW,ROW], 100, LIMITS), Err(Inventory(Error::Duplicate)));
+        assert_eq!(assess_coverage(&[2], &[ROW], 100, LIMITS), Err(UnexpectedIdentity));
+        assert_eq!(assess_coverage(&[1], &[Identity { id: 0, ..ROW }], 100, LIMITS),
+            Err(Inventory(Error::InvalidIdentifier)));
+        assert_eq!(assess_coverage(&[1], &[], 100, Limits { max_lifetime: 0, ..LIMITS }),
+            Err(Inventory(Error::InvalidConfiguration)));
+    }
+    #[test]
+    fn bounds_and_nonpositive_reasons_are_preserved() {
+        let required: Vec<u32> = (1..=MAX_IDENTITIES as u32).collect();
+        let observed: Vec<_> = required.iter().map(|&id| Identity { id, ..ROW }).collect();
+        assert!(assess_coverage(&required, &observed, 100, LIMITS).unwrap().all_fixture_criteria_reported);
+        assert_eq!(assess_coverage(&vec![1; MAX_IDENTITIES+1], &[], 100, LIMITS),
+            Err(CoverageError::Inventory(Error::LimitExceeded)));
+        assert_eq!(assess_coverage(&[1], &vec![ROW; MAX_IDENTITIES+1], 100, LIMITS),
+            Err(CoverageError::Inventory(Error::LimitExceeded)));
+        for bad in [Identity { revocation: Revocation::Revoked, ..ROW },
+            Identity { observed_at: 101, ..ROW }, Identity { observed_at: 89, ..ROW },
+            Identity { expires_at: Some(100), ..ROW }, Identity { scoped: Reported::Unknown, ..ROW }] {
+            let r = assess_coverage(&[1], &[bad], 100, LIMITS).unwrap();
+            assert!(!r.all_fixture_criteria_reported);
+            assert_eq!(r.rows[0].status, CoverageStatus::Observed(assess(&[bad],100,LIMITS).unwrap().remove(0)));
+        }
+    }
+}
