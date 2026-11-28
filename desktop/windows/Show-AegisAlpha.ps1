@@ -1183,22 +1183,36 @@ function Test-AegisAsrSummary {
     $ids = @('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa','bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
         'cccccccc-cccc-cccc-cccc-cccccccccccc','dddddddd-dddd-dddd-dddd-dddddddddddd',
         'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee')
-    $record = [pscustomobject]@{AttackSurfaceReductionRules_Ids=$ids;
+    $asrFixture = [pscustomobject]@{AttackSurfaceReductionRules_Ids=$ids;
         AttackSurfaceReductionRules_Actions=[byte[]]@(0,1,2,5,6)}
     $expected = 'Reported rules: 5; block: 1; audit: 1; warn: 1; off: 1; not configured: 1'
-    if ((Get-AegisAsrSummary $record) -cne $expected) { throw 'ASR mode aggregate mismatch' }
-    $report = Get-AegisDefenderPreferenceReport { $record }
-    if (-not $report.Contains("Attack surface reduction : $expected") -or $report.Contains($ids[0])) {
-        throw 'ASR integration or privacy regression'
+    if ((Get-AegisAsrSummary $asrFixture) -cne $expected) { throw 'ASR mode aggregate mismatch' }
+    # Capture the synthetic fixture explicitly: a called function's local variables
+    # must not shadow the provider's input through PowerShell dynamic scope.
+    $readAsrFixture = { $asrFixture }.GetNewClosure()
+    $report = Get-AegisDefenderPreferenceReport $readAsrFixture
+    if (-not $report.Contains("Attack surface reduction : $expected")) {
+        throw 'ASR report aggregate mismatch'
     }
-    $record.AttackSurfaceReductionRules_Ids = [string[]]@()
-    $record.AttackSurfaceReductionRules_Actions = [byte[]]@()
-    if ((Get-AegisAsrSummary $record) -cne 'No rules reported (coverage unknown)') {
+    foreach ($id in $ids) {
+        if ($report.Contains($id)) { throw 'ASR report privacy regression' }
+    }
+    $ambiguous = { $asrFixture; $asrFixture }.GetNewClosure()
+    $ambiguousReport = Get-AegisDefenderPreferenceReport $ambiguous
+    if (-not $ambiguousReport.Contains('Attack surface reduction : Unknown (missing, unsupported or inconsistent rule metadata)')) {
+        throw 'ASR ambiguous provider accepted'
+    }
+    foreach ($id in $ids) {
+        if ($ambiguousReport.Contains($id)) { throw 'ASR ambiguous provider privacy regression' }
+    }
+    $asrFixture.AttackSurfaceReductionRules_Ids = [string[]]@()
+    $asrFixture.AttackSurfaceReductionRules_Actions = [byte[]]@()
+    if ((Get-AegisAsrSummary $asrFixture) -cne 'No rules reported (coverage unknown)') {
         throw 'ASR empty evidence mismatch'
     }
-    $record.AttackSurfaceReductionRules_Ids = [string[]]@($ids[0])
-    $record.AttackSurfaceReductionRules_Actions = [uint16[]]@(1)
-    if ((Get-AegisAsrSummary $record) -cne 'Reported rules: 1; block: 1; audit: 0; warn: 0; off: 0; not configured: 0') {
+    $asrFixture.AttackSurfaceReductionRules_Ids = [string[]]@($ids[0])
+    $asrFixture.AttackSurfaceReductionRules_Actions = [uint16[]]@(1)
+    if ((Get-AegisAsrSummary $asrFixture) -cne 'Reported rules: 1; block: 1; audit: 0; warn: 0; off: 0; not configured: 0') {
         throw 'ASR singleton mismatch'
     }
     $bad = @(
@@ -1218,9 +1232,9 @@ function Test-AegisAsrSummary {
         @{Ids=@($ids[0])*257;Actions=@(1)*257}
     )
     foreach ($case in $bad) {
-        $record.AttackSurfaceReductionRules_Ids = $case.Ids
-        $record.AttackSurfaceReductionRules_Actions = $case.Actions
-        $summary = Get-AegisAsrSummary $record
+        $asrFixture.AttackSurfaceReductionRules_Ids = $case.Ids
+        $asrFixture.AttackSurfaceReductionRules_Actions = $case.Actions
+        $summary = Get-AegisAsrSummary $asrFixture
         if ($summary -cne 'Unknown (missing, unsupported or inconsistent rule metadata)') {
             throw 'Invalid ASR metadata accepted'
         }
