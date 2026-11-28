@@ -12,7 +12,7 @@ in sviluppo
 non pubblicata
 
 ## Prossimi passi
-1. Validare l'integrazione del protocollo comune e la CI della PR #1.
+1. Verificare le nuove CI e completare il candidato Windows alpha.
 2. Completare provenienza, licenze, linkage e laboratorio del motore AV.
 3. Collaudare installazione e rimozione su VM Windows client isolata.
 4. Ottenere firma attendibile e revisione indipendente prima di ogni distribuzione.
@@ -32,3 +32,5 @@ Segue la versione **1.1.0** (`LINEE_GUIDA.md`).
 ## Registro aggiornamenti
 - 2026-11-26 [Claude] Prima compilazione dai contenuti del repository; le voci "da confermare" vanno verificate.
 - 2026-11-28 [Codex] Aggiornamento su evidenza CI ADE-096: tre OS e controlli UI superati; riconciliazione della governance su ramo di sviluppo, non rilascio.
+
+- 2026-11-28 [Codex] ADE-098: CI ADE-097 verde; validatore offline di coerenza dei verbali Windows client, installazione reale ancora non verificata.

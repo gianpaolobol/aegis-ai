@@ -4,12 +4,14 @@ on:
     paths:
       - 'desktop/windows/**'
       - 'lab/av/**'
+      - 'lab/windows/**'
       - '.github/workflows/windows-ui.yml'
   push:
     branches: ['dev/**']
     paths:
       - 'desktop/windows/**'
       - 'lab/av/**'
+      - 'lab/windows/**'
       - '.github/workflows/windows-ui.yml'
 permissions:
   contents: read
@@ -68,3 +70,9 @@ jobs:
         run: |
           python -I lab/av/provenance_preflight.py --self-test
           if ($LASTEXITCODE -ne 0) { throw 'Provenance preflight regressions failed' }
+
+      - name: Validate synthetic Windows client evidence records
+        shell: powershell
+        run: |
+          python -I lab/windows/validate_client_record.py --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'Client evidence record regression failed' }
