@@ -61,6 +61,15 @@ SOURCE_OBSERVATIONS = (
     ("pkg:cargo/adler2@2.0.1", "adler2", "2.0.1",
      "expression:0BSD OR MIT OR Apache-2.0",
      "https://docs.rs/crate/adler2/latest/source/Cargo.toml.orig", "2026-11-28"),
+    ("pkg:cargo/hex@0.4.3", "hex", "0.4.3",
+     "expression:MIT OR Apache-2.0",
+     "https://docs.rs/crate/hex/latest/source/Cargo.toml", "2026-11-28"),
+    ("pkg:cargo/block-buffer@0.12.1", "block-buffer", "0.12.1",
+     "expression:MIT OR Apache-2.0",
+     "https://docs.rs/crate/block-buffer/latest/source/Cargo.toml", "2026-11-28"),
+    ("pkg:cargo/cpufeatures@0.3.1", "cpufeatures", "0.3.1",
+     "expression:MIT OR Apache-2.0",
+     "https://docs.rs/crate/cpufeatures/latest/source/Cargo.toml", "2026-11-28"),
 )
 
 def unique_object(pairs):

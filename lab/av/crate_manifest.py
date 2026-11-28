@@ -20,6 +20,9 @@ MAX_ARCHIVE = 8 * 1024 * 1024
 MAX_EXPANDED = 16 * 1024 * 1024
 MAX_ENTRIES = 4096
 MAX_MANIFEST = 64 * 1024
+MAX_NOTICE_BYTES = 256 * 1024
+MAX_NOTICE_FILES = 32
+NOTICE_NAME = re.compile(r'(?:LICENSE|LICENCE|COPYING|NOTICE|COPYRIGHT)(?:[._-][A-Za-z0-9._-]{1,100})?', re.ASCII | re.IGNORECASE)
 MAX_BATCH_BYTES = 16 * 1024 * 1024
 MAX_BATCH_ARCHIVES = 32
 MAX_BATCH_COMPRESSED = 12 * 1024 * 1024
@@ -48,6 +51,7 @@ def compare(row, raw, expected_sha256, observed_date):
             return None
         root = name + '-' + version
         seen, manifest = set(), None
+        notices = []
         with tarfile.open(fileobj=io.BytesIO(expanded), mode='r:') as archive:
             for member in archive:
                 path = member.name
@@ -67,6 +71,16 @@ def compare(row, raw, expected_sha256, observed_date):
                         manifest = stream.read(MAX_MANIFEST + 1)
                     if len(manifest) != member.size:
                         return None
+                # Narrow root-level notice candidate inventory, not a license parser.
+                elif len(parts) == 2 and NOTICE_NAME.fullmatch(parts[1]) and member.isfile():
+                    if len(notices) >= MAX_NOTICE_FILES or not 1 <= member.size <= MAX_NOTICE_BYTES:
+                        return None
+                    with archive.extractfile(member) as stream:
+                        notice = stream.read(MAX_NOTICE_BYTES + 1)
+                    if len(notice) != member.size:
+                        return None
+                    notices.append({'name': parts[1], 'size': len(notice),
+                                    'sha256': hashlib.sha256(notice).hexdigest()})
             # Reject a missing terminator or hidden nonzero data after the logical archive.
             tail = expanded[archive.offset:]
             if len(tail) < 1024 or any(tail):
@@ -82,6 +96,9 @@ def compare(row, raw, expected_sha256, observed_date):
         return {'schema': 'aegis-local-crate-comparison-v1', 'declared_purl': purl,
                 'observed_date': observed_date, 'archive_sha256': expected_sha256,
                 'manifest_sha256': hashlib.sha256(manifest).hexdigest(),
+                'root_notice_candidates': sorted(notices, key=lambda item: item['name']),
+                'notice_inventory_scope': 'root-filename-pattern-only',
+                'notice_review': 'not-performed',
                 'declaration_comparison': 'exact-match', 'checksum_origin': 'caller-supplied',
                 'source_authentication': 'not-performed', 'license_review': 'not-performed',
                 'linkage_review': 'not-performed', 'execution_approved': False}
@@ -207,6 +224,32 @@ class Fixtures(unittest.TestCase):
         self.assertIsNone(self.check(gzip.compress(b'x' * (MAX_EXPANDED + 1))))
         self.assertIsNone(self.check(b'x' * (MAX_ARCHIVE + 1)))
 
+
+    def test_root_notice_inventory_is_partial(self):
+        valid = (self.path, self.manifest, tarfile.REGTYPE)
+        a = ('fixture-1.0.0/LICENSE-MIT', b'synthetic MIT notice', tarfile.REGTYPE)
+        b = ('fixture-1.0.0/NOTICE.txt', b'synthetic notice', tarfile.REGTYPE)
+        nested = ('fixture-1.0.0/vendor/LICENSE', b'nested synthetic', tarfile.REGTYPE)
+        result = self.check(self.archive([valid, b, nested, a]))
+        self.assertEqual(result['root_notice_candidates'], [
+            {'name': 'LICENSE-MIT', 'size': len(a[1]), 'sha256': hashlib.sha256(a[1]).hexdigest()},
+            {'name': 'NOTICE.txt', 'size': len(b[1]), 'sha256': hashlib.sha256(b[1]).hexdigest()}])
+        self.assertEqual(result['root_notice_candidates'],
+                         self.check(self.archive([a, valid, b]))['root_notice_candidates'])
+        self.assertEqual(result['notice_inventory_scope'], 'root-filename-pattern-only')
+        self.assertEqual(result['notice_review'], 'not-performed')
+        self.assertFalse(result['execution_approved'])
+        self.assertEqual(self.check(self.archive([valid]))['root_notice_candidates'], [])
+
+    def test_notice_limits_and_no_partial_result(self):
+        valid = (self.path, self.manifest, tarfile.REGTYPE)
+        for payload in (b'', b'x' * (MAX_NOTICE_BYTES + 1)):
+            self.assertIsNone(self.check(self.archive([valid, ('fixture-1.0.0/LICENSE', payload, tarfile.REGTYPE)])))
+        entries = [('fixture-1.0.0/NOTICE-' + str(i), b'x', tarfile.REGTYPE)
+                   for i in range(MAX_NOTICE_FILES + 1)]
+        self.assertIsNone(self.check(self.archive([valid] + entries)))
+        self.assertEqual(len(self.check(self.archive([valid] + entries[:-1]))['root_notice_candidates']),
+                         MAX_NOTICE_FILES)
 
     def batch_fixture(self):
         second = dict(self.row, name='fixture-two', declared_purl='pkg:cargo/fixture-two@1.0.0')
