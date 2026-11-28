@@ -34,3 +34,5 @@ Segue la versione **1.1.0** (`LINEE_GUIDA.md`).
 - 2026-11-28 [Codex] Aggiornamento su evidenza CI ADE-096: tre OS e controlli UI superati; riconciliazione della governance su ramo di sviluppo, non rilascio.
 
 - 2026-11-28 [Codex] ADE-098: CI ADE-097 verde; validatore offline di coerenza dei verbali Windows client, installazione reale ancora non verificata.
+
+- 2026-11-28 [Codex] ADE-099: CI ADE-098 verde; confronto offline SHA-256 dei byte del pacchetto e delle sette evidenze, senza attestare installazione o autenticità.

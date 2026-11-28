@@ -76,3 +76,9 @@ jobs:
         run: |
           python -I lab/windows/validate_client_record.py --self-test
           if ($LASTEXITCODE -ne 0) { throw 'Client evidence record regression failed' }
+
+      - name: Verify synthetic client package and evidence byte binding
+        shell: powershell
+        run: |
+          python -I lab/windows/verify_client_evidence.py --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'Client evidence byte binding regression failed' }
