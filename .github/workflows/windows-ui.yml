@@ -82,3 +82,11 @@ jobs:
         run: |
           python -I lab/windows/verify_client_evidence.py --self-test
           if ($LASTEXITCODE -ne 0) { throw 'Client evidence byte binding regression failed' }
+
+      - name: Run offline endpoint evidence fusion regressions
+        shell: powershell
+        run: |
+          python -I lab/windows/edr_triage.py --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'EDR triage regressions failed' }
+          python -E -s lab/windows/endpoint_fusion.py
+          if ($LASTEXITCODE -ne 0) { throw 'Endpoint fusion regressions failed' }

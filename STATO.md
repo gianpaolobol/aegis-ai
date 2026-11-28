@@ -12,11 +12,11 @@ in sviluppo
 non pubblicata
 
 ## Prossimi passi
-1. Completare i lotti funzionali e i test locali; congelare il candidato Windows alpha prima della CI/build finale autorizzata.
+1. V0.1 Alpha approvata provvisoriamente dal titolare; sviluppare V0.2 AV/EDR/XDR e lotti successivi senza blocchi indipendenti. Congelare i candidati solo dopo test e review.
 2. Completare provenienza, licenze, linkage e laboratorio del motore AV.
 3. Collaudare installazione e rimozione su VM Windows client isolata.
 4. Ottenere firma attendibile e revisione indipendente prima di ogni distribuzione.
-5. Proseguire il piano V1.0 senza dichiarare capacità non validate.
+5. Proseguire V0.3–V1.0 secondo MASTER_PLAN, senza dichiarare capacità non validate.
 
 ## Blocchi
 - Revisione indipendente, firma di distribuzione, laboratorio Windows client e motore AV nativo non ancora validati.
@@ -44,3 +44,5 @@ Segue la versione **1.1.0** (`LINEE_GUIDA.md`).
 - 2026-11-28 [Codex] ADE-102: CI ADE-101 verde; riepilogo eventi Defender locali su richiesta, soli conteggi, nuovo collaudo CI in attesa.
 
 - 2026-11-28 [Codex] ADE-103: CI ADE-102 verde; riferimento offline di triage dei soli conteggi Defender, 6 test locali superati; integrazione UI e collaudo finale ancora aperti. Build differite secondo direttiva del titolare.
+
+- 2026-11-28 [Codex] ADE-104: avvio V0.2, correlazione offline di segnali AV/EDR sintetici e 12 test locali (6 nuovi, 6 regressioni); integrazione nativa e gate di distribuzione ancora aperti.

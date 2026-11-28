@@ -23,3 +23,7 @@ Threat coverage: hostile agents, adaptive malware, ransomware, phishing, deepfak
 - First release priority: [Windows alpha readiness](RELEASE_READINESS.md), followed by other platforms only after actual validation. No production protection claims.
 
 - ALIS: [Learning Integrity Shield](LEARNING_INTEGRITY.md). Quarantine, provenance, drift, artifact and RAG integrity, independent release gates and rollback; design only.
+
+
+## [Codex] Owner milestone decision — 2026-11-28
+V0.1 Alpha provisionally accepted by owner for development progression only, not technical validation or distribution. Active V0.2 AV/antimalware/EDR/XDR; V0.3 network/VPN/firewall/DNS/Wi-Fi; V0.4 phishing/browser/email/account; V0.5 AI/MCP/API/OAuth; V0.6 AAIS; V0.7 ALIS/AGCE; V0.8 platform consolidation; V0.9 integration/benchmarks; V1.0 RC cumulative validation; V1.0 only after verified gates. Earlier Windows-alpha-first wording means distribution priority, not a blocker for independent lots. Full scope remains. No build merely for milestone labels. V0.1 client lab, trusted signature, licenses, native AV, independent review and exact candidate tests remain release gates.

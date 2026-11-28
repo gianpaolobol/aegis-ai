@@ -22,3 +22,7 @@ For each iteration: inspect main, open PRs and CI; define scope, acceptance and 
 ## [Codex] Build finali — 2026-11-28
 
 Decisione esplicita del titolare del 28/11/2026: completare lotti funzionali, test locali gratuiti e revisione prima del congelamento del candidato (SHA, lockfile, backup, evidenze e gate). Solo dopo verificare quota gratuita effettiva e autorizzazioni; una build finale per piattaforma/candidato, riuso degli artefatti identici, nessun costo o duplicazione. Eccezioni native indispensabili motivate e autorizzate, senza alternativa locale. Checkpoint di sviluppo con [skip ci] per i workflow push/pull_request; non equivale a superare i gate. Nessun merge/rilascio fino a verifiche esatte, collaudo fisico e gate store ove applicabili. Non modificare la copia sincronizzata di LINEE_GUIDA.md.
+
+## [Codex] Rettifica: progressione delle milestone — 2026-11-28
+
+Decisione del titolare: V0.1 Alpha approvata provvisoriamente come milestone di sviluppo, non come validazione tecnica o distribuzione. Passare alla V0.2 e seguire la sequenza in docs/MASTER_PLAN.md; i gate della V0.1 restano obbligatori per la distribuzione, non per i lotti indipendenti. Build finali, niente spese, nessun cambiamento delle policy di sicurezza.
