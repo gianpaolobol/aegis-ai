@@ -1130,6 +1130,90 @@ function Test-AegisSmbSigningReport {
 }
 
 
+# Defender preference snapshot only: never read or display exclusion/path lists.
+function Get-AegisDefenderPreferenceMode($Record,[string]$Name) {
+    if ($Name -cnotin @('PUAProtection','EnableNetworkProtection','EnableControlledFolderAccess')) { return 'Unknown' }
+    if ($null -eq $Record) { return 'Unknown' }
+    $property = $Record.PSObject.Properties[$Name]
+    if ($null -eq $property) { return 'Unknown' }
+    $value = $property.Value
+    if ($value -isnot [byte] -and $value -isnot [uint16] -and
+        $value -isnot [uint32] -and $value -isnot [int32]) { return 'Unknown' }
+    if ($value -eq 0) { return 'Configured off' }
+    if ($value -eq 1) { return 'Configured block' }
+    if ($value -eq 2) { return 'Configured audit only' }
+    if ($Name -ceq 'EnableControlledFolderAccess') {
+        if ($value -eq 3) { return 'Configured disk-sector block only' }
+        if ($value -eq 4) { return 'Configured disk-sector audit only' }
+    }
+    return 'Unknown'
+}
+function Get-AegisDefenderPreferenceReport([scriptblock]$ReadPreference) {
+    $record = $null
+    try {
+        $records = @(& $ReadPreference | Select-Object -First 2)
+        if ($records.Count -eq 1) { $record = $records[0] }
+    } catch { $record = $null }
+    $pua = Get-AegisDefenderPreferenceMode $record 'PUAProtection'
+    $network = Get-AegisDefenderPreferenceMode $record 'EnableNetworkProtection'
+    $folders = Get-AegisDefenderPreferenceMode $record 'EnableControlledFolderAccess'
+    return (@('Defender preference snapshot (read-only configuration, not enforcement).',
+        "Potentially unwanted apps : $pua",
+        "Network protection : $network",
+        "Controlled folder access : $folders",
+        'Audit-only and disk-sector-only modes are not full blocking.',
+        'Actual protection depends on OS support, active Defender mode and other prerequisites.',
+        'No exclusions, protected folder paths, or settings changes reported.') -join [Environment]::NewLine)
+}
+function Test-AegisDefenderPreferenceReport {
+    $report = Get-AegisDefenderPreferenceReport {
+        [pscustomobject]@{PUAProtection=[byte]1;EnableNetworkProtection=[uint32]2;
+            EnableControlledFolderAccess=[int32]3;ExclusionPath='SYNTHETIC-PRIVATE'}
+    }
+    foreach ($line in @('Potentially unwanted apps : Configured block','Network protection : Configured audit only',
+        'Controlled folder access : Configured disk-sector block only','not enforcement')) {
+        if (-not $report.Contains($line)) { throw 'Defender preference positive fixture mismatch' }
+    }
+    if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'Defender preference privacy regression' }
+    foreach ($case in @(
+        @{Value=[byte]0;Expected='Configured off'},
+        @{Value=[uint16]1;Expected='Configured block'},
+        @{Value=[uint32]2;Expected='Configured audit only'},
+        @{Value=[int32]3;Expected='Configured disk-sector block only'},
+        @{Value=[int32]4;Expected='Configured disk-sector audit only'})) {
+        $record = [pscustomobject]@{EnableControlledFolderAccess=$case.Value}
+        if ((Get-AegisDefenderPreferenceMode $record 'EnableControlledFolderAccess') -cne $case.Expected) {
+            throw 'Defender folder mode mismatch'
+        }
+    }
+    foreach ($bad in @(@{Value='1'},@{Value=$true},@{Value=@(1)},@{Value=[double]1},
+        @{Value=[int32]-1},@{Value=[uint32]::MaxValue},@{Value=$null},@{Value=[int32]5})) {
+        $record = [pscustomobject]@{PUAProtection=$bad.Value;EnableNetworkProtection=$bad.Value;EnableControlledFolderAccess=$bad.Value}
+        foreach ($name in @('PUAProtection','EnableNetworkProtection','EnableControlledFolderAccess')) {
+            if ((Get-AegisDefenderPreferenceMode $record $name) -cne 'Unknown') {
+                throw 'Invalid Defender preference accepted'
+            }
+        }
+    }
+    $partial = Get-AegisDefenderPreferenceReport {
+        [pscustomobject]@{PUAProtection=[int32]3;EnableNetworkProtection=[int32]4;EnableControlledFolderAccess=[byte]1}
+    }
+    foreach ($line in @('Potentially unwanted apps : Unknown','Network protection : Unknown','Controlled folder access : Configured block')) {
+        if (-not $partial.Contains($line)) { throw 'Defender preference scope mismatch' }
+    }
+    foreach ($reader in @({}, { throw 'SYNTHETIC-PRIVATE' }, {
+        [pscustomobject]@{PUAProtection=[byte]1}
+        [pscustomobject]@{PUAProtection=[byte]1}
+    })) {
+        $report = Get-AegisDefenderPreferenceReport $reader
+        foreach ($line in @('Potentially unwanted apps : Unknown','Network protection : Unknown','Controlled folder access : Unknown')) {
+            if (-not $report.Contains($line)) { throw 'Ambiguous or unavailable Defender preference accepted' }
+        }
+        if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'Defender preference exception disclosed' }
+    }
+    Write-Output 'PASS: Defender preference snapshot synthetic fixtures'
+}
+
 if ($SelfTest) {
     foreach ($command in (Get-AegisCommands)) {
         if (-not (Test-AegisCommand $command)) { throw 'Allowlist failure' }
@@ -1138,6 +1222,7 @@ if ($SelfTest) {
         if (Test-AegisCommand $command) { throw 'Unexpected command accepted' }
     }
     Test-AegisNativeReport
+    Test-AegisDefenderPreferenceReport
     Test-AegisDeviceGuardReport
     Test-AegisBootTrustReport
     Test-AegisUacReport
@@ -1220,6 +1305,10 @@ $native.Add_Click({
         } {
             NetSecurity\Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop -WarningAction SilentlyContinue
         }
+        $output.Text += [Environment]::NewLine + [Environment]::NewLine + (Get-AegisDefenderPreferenceReport {
+            Defender\Get-MpPreference -ErrorAction Stop -WarningAction SilentlyContinue |
+                Select-Object -Property PUAProtection,EnableNetworkProtection,EnableControlledFolderAccess -First 2
+        })
         $output.Text += [Environment]::NewLine + [Environment]::NewLine + (Get-AegisDeviceGuardReport {
             CimCmdlets\Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -Property VirtualizationBasedSecurityStatus,SecurityServicesConfigured,SecurityServicesRunning,CodeIntegrityPolicyEnforcementStatus,UsermodeCodeIntegrityPolicyEnforcementStatus -OperationTimeoutSec 5 -ErrorAction Stop -WarningAction SilentlyContinue
         })
