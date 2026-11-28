@@ -58,6 +58,9 @@ SOURCE_OBSERVATIONS = (
     ("pkg:cargo/sha2@0.10.9", "sha2", "0.10.9",
      "expression:MIT OR Apache-2.0",
      "https://docs.rs/crate/sha2/0.10.9/source/Cargo.toml", "2026-11-28"),
+    ("pkg:cargo/adler2@2.0.1", "adler2", "2.0.1",
+     "expression:0BSD OR MIT OR Apache-2.0",
+     "https://docs.rs/crate/adler2/latest/source/Cargo.toml.orig", "2026-11-28"),
 )
 
 def unique_object(pairs):

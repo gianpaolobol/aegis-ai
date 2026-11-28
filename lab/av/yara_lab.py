@@ -29,14 +29,29 @@ def evaluate(engine, data):
         scanner.set_timeout(2)
         scanner.max_matches_per_pattern(1)
         result = scanner.scan(data)
-        ids = tuple(rule.identifier for rule in result.matching_rules)
-        if ids == (RULE_ID,):
-            return 'FixtureMatch'
-        if ids == ():
+        # One fixed rule, so at most two iterator reads are needed. Never
+        # exhaust an unexpected result stream or trust custom equality.
+        matches = iter(result.matching_rules)
+        end = object()
+        first = next(matches, end)
+        if first is end:
             return 'NoFixtureMatch'
-        return 'Unavailable'
+        identifier = first.identifier
+        if type(identifier) is not str or identifier != RULE_ID:
+            return 'Unavailable'
+        if next(matches, end) is not end:
+            return 'Unavailable'
+        return 'FixtureMatch'
     except Exception:
         return 'Unavailable'
+
+
+def fixed_corpus(engine):
+    """Advisory fixture results only; no actual engine approval or malware claim."""
+    outcomes = tuple(evaluate(engine, data) for data, _ in CASES)
+    expected = tuple(status for _, status in CASES)
+    return {'outcomes': outcomes, 'fixture_expectations_met': outcomes == expected,
+            'execution_approved': False}
 
 
 def real_rehearsal():
@@ -87,6 +102,46 @@ class AdapterTests(unittest.TestCase):
     def test_unexpected_or_duplicate_rule(self):
         for ids in (('unknown',), (RULE_ID, RULE_ID)):
             self.assertEqual(evaluate(self.engine(ids), b'x'), 'Unavailable')
+
+    def test_result_stream_bounded(self):
+        engine = self.engine()
+        reads = []
+        def stream():
+            for i in range(3):
+                reads.append(i)
+                yield SimpleNamespace(identifier=RULE_ID)
+            raise AssertionError('stream exhausted')
+        engine.Scanner.scan = lambda scanner, data: SimpleNamespace(matching_rules=stream())
+        self.assertEqual(evaluate(engine, b'x'), 'Unavailable')
+        self.assertEqual(reads, [0, 1])
+
+    def test_malformed_result_identifier(self):
+        class Pretender:
+            def __eq__(self, other):
+                return True
+        for identifier in (Pretender(), None, 1, b'aegis_fixture_marker'):
+            self.assertEqual(evaluate(self.engine((identifier,)), b'x'), 'Unavailable')
+
+    def test_incomplete_result_stream(self):
+        engine = self.engine()
+        def stream():
+            yield SimpleNamespace(identifier=RULE_ID)
+            raise TimeoutError('SYNTHETIC_PRIVATE')
+        engine.Scanner.scan = lambda scanner, data: SimpleNamespace(matching_rules=stream())
+        self.assertEqual(evaluate(engine, b'x'), 'Unavailable')
+
+    def test_fixed_corpus_no_approval(self):
+        engine = self.engine()
+        engine.Scanner.scan = lambda scanner, data: SimpleNamespace(matching_rules=(
+            [SimpleNamespace(identifier=RULE_ID)] if data == CASES[0][0] else []))
+        report = fixed_corpus(engine)
+        self.assertEqual(report['outcomes'], ('FixtureMatch', 'NoFixtureMatch', 'NoFixtureMatch'))
+        self.assertTrue(report['fixture_expectations_met'])
+        self.assertFalse(report['execution_approved'])
+        for bad in (self.engine(), self.engine((RULE_ID,)), self.engine(fail=True)):
+            report = fixed_corpus(bad)
+            self.assertFalse(report['fixture_expectations_met'])
+            self.assertFalse(report['execution_approved'])
 
     def test_imports_blocked(self):
         self.assertEqual(evaluate(self.engine(imports=('pe',)), b'x'), 'Unavailable')
