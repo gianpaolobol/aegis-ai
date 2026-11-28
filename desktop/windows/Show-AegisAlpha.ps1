@@ -1148,6 +1148,91 @@ function Get-AegisDefenderPreferenceMode($Record,[string]$Name) {
     }
     return 'Unknown'
 }
+# ASR is reported configuration, not proof of coverage or enforcement.
+function Get-AegisAsrSummary($Record) {
+    $unknown = 'Unknown (missing, unsupported or inconsistent rule metadata)'
+    if ($null -eq $Record) { return $unknown }
+    $idProperty = $Record.PSObject.Properties['AttackSurfaceReductionRules_Ids']
+    $actionProperty = $Record.PSObject.Properties['AttackSurfaceReductionRules_Actions']
+    if ($null -eq $idProperty -or $null -eq $actionProperty) { return $unknown }
+    $ids = $idProperty.Value
+    $actions = $actionProperty.Value
+    if ($ids -isnot [array] -or $actions -isnot [array] -or
+        $ids.Rank -ne 1 -or $actions.Rank -ne 1 -or
+        $ids.GetLowerBound(0) -ne 0 -or $actions.GetLowerBound(0) -ne 0 -or
+        $ids.Length -ne $actions.Length -or $ids.Length -gt 256) { return $unknown }
+    if ($ids.Length -eq 0) { return 'No rules reported (coverage unknown)' }
+    $seen = @{}
+    $counts = @{0=0;1=0;2=0;5=0;6=0}
+    for ($i=0; $i -lt $ids.Length; $i++) {
+        $id = $ids[$i]
+        $action = $actions[$i]
+        if ($id -isnot [string] -or $id -cnotmatch '\A[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\z' -or
+            $id -ceq '00000000-0000-0000-0000-000000000000' -or $seen.ContainsKey($id)) { return $unknown }
+        if ($action -isnot [byte] -and $action -isnot [uint16] -and
+            $action -isnot [uint32] -and $action -isnot [int32]) { return $unknown }
+        if ($action -notin @(0,1,2,5,6)) { return $unknown }
+        $seen[$id] = $true
+        $key = [int]$action
+        $counts[$key] = $counts[$key] + 1
+    }
+    return ("Reported rules: {0}; block: {1}; audit: {2}; warn: {3}; off: {4}; not configured: {5}" -f
+        $ids.Length,$counts[1],$counts[2],$counts[6],$counts[0],$counts[5])
+}
+function Test-AegisAsrSummary {
+    $ids = @('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa','bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb',
+        'cccccccc-cccc-cccc-cccc-cccccccccccc','dddddddd-dddd-dddd-dddd-dddddddddddd',
+        'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee')
+    $record = [pscustomobject]@{AttackSurfaceReductionRules_Ids=$ids;
+        AttackSurfaceReductionRules_Actions=[byte[]]@(0,1,2,5,6)}
+    $expected = 'Reported rules: 5; block: 1; audit: 1; warn: 1; off: 1; not configured: 1'
+    if ((Get-AegisAsrSummary $record) -cne $expected) { throw 'ASR mode aggregate mismatch' }
+    $report = Get-AegisDefenderPreferenceReport { $record }
+    if (-not $report.Contains("Attack surface reduction : $expected") -or $report.Contains($ids[0])) {
+        throw 'ASR integration or privacy regression'
+    }
+    $record.AttackSurfaceReductionRules_Ids = [string[]]@()
+    $record.AttackSurfaceReductionRules_Actions = [byte[]]@()
+    if ((Get-AegisAsrSummary $record) -cne 'No rules reported (coverage unknown)') {
+        throw 'ASR empty evidence mismatch'
+    }
+    $record.AttackSurfaceReductionRules_Ids = [string[]]@($ids[0])
+    $record.AttackSurfaceReductionRules_Actions = [uint16[]]@(1)
+    if ((Get-AegisAsrSummary $record) -cne 'Reported rules: 1; block: 1; audit: 0; warn: 0; off: 0; not configured: 0') {
+        throw 'ASR singleton mismatch'
+    }
+    $bad = @(
+        @{Ids=$null;Actions=@(1)},
+        @{Ids=$ids[0];Actions=@(1)},
+        @{Ids=@($ids[0]);Actions=1},
+        @{Ids=@($ids[0]);Actions=@(1,2)},
+        @{Ids=@($ids[0],$ids[0].ToUpperInvariant());Actions=@(1,2)},
+        @{Ids=@('SYNTHETIC-PRIVATE');Actions=@(1)},
+        @{Ids=@('00000000-0000-0000-0000-000000000000');Actions=@(1)},
+        @{Ids=@($ids[0]);Actions=@('1')},
+        @{Ids=@($ids[0]);Actions=@($true)},
+        @{Ids=@($ids[0]);Actions=@([double]1)},
+        @{Ids=@($ids[0]);Actions=@(3)},
+        @{Ids=@($ids[0]);Actions=@(255)},
+        @{Ids=@($ids[0]);Actions=@($null)},
+        @{Ids=@($ids[0])*257;Actions=@(1)*257}
+    )
+    foreach ($case in $bad) {
+        $record.AttackSurfaceReductionRules_Ids = $case.Ids
+        $record.AttackSurfaceReductionRules_Actions = $case.Actions
+        $summary = Get-AegisAsrSummary $record
+        if ($summary -cne 'Unknown (missing, unsupported or inconsistent rule metadata)') {
+            throw 'Invalid ASR metadata accepted'
+        }
+    }
+    foreach ($missing in @($null,[pscustomobject]@{AttackSurfaceReductionRules_Ids=@($ids[0])})) {
+        if ((Get-AegisAsrSummary $missing) -cne 'Unknown (missing, unsupported or inconsistent rule metadata)') {
+            throw 'Missing ASR metadata accepted'
+        }
+    }
+    Write-Output 'PASS: ASR configuration aggregate synthetic fixtures'
+}
+
 function Get-AegisDefenderPreferenceReport([scriptblock]$ReadPreference) {
     $record = $null
     try {
@@ -1157,10 +1242,13 @@ function Get-AegisDefenderPreferenceReport([scriptblock]$ReadPreference) {
     $pua = Get-AegisDefenderPreferenceMode $record 'PUAProtection'
     $network = Get-AegisDefenderPreferenceMode $record 'EnableNetworkProtection'
     $folders = Get-AegisDefenderPreferenceMode $record 'EnableControlledFolderAccess'
+    $asr = Get-AegisAsrSummary $record
     return (@('Defender preference snapshot (read-only configuration, not enforcement).',
         "Potentially unwanted apps : $pua",
         "Network protection : $network",
         "Controlled folder access : $folders",
+        "Attack surface reduction : $asr",
+        'ASR counts are configured modes only; no rule coverage, exclusions or enforcement verified.',
         'Audit-only and disk-sector-only modes are not full blocking.',
         'Actual protection depends on OS support, active Defender mode and other prerequisites.',
         'No exclusions, protected folder paths, or settings changes reported.') -join [Environment]::NewLine)
@@ -1223,6 +1311,7 @@ if ($SelfTest) {
     }
     Test-AegisNativeReport
     Test-AegisDefenderPreferenceReport
+    Test-AegisAsrSummary
     Test-AegisDeviceGuardReport
     Test-AegisBootTrustReport
     Test-AegisUacReport
@@ -1307,7 +1396,7 @@ $native.Add_Click({
         }
         $output.Text += [Environment]::NewLine + [Environment]::NewLine + (Get-AegisDefenderPreferenceReport {
             Defender\Get-MpPreference -ErrorAction Stop -WarningAction SilentlyContinue |
-                Select-Object -Property PUAProtection,EnableNetworkProtection,EnableControlledFolderAccess -First 2
+                Select-Object -Property PUAProtection,EnableNetworkProtection,EnableControlledFolderAccess,AttackSurfaceReductionRules_Ids,AttackSurfaceReductionRules_Actions -First 2
         })
         $output.Text += [Environment]::NewLine + [Environment]::NewLine + (Get-AegisDeviceGuardReport {
             CimCmdlets\Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -Property VirtualizationBasedSecurityStatus,SecurityServicesConfigured,SecurityServicesRunning,CodeIntegrityPolicyEnforcementStatus,UsermodeCodeIntegrityPolicyEnforcementStatus -OperationTimeoutSec 5 -ErrorAction Stop -WarningAction SilentlyContinue
