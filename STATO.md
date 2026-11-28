@@ -46,3 +46,5 @@ Segue la versione **1.1.0** (`LINEE_GUIDA.md`).
 - 2026-11-28 [Codex] ADE-103: CI ADE-102 verde; riferimento offline di triage dei soli conteggi Defender, 6 test locali superati; integrazione UI e collaudo finale ancora aperti. Build differite secondo direttiva del titolare.
 
 - 2026-11-28 [Codex] ADE-104: avvio V0.2, correlazione offline di segnali AV/EDR sintetici e 12 test locali (6 nuovi, 6 regressioni); integrazione nativa e gate di distribuzione ancora aperti.
+
+- 2026-11-28 [Codex] ADE-105: collegamento della correlazione AV/EDR ai dati nativi in sola lettura nell'interfaccia Windows; fixture di regressione aggiunte, esecuzione PowerShell ancora da verificare; V0.2 in sviluppo.

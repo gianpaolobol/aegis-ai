@@ -1521,10 +1521,11 @@ function Read-AegisDefenderEventIds {
         if ($null -ne $config) { $config.Dispose() }
     }
 }
-function Get-AegisDefenderEventReport([scriptblock]$ReadEvents) {
+function Get-AegisDefenderEventReport([scriptblock]$ReadEvents, [switch]$AsSnapshot) {
     $heading = 'Defender operational event snapshot (local, read-only; last 24 hours).'
     $limitation = 'Selected event records only; not unique threats, proof of remediation, current protection, or absence of compromise. Retention and coverage are not verified.'
     $unavailable = @($heading,'Event counts : Unknown (source disabled, denied, invalid or unavailable).',$limitation) -join [Environment]::NewLine
+    if ($AsSnapshot) { $unavailable = [pscustomobject]@{Coverage='unknown';Counts=$null} }
     $labels = [ordered]@{
         '1116'='Detection records'
         '1117'='Action records (not necessarily remediation)'
@@ -1544,6 +1545,11 @@ function Get-AegisDefenderEventReport([scriptblock]$ReadEvents) {
         for ($i=0; $i -lt [Math]::Min($items.Count,256); $i++) {
             $key = [string]$items[$i]
             $counts[$key]++
+        }
+        if ($AsSnapshot) {
+            $coverage = 'query-exhausted'
+            if ($limited) { $coverage = 'limited' }
+            return [pscustomobject]@{Coverage=$coverage;Counts=$counts}
         }
         $lines = @($heading)
         if ($limited) { $lines += 'Coverage : Limited to latest 256 selected records; additional records exist.' }
@@ -1581,6 +1587,97 @@ function Test-AegisDefenderEventReport {
     Write-Output 'PASS: Defender event aggregate synthetic fixtures'
 }
 
+# [Codex] ADE-105: correlate fixed native Defender observations, advisory only.
+# Provider status and history are separate non-atomic reads; neither proves safety.
+function Get-AegisEndpointFusionReport([scriptblock]$ReadStatus,[scriptblock]$ReadEvents) {
+    $record = $null
+    try {
+        $records = @(& $ReadStatus | Select-Object -First 2)
+        if ($records.Count -eq 1) { $record = $records[0] }
+    } catch { $record = $null }
+    $realtime = Get-AegisDefenderFlag $record 'RealTimeProtectionEnabled' 'Enabled' 'Disabled'
+    $signatures = Get-AegisDefenderFlag $record 'DefenderSignaturesOutOfDate' 'ReportedOutOfDate' 'NotReportedOutOfDate'
+    $snapshot = Get-AegisDefenderEventReport $ReadEvents -AsSnapshot
+    $reasons = @()
+    $urgent = $false
+    if ($snapshot.Coverage -ne 'unknown') {
+        foreach ($item in @(
+            @{Id='1119';Reason='critical-action-failure-record'},
+            @{Id='5001';Reason='real-time-disabled-record'},
+            @{Id='1118';Reason='action-failure-record'},
+            @{Id='1116';Reason='detection-record'},
+            @{Id='5013';Reason='tamper-block-record'},
+            @{Id='1117';Reason='action-record'}
+        )) {
+            if ($snapshot.Counts[$item.Id] -gt 0) {
+                $reasons += $item.Reason
+                if ($item.Id -in @('1119','5001')) { $urgent = $true }
+            }
+        }
+    }
+    if ($realtime -ceq 'Disabled') { $reasons += 'realtime-reported-disabled'; $urgent = $true }
+    if ($signatures -ceq 'ReportedOutOfDate') { $reasons += 'signatures-reported-stale' }
+    if ($realtime -ceq 'Unknown') { $reasons += 'realtime-unavailable' }
+    if ($signatures -ceq 'Unknown') { $reasons += 'signature-status-unavailable' }
+    if ($snapshot.Coverage -ceq 'unknown') { $reasons += 'event-source-unavailable' }
+    if ($snapshot.Coverage -ceq 'limited') { $reasons += 'event-sample-limited' }
+    $coverage = 'partial'
+    if ($snapshot.Coverage -ceq 'query-exhausted' -and $realtime -cne 'Unknown' -and $signatures -cne 'Unknown') {
+        $coverage = 'inputs-present'
+    }
+    $priority = 'no-selected-indicators'
+    if ($urgent) { $priority = 'urgent-review' }
+    elseif ($reasons.Count -gt 0) { $priority = 'review' }
+    $reasonText = 'none'
+    if ($reasons.Count -gt 0) { $reasonText = $reasons -join ', ' }
+    return (@(
+        'AEGIS endpoint evidence fusion (local advisory; read-only).',
+        "Review priority : $priority",
+        "Input coverage : $coverage",
+        "Real-time protection : $realtime",
+        "Signature status : $signatures",
+        "Event query coverage : $($snapshot.Coverage)",
+        "Reasons : $reasonText",
+        'Status and event history are separate reads. Passive mode or other antivirus may explain a disabled Defender flag.',
+        'No proof of current protection, remediation or absence of compromise. Query exhaustion does not establish log completeness.',
+        'No action authorized; no scan, update, containment, network request or policy change performed.'
+    ) -join [Environment]::NewLine)
+}
+
+function Test-AegisEndpointFusionReport {
+    $good = { [pscustomobject]@{RealTimeProtectionEnabled=$true;DefenderSignaturesOutOfDate=$false;Private='SYNTHETIC-PRIVATE'} }
+    $disabled = { [pscustomobject]@{RealTimeProtectionEnabled=$false;DefenderSignaturesOutOfDate=$false} }
+    $stale = { [pscustomobject]@{RealTimeProtectionEnabled=$true;DefenderSignaturesOutOfDate=$true} }
+    $denied = { throw 'SYNTHETIC-PRIVATE' }
+    $report = Get-AegisEndpointFusionReport $good {}
+    foreach ($expected in @('Review priority : no-selected-indicators','Input coverage : inputs-present','Signature status : NotReportedOutOfDate','No action authorized','absence of compromise')) {
+        if (-not $report.Contains($expected)) { throw 'Endpoint fusion complete fixture mismatch.' }
+    }
+    if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'Endpoint fusion privacy regression.' }
+    $report = Get-AegisEndpointFusionReport $disabled $denied
+    foreach ($expected in @('Review priority : urgent-review','Input coverage : partial','realtime-reported-disabled','event-source-unavailable')) {
+        if (-not $report.Contains($expected)) { throw 'Endpoint fusion urgent partial fixture mismatch.' }
+    }
+    $report = Get-AegisEndpointFusionReport $good {5001;1117}
+    if (-not $report.Contains('Review priority : urgent-review') -or -not $report.Contains('action-record')) { throw 'Endpoint fusion historical urgency regression.' }
+    $report = Get-AegisEndpointFusionReport $stale {1116}
+    if (-not $report.Contains('Review priority : review') -or -not $report.Contains('detection-record, signatures-reported-stale')) { throw 'Endpoint fusion stale fixture mismatch.' }
+    $report = Get-AegisEndpointFusionReport $good { for ($i=0;$i -lt 257;$i++) {1117} }
+    if (-not $report.Contains('Input coverage : partial') -or -not $report.Contains('event-sample-limited')) { throw 'Endpoint fusion truncated fixture mismatch.' }
+    foreach ($bad in @($denied, { [pscustomobject]@{RealTimeProtectionEnabled='True';DefenderSignaturesOutOfDate=0} }, { & $good; & $good })) {
+        $report = Get-AegisEndpointFusionReport $bad {1119}
+        foreach ($expected in @('Review priority : urgent-review','Input coverage : partial','realtime-unavailable','signature-status-unavailable','critical-action-failure-record')) {
+            if (-not $report.Contains($expected)) { throw 'Endpoint fusion status failure regression.' }
+        }
+        if ($report.Contains('SYNTHETIC-PRIVATE')) { throw 'Endpoint fusion privacy regression.' }
+    }
+    $report = Get-AegisEndpointFusionReport $good {1119; throw 'SYNTHETIC-PRIVATE'}
+    if (-not $report.Contains('Review priority : review') -or -not $report.Contains('event-source-unavailable') -or $report.Contains('critical-action-failure-record') -or $report.Contains('SYNTHETIC-PRIVATE')) {
+        throw 'Endpoint fusion atomic event failure regression.'
+    }
+    Write-Output 'PASS: endpoint evidence fusion synthetic fixtures'
+}
+
 if ($SelfTest) {
     foreach ($command in (Get-AegisCommands)) {
         if (-not (Test-AegisCommand $command)) { throw 'Allowlist failure' }
@@ -1590,6 +1687,7 @@ if ($SelfTest) {
     }
     Test-AegisNativeReport
     Test-AegisDefenderEventReport
+    Test-AegisEndpointFusionReport
     Test-AegisDefenderPreferenceReport
     Test-AegisAsrSummary
     Test-AegisDefenderCloudMode
@@ -1915,6 +2013,18 @@ $eventSummary.Add_Click({
 })
 $form.Controls.Add($eventSummary)
 
+$fusion = New-Object Windows.Forms.Button
+$fusion.Location = New-Object Drawing.Point(365,460)
+$fusion.Size = New-Object Drawing.Size(340,36)
+$fusion.Text = 'Endpoint evidence fusion (local advisory)'
+$fusion.Add_Click({
+    $output.Text = Get-AegisEndpointFusionReport {
+        Defender\Get-MpComputerStatus -ErrorAction Stop -WarningAction SilentlyContinue |
+            Select-Object -Property RealTimeProtectionEnabled,DefenderSignaturesOutOfDate -First 2
+    } { Read-AegisDefenderEventIds }
+})
+$form.Controls.Add($fusion)
+
 
 try {
     if ($UiSmokeTest) {
@@ -1925,7 +2035,7 @@ try {
             'Verify local file integrity (16 MiB max)','Incident correlation (synthetic)',
             'Windows VPN profiles (read-only)','Suspicious link (offline advisory)',
             'Windows patch inventory (partial)','Invoice IBAN comparison (offline, IT)',
-            'Windows disk encryption (read-only)','Patch priority (synthetic)','Mail authentication (synthetic)','Backup recovery readiness (synthetic)','Defender events (local, last 24h)')
+            'Windows disk encryption (read-only)','Patch priority (synthetic)','Mail authentication (synthetic)','Backup recovery readiness (synthetic)','Defender events (local, last 24h)','Endpoint evidence fusion (local advisory)')
         if ($buttons.Count -ne $labels.Count) { throw 'Unexpected GUI button count.' }
         foreach ($label in $labels) {
             if (@($buttons | Where-Object { $_.Text -ceq $label }).Count -ne 1) {
@@ -1947,7 +2057,7 @@ try {
         if ((Get-AegisCliReport 'scan') -cne 'Command rejected.') {
             throw 'Invalid command bridge regression.'
         }
-        Write-Output 'PASS: GUI constructed; seventeen controls, safety labels, eight CLI calls and denied command.'
+        Write-Output 'PASS: GUI constructed; eighteen controls, safety labels, eight CLI calls and denied command.'
     } else {
         [void]$form.ShowDialog()
     }
