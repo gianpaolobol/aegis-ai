@@ -12,7 +12,7 @@ in sviluppo
 non pubblicata
 
 ## Prossimi passi
-1. Verificare le nuove CI e completare il candidato Windows alpha.
+1. Completare i lotti funzionali e i test locali; congelare il candidato Windows alpha prima della CI/build finale autorizzata.
 2. Completare provenienza, licenze, linkage e laboratorio del motore AV.
 3. Collaudare installazione e rimozione su VM Windows client isolata.
 4. Ottenere firma attendibile e revisione indipendente prima di ogni distribuzione.
@@ -42,3 +42,5 @@ Segue la versione **1.1.0** (`LINEE_GUIDA.md`).
 - 2026-11-28 [Codex] ADE-101: CI ADE-100 verde; diagnostica SmartScreen Explorer/Edge in sola lettura, nuova CI da verificare.
 
 - 2026-11-28 [Codex] ADE-102: CI ADE-101 verde; riepilogo eventi Defender locali su richiesta, soli conteggi, nuovo collaudo CI in attesa.
+
+- 2026-11-28 [Codex] ADE-103: CI ADE-102 verde; riferimento offline di triage dei soli conteggi Defender, 6 test locali superati; integrazione UI e collaudo finale ancora aperti. Build differite secondo direttiva del titolare.
