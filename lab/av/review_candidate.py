@@ -52,6 +52,12 @@ SOURCE_OBSERVATIONS = (
     ("pkg:cargo/core-foundation-sys@0.8.7", "core-foundation-sys", "0.8.7",
      "expression:MIT OR Apache-2.0",
      "https://docs.rs/crate/core-foundation-sys/0.8.7/source/Cargo.toml", "2026-11-27"),
+    ("pkg:cargo/thiserror@1.0.69", "thiserror", "1.0.69",
+     "expression:MIT OR Apache-2.0",
+     "https://docs.rs/crate/thiserror/1.0.69/source/Cargo.toml", "2026-11-28"),
+    ("pkg:cargo/sha2@0.10.9", "sha2", "0.10.9",
+     "expression:MIT OR Apache-2.0",
+     "https://docs.rs/crate/sha2/0.10.9/source/Cargo.toml", "2026-11-28"),
 )
 
 def unique_object(pairs):

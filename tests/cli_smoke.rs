@@ -160,6 +160,10 @@ fn mail_auth_demo_is_advisory_and_rejects_extra_arguments() {
         "first session batch fixture: FixtureBatchRecorded",
         "repeated session batch fixture: PreviouslyReviewed",
         "Session history is volatile and synthetic",
+        "two-reviewer fixture: TwoFixtureConfirmationsReported",
+        "reused reviewer fixture: DuplicateReviewer",
+        "changed second confirmation fixture: ConfirmationNeedsReview",
+        "Two reviewer labels do not prove real independence or authorize payment",
         "no persistent replay protection"] {
         assert!(stdout(&output).contains(expected));
     }

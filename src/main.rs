@@ -350,6 +350,22 @@ fn run(args: &[OsString]) -> (i32, String) {
             if observed != expected || session.recorded_count() != 2 { return (1, report); }
         }
         report.push_str("Session history is volatile and synthetic; no persistent replay protection or payment authority.\n");
+        use aegis_policy::mail_auth::{assess_dual_confirmation, DualConfirmationVerdict};
+        let second_reviewer = ConfirmationFixture { reviewer: 6, ..confirmation };
+        for (label, pair, expected) in [
+            ("two-reviewer fixture", [confirmation, second_reviewer],
+                DualConfirmationVerdict::TwoFixtureConfirmationsReported),
+            ("reused reviewer fixture", [confirmation, confirmation],
+                DualConfirmationVerdict::DuplicateReviewer),
+            ("changed second confirmation fixture", [confirmation,
+                ConfirmationFixture { bound_request: CriticalRequest { destination: 9, ..request },
+                    ..second_reviewer }], DualConfirmationVerdict::ConfirmationNeedsReview),
+        ] {
+            let observed = assess_dual_confirmation(request, 120, &pair);
+            report.push_str(&format!("{label}: {observed:?}\n"));
+            if observed != expected { return (1, report); }
+        }
+        report.push_str("Two reviewer labels do not prove real independence or authorize payment.\n");
         return (0, report);
     }
     if arg == OsStr::new("demo-recovery") {

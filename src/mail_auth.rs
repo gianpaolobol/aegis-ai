@@ -411,3 +411,73 @@ mod session_tests {
         assert_eq!(s.recorded_count(), MAX_SESSION_REQUESTS);
     }
 }
+
+
+/// Optional stricter advisory for critical transactions: exactly two separately
+/// identified reviewers, each confirming the identical transaction through a
+/// previously registered channel. Labels are synthetic, not authenticated.
+/// This does not establish real reviewer independence or authorize payment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DualConfirmationVerdict {
+    WrongConfirmationCount, ConfirmationNeedsReview, DuplicateReviewer,
+    TwoFixtureConfirmationsReported,
+}
+pub fn assess_dual_confirmation(request: CriticalRequest, now: u64,
+    confirmations: &[ConfirmationFixture]) -> DualConfirmationVerdict {
+    use DualConfirmationVerdict::*;
+    if confirmations.len() != 2 { return WrongConfirmationCount; }
+    if confirmations.iter().any(|c| assess_confirmation(request, now, Some(*c))
+        != ConfirmationVerdict::FixtureConfirmationReported) {
+        return ConfirmationNeedsReview;
+    }
+    if confirmations[0].reviewer == confirmations[1].reviewer { return DuplicateReviewer; }
+    TwoFixtureConfirmationsReported
+}
+
+#[cfg(test)]
+mod dual_confirmation_tests {
+    use super::*;
+    use DualConfirmationVerdict::*;
+    #[test] fn two_reviewers_and_order_invariance() {
+        let (r,a) = confirmation_example();
+        let b = ConfirmationFixture { reviewer: 6, ..a };
+        for pair in [[a,b],[b,a]] {
+            assert_eq!(assess_dual_confirmation(r,120,&pair), TwoFixtureConfirmationsReported);
+        }
+        let r = CriticalRequest { terms: CriticalTerms::DestinationChange, ..r };
+        assert_eq!(assess_dual_confirmation(r,120,&[
+            ConfirmationFixture { bound_request: r, ..a },
+            ConfirmationFixture { bound_request: r, ..b }]), TwoFixtureConfirmationsReported);
+    }
+    #[test] fn count_and_reviewer_reuse() {
+        let (r,a) = confirmation_example();
+        let b = ConfirmationFixture { reviewer: 6, ..a };
+        for items in [&[][..], &[a][..], &[a,b,a][..]] {
+            assert_eq!(assess_dual_confirmation(r,120,items), WrongConfirmationCount);
+        }
+        assert_eq!(assess_dual_confirmation(r,120,&[a,a]), DuplicateReviewer);
+        assert_eq!(assess_dual_confirmation(r,120,&[a,
+            ConfirmationFixture { confirmed_at: 115, ..a }]), DuplicateReviewer);
+    }
+    #[test] fn each_confirmation_must_pass_existing_checks() {
+        let (r,a) = confirmation_example();
+        let b = ConfirmationFixture { reviewer: 6, ..a };
+        for invalid in [
+            ConfirmationFixture { reviewer: r.requester, ..b },
+            ConfirmationFixture { reviewer: 0, ..b },
+            ConfirmationFixture { source: Source::Untrusted, ..b },
+            ConfirmationFixture { source: Source::Unavailable, ..b },
+            ConfirmationFixture { channel: ConfirmationChannel::FromRequest, ..b },
+            ConfirmationFixture { channel: ConfirmationChannel::Unknown, ..b },
+            ConfirmationFixture { bound_request: CriticalRequest { revision: 2, ..r }, ..b },
+            ConfirmationFixture { bound_request: CriticalRequest { destination: 9, ..r }, ..b },
+            ConfirmationFixture { confirmed_at: 99, ..b },
+            ConfirmationFixture { confirmed_at: 121, ..b },
+        ] {
+            for pair in [[a,invalid],[invalid,a]] {
+                assert_eq!(assess_dual_confirmation(r,120,&pair), ConfirmationNeedsReview);
+            }
+        }
+        assert_eq!(assess_dual_confirmation(r,410,&[a,b]), ConfirmationNeedsReview);
+    }
+}
